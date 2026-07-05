@@ -1,0 +1,1341 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>MiruMood</title>
+<style>
+  :root{
+    --bg:#17181c; --panel:#22242acc; --line:#3a3d46; --text:#c9ccd4;
+    --dim:#7d8089; --accent:#ffb454; --sel:#5ab0ff;
+  }
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);
+    font:13px/1.5 "Hiragino Sans","Noto Sans JP",system-ui,sans-serif;color:var(--text);
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
+  #cv{position:fixed;inset:0;display:block;cursor:default;touch-action:none}
+  #bar{position:fixed;top:10px;left:10px;display:flex;gap:2px;padding:4px;
+    background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);
+    border-radius:8px;opacity:.35;transition:opacity .2s;z-index:10}
+  #bar:hover{opacity:1}
+  #bar button{all:unset;cursor:pointer;padding:5px 9px;border-radius:5px;color:var(--text);font-size:12px}
+  #bar button:hover{background:#ffffff14}
+  #bar .sep{width:1px;background:var(--line);margin:3px 2px}
+  #menu{position:fixed;display:none;min-width:180px;padding:4px;z-index:30;
+    background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:8px}
+  #menu button{all:unset;display:flex;justify-content:space-between;gap:16px;cursor:pointer;
+    width:calc(100% - 18px);padding:5px 9px;border-radius:5px;font-size:12px}
+  #menu button:hover{background:#ffffff14}
+  #menu button .k{color:var(--dim);font-family:ui-monospace,monospace;font-size:11px}
+  #menu hr{border:none;border-top:1px solid var(--line);margin:4px 2px}
+  #help{position:fixed;inset:0;display:none;place-items:center;background:#000a;z-index:40}
+  #help .box{background:#1d1f24;border:1px solid var(--line);border-radius:12px;padding:24px 28px;max-height:80vh;overflow:auto;min-width:440px}
+  #help h2{margin:0 0 4px;font-size:15px;color:var(--accent);font-weight:600}
+  #help p.sub{margin:0 0 14px;color:var(--dim);font-size:12px}
+  #help table{border-collapse:collapse;width:100%}
+  #help td{padding:3px 6px;font-size:12px}
+  #help td:first-child{font-family:ui-monospace,monospace;color:var(--accent);white-space:nowrap;padding-right:18px}
+  #help .grp{padding-top:12px;color:var(--dim);font-size:11px;letter-spacing:.08em}
+  #hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--dim);text-align:center;z-index:5}
+  #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
+  #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);padding:7px 14px;border-radius:6px;
+    background:var(--panel);border:1px solid var(--line);opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;font-size:12px}
+  #status{position:fixed;bottom:10px;right:12px;color:var(--dim);font-family:ui-monospace,monospace;font-size:11px;z-index:5}
+  #drop{position:fixed;inset:0;display:none;place-items:center;background:#ffb45410;border:2px dashed var(--accent);z-index:60;pointer-events:none;color:var(--accent);font-size:15px}
+  #noteEdit{position:fixed;display:none;z-index:25;border:2px solid var(--accent);border-radius:8px;
+    padding:10px;box-sizing:border-box;resize:none;outline:none;
+    font-family:"Hiragino Sans","Noto Sans JP",sans-serif;line-height:1.45}
+  input[type=file]{display:none}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="bar">
+  <button data-act="open"  title="画像を追加">＋ 画像</button>
+  <button data-act="note"  title="メモを追加 (N)">メモ</button>
+  <button data-act="grid"  title="グリッド切替 (S)">グリッド</button>
+  <button data-act="arrange" title="自動整列 (A)">整列</button>
+  <button data-act="fit"   title="全体表示 (F)">全体</button>
+  <div class="sep"></div>
+  <button data-act="save"  title="ボードを保存 (Ctrl+S)">保存</button>
+  <button data-act="load"  title="ボードを読込 (Ctrl+O)">読込</button>
+  <button data-act="png"   title="PNGとして書き出し">PNG</button>
+  <div class="sep"></div>
+  <button data-act="help"  title="ショートカット一覧 (?)">?</button>
+</div>
+
+<div id="menu"></div>
+
+<div id="help"><div class="box">
+  <h2>MiruMood</h2><p class="sub">リファレンス &amp; ムードボード — Esc で閉じる</p>
+  <table>
+    <tr><td class="grp" colspan="2">ナビゲーション</td></tr>
+    <tr><td>ホイール</td><td>ズーム（カーソル中心）</td></tr>
+    <tr><td>中/右ドラッグ・Space+ドラッグ</td><td>パン</td></tr>
+    <tr><td>F / Home</td><td>全体表示 / 100%表示</td></tr>
+    <tr><td>ダブルクリック</td><td>画像を画面にフィット（空白で100%）</td></tr>
+    <tr><td class="grp" colspan="2">選択・編集</td></tr>
+    <tr><td>クリック / Shift+クリック</td><td>選択 / 追加選択</td></tr>
+    <tr><td>空白ドラッグ</td><td>範囲選択</td></tr>
+    <tr><td>角ハンドル (Shift)</td><td>拡縮（Shiftで縦横比フリー）</td></tr>
+    <tr><td>上のハンドル (Shift)</td><td>回転（Shiftで15°スナップ）</td></tr>
+    <tr><td>Ctrl+A / Esc</td><td>全選択 / 選択解除</td></tr>
+    <tr><td>Delete / Ctrl+D</td><td>削除 / 複製（複製はメモリを消費しません）</td></tr>
+    <tr><td>H / V</td><td>左右反転 / 上下反転</td></tr>
+    <tr><td>G</td><td>グレースケール切替</td></tr>
+    <tr><td>R</td><td>回転をリセット</td></tr>
+    <tr><td>Alt+ホイール</td><td>不透明度を変更</td></tr>
+    <tr><td>C</td><td>クロップ（角・辺をドラッグ、Enter/Escで確定）</td></tr>
+    <tr><td>N</td><td>メモを追加（ダブルクリックで編集）</td></tr>
+    <tr><td>S</td><td>グリッド切替（非表示 → 表示 → スナップ）</td></tr>
+    <tr><td>PageUp / PageDown</td><td>前面へ / 背面へ</td></tr>
+    <tr><td class="grp" colspan="2">タッチ操作（タブレット）</td></tr>
+    <tr><td>1本指ドラッグ</td><td>画像を移動（空白ではパン）</td></tr>
+    <tr><td>2本指ピンチ</td><td>ズーム / パン</td></tr>
+    <tr><td>タップ / 空白タップ</td><td>選択 / 選択解除</td></tr>
+    <tr><td>ダブルタップ</td><td>フィット表示（空白で100%）</td></tr>
+    <tr><td>長押し</td><td>メニュー</td></tr>
+    <tr><td class="grp" colspan="2">ボード</td></tr>
+    <tr><td>Ctrl+V</td><td>クリップボードから貼り付け</td></tr>
+    <tr><td>A</td><td>選択（または全画像）を自動整列</td></tr>
+    <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>取り消し / やり直し</td></tr>
+    <tr><td>Ctrl+S / Ctrl+O</td><td>ボード保存 / 読込（.mrmd = 画像同梱・遅延読込対応）</td></tr>
+  </table>
+</div></div>
+
+<div id="hint">
+  <div>
+    <div class="big">画像をここにドラッグ＆ドロップ　または　Ctrl+V で貼り付け</div>
+    <div>ホイールでズーム・右ドラッグでパン・「?」でショートカット一覧</div>
+  </div>
+</div>
+
+<div id="drop">ドロップして追加</div>
+<textarea id="noteEdit" spellcheck="false"></textarea>
+<div id="toast"></div>
+<div id="status"></div>
+
+<input type="file" id="fImg" accept="image/*" multiple>
+<input type="file" id="fJson" accept=".mrmd,.zip,.json">
+
+<script>
+'use strict';
+/* =====================================================================
+ * mini ZIP (store方式・無圧縮)
+ * 画像は元々圧縮済みなので再圧縮せず格納する。
+ * 書き込み: Blob参照を連結（メモリへ丸ごとコピーしない）
+ * 読み込み: File.slice によるランダムアクセス（必要な部分だけ読む）
+ * 制限: ZIP64非対応のため合計 約3.9GB まで
+ * =================================================================== */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+async function crcOfBlob(blob) {
+  let c = 0xFFFFFFFF;
+  const reader = blob.stream().getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    for (let i = 0; i < value.length; i++) c = CRC_TABLE[(c ^ value[i]) & 0xFF] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+const ZIP_LIMIT = 3.9 * 1024 * 1024 * 1024;
+
+async function zipBuild(files, onProgress) {
+  const enc = new TextEncoder();
+  const parts = [], cds = [];
+  let offset = 0;
+  const total = files.reduce((a, f) => a + f.blob.size, 0);
+  if (total > ZIP_LIMIT) throw new Error('SIZE_LIMIT');
+  let done = 0;
+  for (const f of files) {
+    const nameU8 = enc.encode(f.name);
+    const size = f.blob.size;
+    const crc = await crcOfBlob(f.blob);
+    done += size; if (onProgress) onProgress(done / Math.max(1, total));
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true);
+    lh.setUint16(6, 0x0800, true);   // UTF-8 filename
+    lh.setUint16(8, 0, true);        // store
+    lh.setUint32(14, crc, true);
+    lh.setUint32(18, size, true);
+    lh.setUint32(22, size, true);
+    lh.setUint16(26, nameU8.length, true);
+    parts.push(new Uint8Array(lh.buffer), nameU8, f.blob);
+    cds.push({ nameU8, crc, size, offset });
+    offset += 30 + nameU8.length + size;
+  }
+  const cdStart = offset;
+  for (const c of cds) {
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true);
+    cd.setUint16(4, 20, true); cd.setUint16(6, 20, true);
+    cd.setUint16(8, 0x0800, true); cd.setUint16(10, 0, true);
+    cd.setUint32(16, c.crc, true);
+    cd.setUint32(20, c.size, true); cd.setUint32(24, c.size, true);
+    cd.setUint16(28, c.nameU8.length, true);
+    cd.setUint32(42, c.offset, true);
+    parts.push(new Uint8Array(cd.buffer), c.nameU8);
+    offset += 46 + c.nameU8.length;
+  }
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(8, cds.length, true); eocd.setUint16(10, cds.length, true);
+  eocd.setUint32(12, offset - cdStart, true);
+  eocd.setUint32(16, cdStart, true);
+  parts.push(new Uint8Array(eocd.buffer));
+  return new Blob(parts, { type: 'application/zip' });
+}
+
+async function zipOpen(file) {
+  const tailLen = Math.min(file.size, 65557);
+  const tail = new DataView(await file.slice(file.size - tailLen).arrayBuffer());
+  let e = -1;
+  for (let i = tail.byteLength - 22; i >= 0; i--)
+    if (tail.getUint32(i, true) === 0x06054b50) { e = i; break; }
+  if (e < 0) throw new Error('NOT_ZIP');
+  const count = tail.getUint16(e + 10, true);
+  const cdSize = tail.getUint32(e + 12, true);
+  const cdOff = tail.getUint32(e + 16, true);
+  const cd = new DataView(await file.slice(cdOff, cdOff + cdSize).arrayBuffer());
+  const dec = new TextDecoder();
+  const entries = new Map();
+  let p = 0;
+  for (let i = 0; i < count; i++) {
+    if (cd.getUint32(p, true) !== 0x02014b50) throw new Error('BAD_CD');
+    const method = cd.getUint16(p + 10, true);
+    const size = cd.getUint32(p + 20, true);
+    const nameLen = cd.getUint16(p + 28, true);
+    const extraLen = cd.getUint16(p + 30, true);
+    const commentLen = cd.getUint16(p + 32, true);
+    const localOff = cd.getUint32(p + 42, true);
+    const name = dec.decode(new Uint8Array(cd.buffer, p + 46, nameLen));
+    if (method === 0) {
+      let dataStart = null;
+      entries.set(name, {
+        size,
+        async data() {
+          if (dataStart === null) {
+            const lh = new DataView(await file.slice(localOff, localOff + 30).arrayBuffer());
+            dataStart = localOff + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+          }
+          return file.slice(dataStart, dataStart + size);
+        }
+      });
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+/* =====================================================================
+ * 画像ストア（元データ）と LOD デコードキャッシュ（表示用メモリ）
+ *
+ * store: imgId -> {w, h, ext, original, thumb}
+ *   original/thumb は Blob そのもの、または「必要になったら取りに行く関数」。
+ *   .mrmd から開いた場合はファイル内の該当バイト範囲を指す遅延参照になる
+ *   ため、ボードが何GBでも開く時にメモリへ読み込まない。
+ *
+ * bmpCache: `${imgId}:${lod}` -> デコード済み ImageBitmap
+ *   画面上の表示サイズに応じた解像度(256/1024/原寸)だけをデコードし、
+ *   予算(CACHE_BUDGET)を超えたら使っていないものから close() で解放する。
+ * =================================================================== */
+const store = new Map();
+let imgSeq = 1;
+const getBlob = ref => typeof ref === 'function' ? ref() : Promise.resolve(ref);
+
+const LOD_THUMB = 256, LOD_MID = 1024, LOD_FULL = 0;
+const bmpCache = new Map();
+const pendingDecodes = new Set();
+let cacheBytes = 0, clock = 0;
+let frameUsed = new Set();
+const CACHE_BUDGET = 1200 * 1024 * 1024; // デコード済みピクセルの予算(約1.2GB)
+
+function lodForSize(px) { return px <= 300 ? LOD_THUMB : px <= 1200 ? LOD_MID : LOD_FULL; }
+
+function bestAvailable(imgId, want) {
+  const order = want === LOD_THUMB ? [LOD_THUMB, LOD_MID, LOD_FULL]
+              : want === LOD_MID   ? [LOD_MID, LOD_FULL, LOD_THUMB]
+              :                      [LOD_FULL, LOD_MID, LOD_THUMB];
+  for (const l of order) {
+    const e = bmpCache.get(imgId + ':' + l);
+    if (e) { e.t = ++clock; frameUsed.add(imgId + ':' + l); return e.bmp; }
+  }
+  return null;
+}
+
+function requestDecode(imgId, lod) {
+  const key = imgId + ':' + lod;
+  if (bmpCache.has(key) || pendingDecodes.has(key)) return;
+  pendingDecodes.add(key);
+  decodeLod(imgId, lod).then(bmp => {
+    pendingDecodes.delete(key);
+    if (!bmp) return;
+    const bytes = bmp.width * bmp.height * 4;
+    bmpCache.set(key, { bmp, bytes, t: ++clock });
+    cacheBytes += bytes;
+    evict();
+    paint(); updateStatus();
+  }).catch(() => pendingDecodes.delete(key));
+}
+
+async function decodeLod(imgId, lod) {
+  const rec = store.get(imgId);
+  if (!rec) return null;
+  if (lod === LOD_THUMB && rec.thumb) return createImageBitmap(await getBlob(rec.thumb));
+  const blob = await getBlob(rec.original);
+  if (lod === LOD_FULL || Math.max(rec.w, rec.h) <= lod) return createImageBitmap(blob);
+  const k = lod / Math.max(rec.w, rec.h);
+  return createImageBitmap(blob, {
+    resizeWidth: Math.max(1, Math.round(rec.w * k)),
+    resizeHeight: Math.max(1, Math.round(rec.h * k)),
+    resizeQuality: 'high'
+  });
+}
+
+function evict() {
+  if (cacheBytes <= CACHE_BUDGET) return;
+  const entries = [...bmpCache.entries()].sort((a, b) => a[1].t - b[1].t);
+  for (const [key, e] of entries) {
+    if (cacheBytes <= CACHE_BUDGET * 0.85) break;
+    if (frameUsed.has(key)) continue;
+    bmpCache.delete(key);
+    cacheBytes -= e.bytes;
+    e.bmp.close();
+  }
+}
+
+async function blobToThumb(srcBmp) { // 256px WebP サムネイル
+  const k = LOD_THUMB / Math.max(srcBmp.width, srcBmp.height);
+  const w = Math.max(1, Math.round(srcBmp.width * k)), h = Math.max(1, Math.round(srcBmp.height * k));
+  if (typeof OffscreenCanvas !== 'undefined') {
+    const c = new OffscreenCanvas(w, h);
+    c.getContext('2d').drawImage(srcBmp, 0, 0, w, h);
+    return c.convertToBlob({ type: 'image/webp', quality: .8 });
+  }
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  c.getContext('2d').drawImage(srcBmp, 0, 0, w, h);
+  return new Promise(res => c.toBlob(res, 'image/webp', .8));
+}
+
+async function importImageBlob(blob, typeHint) { // -> imgId | null
+  let bmp;
+  try { bmp = await createImageBitmap(blob); } catch { return null; }
+  const id = 'i' + (imgSeq++);
+  const thumb = Math.max(bmp.width, bmp.height) > 320 ? await blobToThumb(bmp) : null;
+  const ext = ((typeHint || blob.type || 'image/png').split('/')[1] || 'png')
+    .replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'png';
+  store.set(id, { w: bmp.width, h: bmp.height, ext, original: blob, thumb });
+  bmp.close();
+  return id;
+}
+
+/* ============ 基本状態 ============ */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const dpr = () => window.devicePixelRatio || 1;
+
+let items = [];               // {id, imgId, x, y, w, h, rot, flipH, flipV, gray, opacity}
+let currentBoardName = 'board'; // 保存ファイル名（拡張子なし）
+let sel = new Set();
+let view = { ox: 0, oy: 0, s: 1 };
+let nextId = 1;
+
+const undoStack = [], redoStack = [];
+function snapshot() { return items.map(it => ({ ...it, crop: it.crop ? { ...it.crop } : it.crop })); }
+function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 60) undoStack.shift(); redoStack.length = 0; }
+function undo() { if (!undoStack.length) return; redoStack.push(snapshot()); items = undoStack.pop(); sel.clear(); cropState = null; paint(); }
+function redo() { if (!redoStack.length) return; undoStack.push(snapshot()); items = redoStack.pop(); sel.clear(); cropState = null; paint(); }
+
+/* ============ 座標変換 ============ */
+const w2sX = x => x * view.s + view.ox, w2sY = y => y * view.s + view.oy;
+const s2wX = x => (x - view.ox) / view.s, s2wY = y => (y - view.oy) / view.s;
+function localOf(it, wx, wy) {
+  const dx = wx - it.x, dy = wy - it.y, c = Math.cos(-it.rot), s = Math.sin(-it.rot);
+  return [dx * c - dy * s, dx * s + dy * c];
+}
+function worldOf(it, lx, ly) {
+  const c = Math.cos(it.rot), s = Math.sin(it.rot);
+  return [it.x + lx * c - ly * s, it.y + lx * s + ly * c];
+}
+function corners(it) {
+  const hw = it.w / 2, hh = it.h / 2;
+  return [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(p => worldOf(it, p[0], p[1]));
+}
+
+/* ============ 描画 ============ */
+let raf = 0;
+function paint() { if (!raf) raf = requestAnimationFrame(render); }
+function render() {
+  raf = 0;
+  const d = dpr(), W = cv.width = innerWidth * d, H = cv.height = innerHeight * d;
+  frameUsed = new Set();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg');
+  ctx.fillRect(0, 0, W, H);
+
+  if (gridMode > 0 && view.s > .25) { // ドットグリッド
+    const gs = GRID * view.s * d;
+    ctx.fillStyle = gridMode === 2 ? '#ffb45428' : '#ffffff10';
+    const x0 = ((view.ox * d) % gs + gs) % gs, y0 = ((view.oy * d) % gs + gs) % gs;
+    for (let x = x0; x < W; x += gs) for (let y = y0; y < H; y += gs) ctx.fillRect(x - 1, y - 1, 2, 2);
+  }
+
+  ctx.setTransform(view.s * d, 0, 0, view.s * d, view.ox * d, view.oy * d);
+  const margin = 200; // 画面外判定の余白(スクリーンpx)
+  for (const it of items) {
+    // 可視判定：画面外の画像はデコード要求すら出さない
+    const r = Math.hypot(it.w, it.h) / 2 * view.s;
+    const sx = w2sX(it.x), sy = w2sY(it.y);
+    const visible = sx + r > -margin && sx - r < innerWidth + margin &&
+                    sy + r > -margin && sy - r < innerHeight + margin;
+    if (!visible) continue;
+    drawItem(ctx, it, true);
+  }
+
+  if (cropState) drawCropOverlay(d);
+
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  for (const it of items) if (sel.has(it.id) && !(cropState && cropState.id === it.id)) drawSelection(it);
+  if (band) {
+    ctx.strokeStyle = '#5ab0ff'; ctx.fillStyle = '#5ab0ff18'; ctx.lineWidth = 1;
+    const x = Math.min(band.x0, band.x1), y = Math.min(band.y0, band.y1),
+          w = Math.abs(band.x1 - band.x0), h = Math.abs(band.y1 - band.y0);
+    ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h);
+  }
+
+  document.getElementById('hint').style.display = items.length ? 'none' : 'grid';
+  updateStatus();
+}
+function drawItem(g, it, live) {
+  g.save();
+  g.translate(it.x, it.y); g.rotate(it.rot);
+  g.globalAlpha = it.opacity;
+  if (it.type === 'note') { drawNote(g, it); g.restore(); return; } // メモは反転/グレスケ対象外
+  g.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
+  g.filter = it.gray ? 'grayscale(1)' : 'none';
+  let bmp = null;
+  if (live) {
+    const c = it.crop;
+    // クロップ時は表示部分が原寸の一部なので、必要解像度を割り増しする
+    const need = Math.max(it.w / (c ? c.w : 1), it.h / (c ? c.h : 1)) * view.s * dpr();
+    const lod = lodForSize(need);
+    requestDecode(it.imgId, lod);       // 目標解像度を非同期で用意
+    bmp = bestAvailable(it.imgId, lod); // 今あるベストで描く（プログレッシブ）
+  }
+  if (bmp) {
+    const c = it.crop;
+    if (c) g.drawImage(bmp, c.x * bmp.width, c.y * bmp.height, Math.max(1, c.w * bmp.width), Math.max(1, c.h * bmp.height), -it.w / 2, -it.h / 2, it.w, it.h);
+    else g.drawImage(bmp, -it.w / 2, -it.h / 2, it.w, it.h);
+  } else { // まだ何もデコードされていない：プレースホルダ
+    g.fillStyle = '#24262c'; g.fillRect(-it.w / 2, -it.h / 2, it.w, it.h);
+    g.strokeStyle = '#3a3d46'; g.lineWidth = 2 / view.s;
+    g.strokeRect(-it.w / 2, -it.h / 2, it.w, it.h);
+  }
+  g.restore();
+}
+/* ============ メモ ============ */
+const NOTE_COLORS = [['#ffd977', '#26241c'], ['#a8d8ff', '#122438'], ['#b8f0c0', '#15301a'], ['#ffc4d6', '#3a1622'], ['#2b2e36', '#e8eaef']];
+function rrPath(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+function wrapText(g, text, maxW) {
+  const out = [];
+  for (const para of String(text).split('\n')) {
+    let line = '';
+    for (const ch of para) {
+      if (line && g.measureText(line + ch).width > maxW) { out.push(line); line = ch; }
+      else line += ch;
+    }
+    out.push(line);
+  }
+  return out;
+}
+function drawNote(g, it) {
+  const r = Math.min(14, it.w / 8, it.h / 8);
+  g.fillStyle = it.bg || NOTE_COLORS[0][0];
+  rrPath(g, -it.w / 2, -it.h / 2, it.w, it.h, r);
+  g.fill();
+  const fs = it.fontSize || 18;
+  const pad = fs * 0.7;
+  g.font = `${fs}px "Hiragino Sans","Noto Sans JP",sans-serif`;
+  g.textBaseline = 'top';
+  let txt = it.text || '';
+  if (!txt) { txt = 'ダブルクリックで編集'; g.globalAlpha *= 0.5; }
+  g.fillStyle = it.fg || NOTE_COLORS[0][1];
+  const lines = wrapText(g, txt, it.w - pad * 2);
+  const lh = fs * 1.45;
+  let y = -it.h / 2 + pad;
+  for (const ln of lines) {
+    if (y + lh > it.h / 2 - pad + 1) break;
+    g.fillText(ln, -it.w / 2 + pad, y);
+    y += lh;
+  }
+}
+function addNote(wx, wy) {
+  pushUndo();
+  const it = { id: nextId++, type: 'note', text: '', x: wx, y: wy, w: 260, h: 150,
+    rot: 0, flipH: false, flipV: false, gray: false, opacity: 1,
+    bg: NOTE_COLORS[0][0], fg: NOTE_COLORS[0][1], fontSize: 18 };
+  items.push(it);
+  sel.clear(); sel.add(it.id);
+  paint();
+  openNoteEditor(it);
+  return it;
+}
+function cycleNoteColor(it) {
+  pushUndo();
+  const idx = NOTE_COLORS.findIndex(c => c[0] === it.bg);
+  const nx = NOTE_COLORS[(idx + 1) % NOTE_COLORS.length];
+  it.bg = nx[0]; it.fg = nx[1];
+  paint();
+}
+const noteEdit = document.getElementById('noteEdit');
+let editingNote = null;
+function openNoteEditor(it) {
+  editingNote = it;
+  const w = Math.max(140, it.w * view.s), h = Math.max(70, it.h * view.s);
+  Object.assign(noteEdit.style, {
+    display: 'block',
+    left: (w2sX(it.x) - w / 2) + 'px', top: (w2sY(it.y) - h / 2) + 'px',
+    width: w + 'px', height: h + 'px',
+    background: it.bg || NOTE_COLORS[0][0], color: it.fg || NOTE_COLORS[0][1],
+    fontSize: Math.max(11, (it.fontSize || 18) * view.s) + 'px',
+  });
+  noteEdit.value = it.text || '';
+  noteEdit.focus();
+}
+function closeNoteEditor(commit) {
+  if (!editingNote) return;
+  if (commit && noteEdit.value !== (editingNote.text || '')) { pushUndo(); editingNote.text = noteEdit.value; }
+  editingNote = null;
+  noteEdit.style.display = 'none';
+  paint();
+}
+noteEdit.addEventListener('blur', () => closeNoteEditor(true));
+noteEdit.addEventListener('keydown', e => {
+  e.stopPropagation();
+  if (e.key === 'Escape') closeNoteEditor(false);
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) closeNoteEditor(true);
+});
+/* ============ クロップ ============ */
+let cropState = null; // {id, Wf, Hf} Wf/Hf=フル画像の表示サイズ（クロップ中は不変）
+function toggleCrop() {
+  if (cropState) { cropState = null; paint(); return; }
+  if (sel.size !== 1) { toast('画像を1枚だけ選択してください'); return; }
+  const it = items.find(i => sel.has(i.id));
+  if (!it || it.type === 'note') { toast('メモはクロップできません'); return; }
+  pushUndo(); // クロップ前の状態を積む（Ctrl+Zで丸ごと戻せる）
+  if (!it.crop) it.crop = { x: 0, y: 0, w: 1, h: 1 };
+  cropState = { id: it.id, Wf: it.w / it.crop.w, Hf: it.h / it.crop.h };
+  paint();
+}
+function cropFullCenter(it, cs) { // フル画像の中心（world座標）
+  const c = it.crop;
+  const dx = (0.5 - (c.x + c.w / 2)) * cs.Wf * (it.flipH ? -1 : 1);
+  const dy = (0.5 - (c.y + c.h / 2)) * cs.Hf * (it.flipV ? -1 : 1);
+  return worldOf(it, dx, dy);
+}
+function clearCrop(it) {
+  if (!it.crop) return;
+  pushUndo();
+  const c = it.crop, Wf = it.w / c.w, Hf = it.h / c.h;
+  const ddx = (0.5 - (c.x + c.w / 2)) * Wf * (it.flipH ? -1 : 1);
+  const ddy = (0.5 - (c.y + c.h / 2)) * Hf * (it.flipV ? -1 : 1);
+  const cc = Math.cos(it.rot), ss = Math.sin(it.rot);
+  it.x += ddx * cc - ddy * ss;
+  it.y += ddx * ss + ddy * cc;
+  it.w = Wf; it.h = Hf; it.crop = null;
+  cropState = null;
+  paint();
+}
+function cropHandlePts(it) {
+  const cs4 = corners(it).map(p => [w2sX(p[0]), w2sY(p[1])]);
+  const edges = [];
+  for (let k = 0; k < 4; k++) {
+    const a = cs4[k], b = cs4[(k + 1) % 4];
+    edges.push([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+  }
+  return { corners: cs4, edges }; // corners: TL,TR,BR,BL / edges: 上,右,下,左
+}
+function cropHandleAt(px, py, coarse) {
+  const it = items.find(i => i.id === cropState.id);
+  if (!it) return null;
+  const { corners: cs4, edges } = cropHandlePts(it);
+  const R = coarse ? 18 : 12;
+  for (let k = 0; k < 4; k++) if (Math.abs(px - cs4[k][0]) < R && Math.abs(py - cs4[k][1]) < R) return { corner: k, it };
+  for (let k = 0; k < 4; k++) if (Math.abs(px - edges[k][0]) < R && Math.abs(py - edges[k][1]) < R) return { edge: k, it };
+  return null;
+}
+function drawCropOverlay(d) {
+  const it = items.find(i => i.id === cropState.id);
+  if (!it) { cropState = null; return; }
+  // ゴースト（フル画像を薄く表示）
+  requestDecode(it.imgId, LOD_MID);
+  const bmp = bestAvailable(it.imgId, LOD_MID);
+  const [fx, fy] = cropFullCenter(it, cropState);
+  if (bmp) {
+    ctx.save();
+    ctx.setTransform(view.s * d, 0, 0, view.s * d, view.ox * d, view.oy * d);
+    ctx.translate(fx, fy); ctx.rotate(it.rot);
+    ctx.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
+    ctx.globalAlpha = 0.3;
+    ctx.drawImage(bmp, -cropState.Wf / 2, -cropState.Hf / 2, cropState.Wf, cropState.Hf);
+    ctx.restore();
+    // クロップ部分を上から再描画（くっきり見せる）
+    ctx.setTransform(view.s * d, 0, 0, view.s * d, view.ox * d, view.oy * d);
+    drawItem(ctx, it, true);
+  }
+  // 枠とハンドル
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  const { corners: cs4, edges } = cropHandlePts(it);
+  ctx.strokeStyle = '#ffb454'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  cs4.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+  ctx.closePath(); ctx.stroke();
+  ctx.fillStyle = '#ffb454';
+  for (const p of [...cs4, ...edges]) ctx.fillRect(p[0] - 5, p[1] - 5, 10, 10);
+}
+/* ============ グリッド ============ */
+let gridMode = 1; // 0=非表示 1=表示 2=表示+スナップ
+const GRID = 64;
+function cycleGrid() {
+  gridMode = (gridMode + 1) % 3;
+  toast(['グリッド: 非表示', 'グリッド: 表示', 'グリッド: スナップ有効'][gridMode]);
+  paint();
+}
+const HANDLE = 6, ROT_OFF = 26;
+function handlePts(it) {
+  const cs = corners(it).map(p => [w2sX(p[0]), w2sY(p[1])]);
+  const [tx, ty] = worldOf(it, 0, -it.h / 2);
+  const topX = w2sX(tx), topY = w2sY(ty);
+  const ang = it.rot - Math.PI / 2;
+  const rot = [topX + Math.cos(ang) * ROT_OFF, topY + Math.sin(ang) * ROT_OFF];
+  return { cs, rot, top: [topX, topY] };
+}
+function drawSelection(it) {
+  const single = sel.size === 1;
+  const { cs, rot, top } = handlePts(it);
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--sel');
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  cs.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+  ctx.closePath(); ctx.stroke();
+  if (!single) return;
+  ctx.fillStyle = '#fff';
+  for (const p of cs) { ctx.fillRect(p[0] - HANDLE / 2, p[1] - HANDLE / 2, HANDLE, HANDLE); ctx.strokeRect(p[0] - HANDLE / 2, p[1] - HANDLE / 2, HANDLE, HANDLE); }
+  ctx.beginPath(); ctx.moveTo(top[0], top[1]); ctx.lineTo(rot[0], rot[1]); ctx.stroke();
+  ctx.beginPath(); ctx.arc(rot[0], rot[1], HANDLE / 2 + 1, 0, 7); ctx.fill(); ctx.stroke();
+}
+function updateStatus() {
+  document.getElementById('status').textContent =
+    `${items.length}枚 ・ デコード ${(cacheBytes / 1048576) | 0}MB ・ ${Math.round(view.s * 100)}%`;
+}
+
+/* ============ ヒットテスト ============ */
+function itemAt(wx, wy) {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i], [lx, ly] = localOf(it, wx, wy);
+    if (Math.abs(lx) <= it.w / 2 && Math.abs(ly) <= it.h / 2) return it;
+  }
+  return null;
+}
+function handleAt(px, py, coarse) { // coarse=true(タッチ)は当たり判定を約2倍に
+  if (sel.size !== 1) return null;
+  const it = items.find(i => sel.has(i.id));
+  if (!it) return null;
+  const { cs, rot } = handlePts(it);
+  const rr = coarse ? 20 : 9, hr = coarse ? 18 : 8;
+  if (Math.hypot(px - rot[0], py - rot[1]) < rr) return { type: 'rotate', it };
+  for (let k = 0; k < 4; k++)
+    if (Math.abs(px - cs[k][0]) < hr && Math.abs(py - cs[k][1]) < hr) return { type: 'scale', it, k };
+  return null;
+}
+
+/* ============ 入力 ============ */
+let mode = null, band = null, spaceDown = false;
+let drag = {};
+const pointers = new Map();           // アクティブなポインタ（タッチ/マウス共通）
+let longPressTimer = 0;               // タッチ長押し→メニュー
+let lastTap = { t: 0, x: 0, y: 0 };   // ダブルタップ検出
+let lastDoubleTapT = 0;
+
+function startPinch() { // 2本指: ピンチズーム＋パン
+  clearTimeout(longPressTimer);
+  const [a, b] = [...pointers.values()];
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  mode = 'pinch'; band = null;
+  drag = { d0: Math.max(10, Math.hypot(a.x - b.x, a.y - b.y)), s0: view.s, wx: s2wX(mx), wy: s2wY(my) };
+}
+function movePinch() { // 2本指の中点を不動点として拡縮・移動
+  if (pointers.size < 2) return;
+  const [a, b] = [...pointers.values()];
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const d = Math.max(10, Math.hypot(a.x - b.x, a.y - b.y));
+  view.s = Math.min(32, Math.max(.02, drag.s0 * d / drag.d0));
+  view.ox = mx - drag.wx * view.s;
+  view.oy = my - drag.wy * view.s;
+  paint();
+}
+function beginHandleDrag(h) { // 拡縮/回転ハンドルのドラッグ開始（マウス・タッチ共通）
+  pushUndo();
+  if (h.type === 'rotate') { mode = 'rotate'; drag.it = h.it; }
+  else {
+    mode = 'scale'; drag.it = h.it;
+    const sign = [[-1, -1], [1, -1], [1, 1], [-1, 1]][h.k];
+    drag.sign = sign;
+    const [ax, ay] = worldOf(h.it, -sign[0] * h.it.w / 2, -sign[1] * h.it.h / 2);
+    drag.anchor = [ax, ay]; drag.w0 = h.it.w; drag.h0 = h.it.h;
+  }
+}
+
+cv.addEventListener('pointerdown', e => {
+  hideMenu();
+  cv.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 2) { startPinch(); return; }
+  if (pointers.size > 2) return;
+
+  const px = e.clientX, py = e.clientY;
+  const wx = s2wX(px), wy = s2wY(py);
+  const touch = e.pointerType === 'touch';
+  drag = { px, py, wx, wy, moved: false, button: e.button, touch };
+
+  if (cropState && e.button !== 1 && e.button !== 2 && !spaceDown) { // ---- クロップモード ----
+    const ch = cropHandleAt(px, py, touch);
+    if (ch) {
+      mode = 'crop';
+      const it2 = ch.it;
+      const f = { L: false, R: false, T: false, B: false };
+      // 反転時は「見た目の辺」と「ソース座標の辺」が入れ替わる
+      const visToSrcH = v => it2.flipH ? (v === 'L' ? 'R' : 'L') : v;
+      const visToSrcV = v => it2.flipV ? (v === 'T' ? 'B' : 'T') : v;
+      if (ch.corner !== undefined) {
+        f[visToSrcH(ch.corner === 0 || ch.corner === 3 ? 'L' : 'R')] = true;
+        f[visToSrcV(ch.corner === 0 || ch.corner === 1 ? 'T' : 'B')] = true;
+      } else {
+        if (ch.edge === 0) f[visToSrcV('T')] = true;
+        if (ch.edge === 1) f[visToSrcH('R')] = true;
+        if (ch.edge === 2) f[visToSrcV('B')] = true;
+        if (ch.edge === 3) f[visToSrcH('L')] = true;
+      }
+      drag.cit = it2;
+      drag.c0 = { ...it2.crop };
+      drag.eh = f;
+      drag.fullC = cropFullCenter(it2, cropState); // フル画像中心は固定（不変条件）
+      return;
+    }
+    cropState = null; paint(); // ハンドル外クリック：クロップ終了して通常処理へ
+  }
+
+  if (touch) { // ---- タッチ専用ルート（マウス処理には影響しない）----
+    clearTimeout(longPressTimer);
+    longPressTimer = setTimeout(() => { // 長押しでメニュー
+      if (!drag.moved && pointers.size === 1 && mode !== 'pinch') { mode = null; openMenu(px, py); }
+    }, 500);
+    const h = handleAt(px, py, true); // タッチは当たり判定を広く
+    if (h) { beginHandleDrag(h); return; }
+    const hit = itemAt(wx, wy);
+    if (hit) {
+      if (!sel.has(hit.id)) { sel.clear(); sel.add(hit.id); }
+      mode = 'move';
+      drag.starts = items.filter(i => sel.has(i.id)).map(i => ({ it: i, x: i.x, y: i.y }));
+      drag.undoPushed = false;
+    } else { // 空白は1本指パン（動かさなければタップ＝選択解除）
+      mode = 'pan'; drag.ox = view.ox; drag.oy = view.oy; drag.tapEmpty = true;
+    }
+    paint(); return;
+  }
+
+  // ---- マウス（従来どおり）----
+  if (e.button === 1 || e.button === 2 || (e.button === 0 && spaceDown)) {
+    mode = 'pan'; drag.ox = view.ox; drag.oy = view.oy; return;
+  }
+  if (e.button !== 0) return;
+
+  const h = handleAt(px, py);
+  if (h) { beginHandleDrag(h); return; }
+  const hit = itemAt(wx, wy);
+  if (hit) {
+    if (e.shiftKey) { sel.has(hit.id) ? sel.delete(hit.id) : sel.add(hit.id); }
+    else if (!sel.has(hit.id)) { sel.clear(); sel.add(hit.id); }
+    mode = 'move';
+    drag.starts = items.filter(i => sel.has(i.id)).map(i => ({ it: i, x: i.x, y: i.y }));
+    drag.undoPushed = false;
+  } else {
+    if (!e.shiftKey) sel.clear();
+    mode = 'band'; band = { x0: px, y0: py, x1: px, y1: py, add: e.shiftKey };
+  }
+  paint();
+});
+
+cv.addEventListener('pointermove', e => {
+  const pt = pointers.get(e.pointerId);
+  if (pt) { pt.x = e.clientX; pt.y = e.clientY; }
+  if (mode === 'pinch') { movePinch(); return; }
+  if (!mode) { updateCursor(e); return; }
+  const px = e.clientX, py = e.clientY;
+  if (Math.hypot(px - drag.px, py - drag.py) > 3) { drag.moved = true; clearTimeout(longPressTimer); }
+
+  if (mode === 'pan') {
+    view.ox = drag.ox + (px - drag.px); view.oy = drag.oy + (py - drag.py); paint(); return;
+  }
+  const wx = s2wX(px), wy = s2wY(py);
+
+  if (mode === 'crop') {
+    const it = drag.cit, cs = cropState;
+    if (!it || !cs) { mode = null; return; }
+    // マウス位置 → フル画像のソース正規化座標(u,v)
+    const [fx, fy] = drag.fullC;
+    const dxw = wx - fx, dyw = wy - fy;
+    const cos = Math.cos(-it.rot), sin = Math.sin(-it.rot);
+    let lx = dxw * cos - dyw * sin, ly = dxw * sin + dyw * cos;
+    if (it.flipH) lx = -lx;
+    if (it.flipV) ly = -ly;
+    let u = Math.min(1, Math.max(0, lx / cs.Wf + 0.5));
+    let v = Math.min(1, Math.max(0, ly / cs.Hf + 0.5));
+    const o = drag.c0, MIN = 0.02;
+    let x1 = o.x, x2 = o.x + o.w, y1 = o.y, y2 = o.y + o.h;
+    if (drag.eh.L) x1 = Math.min(u, x2 - MIN);
+    if (drag.eh.R) x2 = Math.max(u, x1 + MIN);
+    if (drag.eh.T) y1 = Math.min(v, y2 - MIN);
+    if (drag.eh.B) y2 = Math.max(v, y1 + MIN);
+    it.crop = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+    // フル画像を固定したままアイテムの位置とサイズを更新
+    it.w = cs.Wf * it.crop.w; it.h = cs.Hf * it.crop.h;
+    const ddx = ((it.crop.x + it.crop.w / 2) - 0.5) * cs.Wf * (it.flipH ? -1 : 1);
+    const ddy = ((it.crop.y + it.crop.h / 2) - 0.5) * cs.Hf * (it.flipV ? -1 : 1);
+    const cc = Math.cos(it.rot), ss = Math.sin(it.rot);
+    it.x = fx + ddx * cc - ddy * ss;
+    it.y = fy + ddx * ss + ddy * cc;
+    paint(); return;
+  }
+  if (mode === 'move') {
+    if (!drag.undoPushed && drag.moved) {
+      const snap = snapshot(); // 移動前の位置でスナップショットを積む
+      for (const s of drag.starts) { const rec = snap.find(r => r.id === s.it.id); if (rec) { rec.x = s.x; rec.y = s.y; } }
+      undoStack.push(snap);
+      if (undoStack.length > 60) undoStack.shift();
+      redoStack.length = 0;
+      drag.undoPushed = true;
+    }
+    let dx = wx - drag.wx, dy = wy - drag.wy;
+    if (gridMode === 2 && !e.altKey) { // グリッドスナップ（Altで一時無効）
+      if (!drag.bbox0) { // 開始時点の選択グループのバウンディングボックス
+        let l = 1e15, t = 1e15, r = -1e15, b = -1e15;
+        for (const s of drag.starts) {
+          for (const [cx2, cy2] of corners({ ...s.it, x: s.x, y: s.y })) {
+            l = Math.min(l, cx2); r = Math.max(r, cx2); t = Math.min(t, cy2); b = Math.max(b, cy2);
+          }
+        }
+        drag.bbox0 = { l, t, r, b };
+      }
+      const th = 10 / view.s;
+      const snapAxis = (vals) => {
+        let best = null;
+        for (const v of vals) {
+          const dlt = Math.round(v / GRID) * GRID - v;
+          if (Math.abs(dlt) < th && (best === null || Math.abs(dlt) < Math.abs(best))) best = dlt;
+        }
+        return best;
+      };
+      const bb = drag.bbox0;
+      const sx2 = snapAxis([bb.l + dx, bb.r + dx, (bb.l + bb.r) / 2 + dx]);
+      const sy2 = snapAxis([bb.t + dy, bb.b + dy, (bb.t + bb.b) / 2 + dy]);
+      if (sx2 !== null) dx += sx2;
+      if (sy2 !== null) dy += sy2;
+    }
+    for (const s of drag.starts) { s.it.x = s.x + dx; s.it.y = s.y + dy; }
+    paint(); return;
+  }
+  if (mode === 'scale') {
+    const it = drag.it, [ax, ay] = drag.anchor;
+    const c = Math.cos(-it.rot), s = Math.sin(-it.rot);
+    let lx = (wx - ax) * c - (wy - ay) * s, ly = (wx - ax) * s + (wy - ay) * c;
+    lx *= drag.sign[0]; ly *= drag.sign[1];
+    let w = Math.max(8, lx), h = Math.max(8, ly);
+    if (!e.shiftKey) { const k = Math.max(w / drag.w0, h / drag.h0); w = drag.w0 * k; h = drag.h0 * k; }
+    it.w = w; it.h = h;
+    const cxp = drag.sign[0] * w / 2, cyp = drag.sign[1] * h / 2;
+    const cc = Math.cos(it.rot), ss = Math.sin(it.rot);
+    it.x = ax + cxp * cc - cyp * ss; it.y = ay + cxp * ss + cyp * cc;
+    paint(); return;
+  }
+  if (mode === 'rotate') {
+    const it = drag.it;
+    let a = Math.atan2(wy - it.y, wx - it.x) + Math.PI / 2;
+    if (e.shiftKey) { const step = Math.PI / 12; a = Math.round(a / step) * step; }
+    it.rot = a; paint(); return;
+  }
+  if (mode === 'band') {
+    band.x1 = px; band.y1 = py;
+    const x0 = s2wX(Math.min(band.x0, band.x1)), x1 = s2wX(Math.max(band.x0, band.x1));
+    const y0 = s2wY(Math.min(band.y0, band.y1)), y1 = s2wY(Math.max(band.y0, band.y1));
+    if (!band.add) sel.clear();
+    for (const it of items) if (it.x >= x0 && it.x <= x1 && it.y >= y0 && it.y <= y1) sel.add(it.id);
+    paint(); return;
+  }
+});
+
+cv.addEventListener('pointerup', e => {
+  clearTimeout(longPressTimer);
+  pointers.delete(e.pointerId);
+  if (mode === 'pinch') { if (pointers.size < 2) mode = null; paint(); return; }
+  if (mode === 'pan' && !drag.moved && drag.button === 2 && !drag.touch) openMenu(e.clientX, e.clientY);
+  if (drag.touch && !drag.moved && mode) { // タッチのタップ処理（長押しでメニューが開いた場合は mode=null で通らない）
+    const now = performance.now();
+    if (now - lastTap.t < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) {
+      // ダブルタップ：メモは編集、画像はフィット表示
+      const it = itemAt(s2wX(e.clientX), s2wY(e.clientY));
+      if (it && it.type === 'note') openNoteEditor(it);
+      else if (it) fitToRect(it.x - it.w / 2, it.y - it.h / 2, it.w, it.h);
+      else view.s = 1;
+      lastDoubleTapT = now;
+      lastTap = { t: 0, x: 0, y: 0 };
+    } else {
+      lastTap = { t: now, x: e.clientX, y: e.clientY };
+      if (drag.tapEmpty) sel.clear(); // 空白タップで選択解除
+    }
+  }
+  mode = null; band = null; paint();
+});
+cv.addEventListener('pointercancel', e => {
+  clearTimeout(longPressTimer);
+  pointers.delete(e.pointerId);
+  mode = null; band = null; paint();
+});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+cv.addEventListener('dblclick', e => {
+  if (performance.now() - lastDoubleTapT < 600) return; // タッチのダブルタップと二重処理しない
+  const it = itemAt(s2wX(e.clientX), s2wY(e.clientY));
+  if (it && it.type === 'note') { openNoteEditor(it); return; }
+  if (it) fitToRect(it.x - it.w / 2, it.y - it.h / 2, it.w, it.h);
+  else { view.s = 1; paint(); }
+});
+
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (e.altKey && sel.size) {
+    const d = e.deltaY < 0 ? .05 : -.05;
+    for (const it of items) if (sel.has(it.id)) it.opacity = Math.min(1, Math.max(.05, it.opacity + d));
+    paint(); return;
+  }
+  const f = Math.pow(1.0015, -e.deltaY);
+  const ns = Math.min(32, Math.max(.02, view.s * f));
+  const k = ns / view.s;
+  view.ox = e.clientX - (e.clientX - view.ox) * k;
+  view.oy = e.clientY - (e.clientY - view.oy) * k;
+  view.s = ns; paint();
+}, { passive: false });
+
+function updateCursor(e) {
+  if (spaceDown) { cv.style.cursor = 'grab'; return; }
+  const h = handleAt(e.clientX, e.clientY);
+  cv.style.cursor = h ? (h.type === 'rotate' ? 'crosshair' : 'nwse-resize')
+                      : (itemAt(s2wX(e.clientX), s2wY(e.clientY)) ? 'move' : 'default');
+}
+
+/* ============ キーボード ============ */
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.code === 'Space') { spaceDown = true; cv.style.cursor = 'grab'; e.preventDefault(); return; }
+  const ctl = e.ctrlKey || e.metaKey;
+  const selected = () => items.filter(i => sel.has(i.id));
+
+  if (cropState && (e.key === 'Enter' || e.key === 'Escape' || e.key.toLowerCase() === 'c')) {
+    cropState = null; paint(); return; // クロップ確定
+  }
+  if (e.key === 'Escape') { sel.clear(); hideMenu(); helpBox.style.display = 'none'; paint(); return; }
+  if (ctl && e.key.toLowerCase() === 'a') { e.preventDefault(); items.forEach(i => sel.add(i.id)); paint(); return; }
+  if (ctl && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+  if (ctl && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSel(); return; }
+  if (ctl && e.key.toLowerCase() === 's') { e.preventDefault(); saveBoard(); return; }
+  if (ctl && e.key.toLowerCase() === 'o') { e.preventDefault(); fJson.click(); return; }
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (sel.size) { pushUndo(); items = items.filter(i => !sel.has(i.id)); sel.clear(); paint(); }
+    return;
+  }
+  if (e.key === '?') { helpBox.style.display = 'grid'; return; }
+
+  switch (e.key.toLowerCase()) {
+    case 'f': fitAll(); break;
+    case 'a': if (!ctl) arrange(); break;
+    case 'c': if (!ctl) toggleCrop(); break;
+    case 'n': if (!ctl) addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)); break;
+    case 's': if (!ctl) cycleGrid(); break;
+    case 'g': if (sel.size) { pushUndo(); selected().forEach(i => { if (i.type !== 'note') i.gray = !i.gray; }); paint(); } break;
+    case 'h': if (sel.size) { pushUndo(); selected().forEach(i => { if (i.type !== 'note') i.flipH = !i.flipH; }); paint(); } break;
+    case 'v': if (!ctl && sel.size) { pushUndo(); selected().forEach(i => { if (i.type !== 'note') i.flipV = !i.flipV; }); paint(); } break;
+    case 'r': if (sel.size) { pushUndo(); selected().forEach(i => i.rot = 0); paint(); } break;
+    case 'home': view.s = 1; paint(); break;
+  }
+  if (e.key === 'PageUp' && sel.size) { pushUndo(); const s = selected(); items = items.filter(i => !sel.has(i.id)).concat(s); paint(); }
+  if (e.key === 'PageDown' && sel.size) { pushUndo(); const s = selected(); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }
+});
+addEventListener('keyup', e => { if (e.code === 'Space') { spaceDown = false; cv.style.cursor = 'default'; } });
+
+/* ============ 画像の追加 ============ */
+function addItemForImage(imgId, wx, wy) {
+  const rec = store.get(imgId);
+  const k = Math.min(1, 480 / Math.max(rec.w, rec.h)); // 追加時の見た目サイズを揃える
+  const it = { id: nextId++, imgId, x: wx, y: wy, w: rec.w * k, h: rec.h * k,
+    rot: 0, flipH: false, flipV: false, gray: false, opacity: 1 };
+  items.push(it);
+  return it;
+}
+async function addFiles(files, cx, cy) {
+  const list = [...files].filter(f => f.type.startsWith('image/'));
+  if (!list.length) return;
+  pushUndo();
+  const wx = cx !== undefined ? s2wX(cx) : s2wX(innerWidth / 2);
+  const wy = cy !== undefined ? s2wY(cy) : s2wY(innerHeight / 2);
+  const cols = Math.ceil(Math.sqrt(list.length));
+  let i = 0, added = 0;
+  sel.clear();
+  for (const f of list) {
+    progress('読み込み中', i / list.length);
+    const imgId = await importImageBlob(f, f.type);
+    if (imgId) {
+      const gx = list.length === 1 ? wx : wx + (i % cols) * 520;
+      const gy = list.length === 1 ? wy : wy + Math.floor(i / cols) * 520;
+      sel.add(addItemForImage(imgId, gx, gy).id);
+      added++;
+    }
+    i++;
+    paint();
+  }
+  progressDone();
+  toast(added + ' 枚追加しました');
+}
+
+/* ドラッグ&ドロップ */
+const dropOverlay = document.getElementById('drop');
+addEventListener('dragover', e => { e.preventDefault(); dropOverlay.style.display = 'grid'; });
+addEventListener('dragleave', e => { if (e.relatedTarget === null) dropOverlay.style.display = 'none'; });
+addEventListener('drop', e => {
+  e.preventDefault(); dropOverlay.style.display = 'none';
+  const fs = [...e.dataTransfer.files];
+  const board = fs.find(f => /\.(mrmd|zip)$/i.test(f.name));
+  if (board) { loadBoard(board); return; }
+  if (fs.length) addFiles(fs, e.clientX, e.clientY);
+});
+/* クリップボード */
+addEventListener('paste', e => {
+  const fs = [...(e.clipboardData?.items || [])].filter(i => i.type.startsWith('image/')).map(i => i.getAsFile());
+  if (fs.length) { e.preventDefault(); addFiles(fs); }
+});
+
+/* ============ 操作系 ============ */
+function duplicateSel() { // imgIdを共有するのでメモリは増えない
+  if (!sel.size) return;
+  pushUndo();
+  const copies = items.filter(i => sel.has(i.id)).map(i => ({
+    ...i, id: nextId++,
+    crop: i.crop ? { ...i.crop } : i.crop,
+    x: i.x + 30 / view.s + 20, y: i.y + 30 / view.s + 20
+  }));
+  items.push(...copies);
+  sel = new Set(copies.map(c => c.id));
+  paint();
+}
+function fitToRect(x, y, w, h) {
+  const pad = 60;
+  const s = Math.min((innerWidth - pad * 2) / w, (innerHeight - pad * 2) / h);
+  view.s = Math.min(4, s);
+  view.ox = innerWidth / 2 - (x + w / 2) * view.s;
+  view.oy = innerHeight / 2 - (y + h / 2) * view.s;
+  paint();
+}
+function boardBBox() {
+  let x0 = 1e15, y0 = 1e15, x1 = -1e15, y1 = -1e15;
+  for (const it of items) for (const [px, py] of corners(it)) {
+    x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py);
+  }
+  return [x0, y0, x1, y1];
+}
+function fitAll() {
+  if (!items.length) return;
+  const [x0, y0, x1, y1] = boardBBox();
+  fitToRect(x0, y0, x1 - x0, y1 - y0);
+}
+function arrange() {
+  const target = sel.size >= 2 ? items.filter(i => sel.has(i.id)) : items.slice();
+  if (target.length < 2) return;
+  pushUndo();
+  const hs = target.map(i => i.h).sort((a, b) => a - b);
+  const H = hs[Math.floor(hs.length / 2)];
+  const gap = 14;
+  const norm = target.map(i => { const k = H / i.h; return { it: i, w: i.w * k, h: H }; });
+  const totalW = norm.reduce((a, b) => a + b.w + gap, 0);
+  const rowW = Math.max(H * 2, Math.sqrt(totalW * H * 1.6));
+  const rows = [[]]; let cur = 0;
+  for (const n of norm) {
+    if (cur + n.w > rowW && rows[rows.length - 1].length) { rows.push([]); cur = 0; }
+    rows[rows.length - 1].push(n); cur += n.w + gap;
+  }
+  const cx = s2wX(innerWidth / 2), cy = s2wY(innerHeight / 2);
+  const totalH = rows.length * (H + gap);
+  let y = cy - totalH / 2 + H / 2;
+  for (const row of rows) {
+    const rw = row.reduce((a, b) => a + b.w + gap, 0) - gap;
+    let x = cx - rw / 2;
+    for (const n of row) {
+      n.it.w = n.w; n.it.h = n.h; n.it.rot = 0;
+      n.it.x = x + n.w / 2; n.it.y = y;
+      x += n.w + gap;
+    }
+    y += H + gap;
+  }
+  fitAll();
+}
+
+/* ============ 保存 / 読込 / 書き出し ============ */
+function download(name, blob) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+}
+async function saveBoard() {
+  if (!items.length) { toast('ボードが空です'); return; }
+  const input = prompt('ボード名を入力してください', currentBoardName || 'board');
+  if (input === null) return; // キャンセル
+  currentBoardName = input.trim() || 'board';
+  const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
+  const manifest = {
+    app: 'MiruMood', version: 2,
+    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
+      ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
+    images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext }; })
+  };
+  const files = [{ name: 'board.json', blob: new Blob([JSON.stringify(manifest)]) }];
+  try {
+    for (const id of used) {
+      const r = store.get(id);
+      files.push({ name: `images/${id}.${r.ext}`, blob: await getBlob(r.original) });
+      if (r.thumb) files.push({ name: `thumbs/${id}.webp`, blob: await getBlob(r.thumb) });
+    }
+    const zip = await zipBuild(files, p => progress('保存中', p));
+    progressDone();
+    download(`${currentBoardName}.mrmd`, zip);
+    toast(`「${currentBoardName}」を保存しました（${(zip.size / 1048576) | 0}MB）`);
+  } catch (err) {
+    progressDone();
+    toast(err.message === 'SIZE_LIMIT' ? '合計4GB超は未対応です（分割して保存してください）' : '保存に失敗しました');
+  }
+}
+async function loadBoard(file) {
+  try {
+    if (/\.json$/i.test(file.name)) return await loadLegacy(file);
+    progress('読み込み中', 0);
+    const entries = await zipOpen(file);
+    const mEntry = entries.get('board.json');
+    if (!mEntry) throw 0;
+    const manifest = JSON.parse(await (await mEntry.data()).text());
+    closeNoteEditor(false); cropState = null;
+    items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
+    // 画像は遅延参照として登録（この時点ではファイルから読まない）
+    for (const im of manifest.images) {
+      const orig = entries.get(`images/${im.id}.${im.ext}`);
+      const th = entries.get(`thumbs/${im.id}.webp`);
+      if (!orig) continue;
+      store.set(im.id, {
+        w: im.w, h: im.h, ext: im.ext,
+        original: () => orig.data(),
+        thumb: th ? () => th.data() : null
+      });
+      const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
+      if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
+    }
+    items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
+    currentBoardName = file.name.replace(/\.mrmd$/i, '') || 'board';
+    progressDone();
+    fitAll();
+    toast(`読み込みました（${items.length} 枚）`);
+  } catch {
+    progressDone();
+    toast('読み込みに失敗しました');
+  }
+}
+async function loadLegacy(file) { // 旧形式(.mrmd.json / base64埋め込み)の取り込み
+  const data = JSON.parse(await file.text());
+  if (!data.items) throw 0;
+  closeNoteEditor(false); cropState = null;
+  items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
+  let i = 0;
+  for (const rec of data.items) {
+    progress('変換中', i++ / data.items.length);
+    const blob = await (await fetch(rec.src)).blob();
+    const imgId = await importImageBlob(blob, blob.type);
+    if (imgId) items.push({
+      id: nextId++, imgId, x: rec.x, y: rec.y, w: rec.w, h: rec.h,
+      rot: rec.rot || 0, flipH: !!rec.flipH, flipV: !!rec.flipV,
+      gray: !!rec.gray, opacity: rec.opacity ?? 1
+    });
+  }
+  progressDone();
+  fitAll();
+  toast(`旧形式から読み込みました（${items.length} 枚）— 保存すると新形式になります`);
+}
+async function exportPNG() {
+  if (!items.length) { toast('ボードが空です'); return; }
+  const [x0, y0, x1, y1] = boardBBox();
+  const pad = 40, w = x1 - x0 + pad * 2, h = y1 - y0 + pad * 2;
+  const k = Math.min(1, 8192 / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * k); c.height = Math.round(h * k);
+  const g = c.getContext('2d');
+  g.fillStyle = '#17181c'; g.fillRect(0, 0, c.width, c.height);
+  g.setTransform(k, 0, 0, k, -(x0 - pad) * k, -(y0 - pad) * k);
+  // 1枚ずつ「必要な解像度で」デコードして描き、即解放する（メモリ一定）
+  let i = 0;
+  for (const it of items) {
+    progress('書き出し中', i++ / items.length);
+    if (it.type === 'note') { // メモはそのまま描画
+      g.save();
+      g.translate(it.x, it.y); g.rotate(it.rot);
+      g.globalAlpha = it.opacity;
+      drawNote(g, it);
+      g.restore();
+      continue;
+    }
+    const rec = store.get(it.imgId);
+    if (!rec) continue;
+    const cr = it.crop;
+    const need = Math.max(it.w / (cr ? cr.w : 1), it.h / (cr ? cr.h : 1)) * k;
+    const blob = await getBlob(rec.original);
+    let bmp;
+    if (need >= Math.max(rec.w, rec.h)) bmp = await createImageBitmap(blob);
+    else {
+      const r = need / Math.max(rec.w, rec.h);
+      bmp = await createImageBitmap(blob, {
+        resizeWidth: Math.max(1, Math.round(rec.w * r)),
+        resizeHeight: Math.max(1, Math.round(rec.h * r)),
+        resizeQuality: 'high'
+      });
+    }
+    g.save();
+    g.translate(it.x, it.y); g.rotate(it.rot);
+    g.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
+    g.globalAlpha = it.opacity;
+    g.filter = it.gray ? 'grayscale(1)' : 'none';
+    if (cr) g.drawImage(bmp, cr.x * bmp.width, cr.y * bmp.height, Math.max(1, cr.w * bmp.width), Math.max(1, cr.h * bmp.height), -it.w / 2, -it.h / 2, it.w, it.h);
+    else g.drawImage(bmp, -it.w / 2, -it.h / 2, it.w, it.h);
+    g.restore();
+    bmp.close();
+  }
+  progressDone();
+  c.toBlob(b => { download('board.png', b); toast('PNGを書き出しました'); }, 'image/png');
+}
+
+/* ============ UI: ツールバー / メニュー / 通知 ============ */
+const fImg = document.getElementById('fImg'), fJson = document.getElementById('fJson');
+const helpBox = document.getElementById('help');
+fImg.addEventListener('change', () => { addFiles(fImg.files); fImg.value = ''; });
+fJson.addEventListener('change', () => { if (fJson.files[0]) loadBoard(fJson.files[0]); fJson.value = ''; });
+document.getElementById('bar').addEventListener('click', e => {
+  const act = e.target.dataset?.act; if (!act) return;
+  ({ open: () => fImg.click(), note: () => addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)),
+     grid: cycleGrid, arrange, fit: fitAll, save: saveBoard,
+     load: () => fJson.click(), png: exportPNG, help: () => helpBox.style.display = 'grid' })[act]();
+});
+helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
+
+const menu = document.getElementById('menu');
+function hideMenu() { menu.style.display = 'none'; }
+function openMenu(px, py) {
+  const wx = s2wX(px), wy = s2wY(py);
+  const hit = itemAt(wx, wy);
+  if (hit && !sel.has(hit.id)) { sel.clear(); sel.add(hit.id); paint(); }
+  const has = sel.size > 0;
+  const selItems = items.filter(i => sel.has(i.id));
+  const singleImg = selItems.length === 1 && selItems[0].type !== 'note';
+  const singleNote = selItems.length === 1 && selItems[0].type === 'note';
+  const rows = has ? [
+    ...(singleImg ? [['クロップ', 'C', toggleCrop]] : []),
+    ...(singleImg && selItems[0].crop ? [['クロップ解除', '', () => clearCrop(selItems[0])]] : []),
+    ...(singleNote ? [['メモを編集', 'ダブルクリック', () => openNoteEditor(selItems[0])],
+                      ['メモの色を変更', '', () => cycleNoteColor(selItems[0])]] : []),
+    ...(singleImg || singleNote ? [null] : []),
+    ['複製', 'Ctrl+D', duplicateSel],
+    ['左右反転', 'H', () => keyAction('h')],
+    ['上下反転', 'V', () => keyAction('v')],
+    ['グレースケール', 'G', () => keyAction('g')],
+    ['回転リセット', 'R', () => keyAction('r')],
+    null,
+    ['最前面へ', 'PgUp', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = items.filter(i => !sel.has(i.id)).concat(s); paint(); }],
+    ['最背面へ', 'PgDn', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }],
+    null,
+    ['削除', 'Del', () => { pushUndo(); items = items.filter(i => !sel.has(i.id)); sel.clear(); paint(); }],
+  ] : [
+    ['画像を追加…', '', () => fImg.click()],
+    ['メモを追加', 'N', () => addNote(wx, wy)],
+    ['貼り付け', 'Ctrl+V', () => toast('Ctrl+V で貼り付けできます')],
+    ['自動整列', 'A', arrange],
+    ['グリッド切替', 'S', cycleGrid],
+    ['全体表示', 'F', fitAll],
+    null,
+    ['ボードを保存', 'Ctrl+S', saveBoard],
+    ['PNG書き出し', '', exportPNG],
+  ];
+  menu.innerHTML = '';
+  for (const r of rows) {
+    if (!r) { menu.appendChild(document.createElement('hr')); continue; }
+    const b = document.createElement('button');
+    b.innerHTML = `<span>${r[0]}</span><span class="k">${r[1]}</span>`;
+    b.onclick = () => { hideMenu(); r[2](); };
+    menu.appendChild(b);
+  }
+  menu.style.display = 'block';
+  menu.style.left = Math.min(px, innerWidth - menu.offsetWidth - 8) + 'px';
+  menu.style.top = Math.min(py, innerHeight - menu.offsetHeight - 8) + 'px';
+}
+function keyAction(k) {
+  const selected = items.filter(i => sel.has(i.id));
+  if (!selected.length) return;
+  pushUndo();
+  if (k === 'h') selected.forEach(i => { if (i.type !== 'note') i.flipH = !i.flipH; });
+  if (k === 'v') selected.forEach(i => { if (i.type !== 'note') i.flipV = !i.flipV; });
+  if (k === 'g') selected.forEach(i => { if (i.type !== 'note') i.gray = !i.gray; });
+  if (k === 'r') selected.forEach(i => i.rot = 0);
+  paint();
+}
+
+let toastTimer = 0, progressing = false;
+function toast(msg) {
+  if (progressing) return;
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.style.opacity = 0, 2200);
+}
+function progress(label, p) {
+  progressing = true;
+  const t = document.getElementById('toast');
+  t.textContent = `${label}… ${Math.round(p * 100)}%`;
+  t.style.opacity = 1;
+  clearTimeout(toastTimer);
+}
+function progressDone() {
+  progressing = false;
+  const t = document.getElementById('toast');
+  t.style.opacity = 0;
+}
+
+addEventListener('resize', paint);
+paint();
+</script>
+</body>
+</html>
