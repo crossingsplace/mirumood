@@ -107,6 +107,7 @@
     <tr><td class="grp" colspan="2">Board</td></tr>
     <tr><td>Ctrl+V</td><td>Paste from clipboard</td></tr>
     <tr><td>A</td><td>Auto-arrange selection (or all images)</td></tr>
+    <tr><td>Right-click (2+ selected)</td><td>Match width / Match height — resize to the average, aspect ratio kept</td></tr>
     <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>Undo / Redo</td></tr>
     <tr><td>Ctrl+S / Ctrl+O</td><td>Save / open board (.mrmd — bundles images, supports lazy loading)</td></tr>
     <tr><td class="grp" colspan="2">Google Drive</td></tr>
@@ -1211,6 +1212,21 @@ function fitAll() {
   const [x0, y0, x1, y1] = boardBBox();
   fitToRect(x0, y0, x1 - x0, y1 - y0);
 }
+/* PureRefの"Normalize"に相当: 選択した複数アイテムの幅または高さを、
+ * 選択範囲の平均値に揃える。各アイテム自身の縦横比とその中心位置は保つ
+ * (レイアウトを崩さずサイズだけ均一にする、というPureRefと同じ考え方)。 */
+function matchDimension(dim) { // dim: 'w'=幅を揃える, 'h'=高さを揃える
+  const selItems = items.filter(i => sel.has(i.id));
+  if (selItems.length < 2) { toast('Select 2 or more items to match'); return; }
+  pushUndo();
+  const target = selItems.reduce((sum, i) => sum + i[dim], 0) / selItems.length;
+  for (const it of selItems) {
+    const ratio = it.h / it.w;
+    if (dim === 'w') { it.w = target; it.h = target * ratio; }
+    else { it.h = target; it.w = target / ratio; }
+  }
+  paint();
+}
 function arrange() {
   const target = sel.size >= 2 ? items.filter(i => sel.has(i.id)) : items.slice();
   if (target.length < 2) return;
@@ -1784,6 +1800,7 @@ function openMenu(px, py) {
     ...(singleNote ? [['Edit note', 'Double-click', () => openNoteEditor(selItems[0])],
                       ['Change note color', '', () => cycleNoteColor(selItems[0])]] : []),
     ...(singleImg || singleNote ? [['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard], null] : []),
+    ...(selItems.length >= 2 ? [['Match width', '', () => matchDimension('w')], ['Match height', '', () => matchDimension('h')], null] : []),
     ['Duplicate', 'Ctrl+D', duplicateSel],
     ['Flip horizontal', 'H', () => keyAction('h')],
     ['Flip vertical', 'V', () => keyAction('v')],
