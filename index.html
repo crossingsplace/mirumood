@@ -89,6 +89,7 @@
     <tr><td>Top handle (Shift)</td><td>Rotate (Shift = snap to 15°)</td></tr>
     <tr><td>Ctrl+A / Esc</td><td>Select all / Deselect</td></tr>
     <tr><td>Delete / Ctrl+D</td><td>Delete / Duplicate (duplicating uses no extra memory)</td></tr>
+    <tr><td>Ctrl+C</td><td>Copy the selected image/note to paste into other apps</td></tr>
     <tr><td>H / V</td><td>Flip horizontal / Flip vertical</td></tr>
     <tr><td>G</td><td>Toggle grayscale</td></tr>
     <tr><td>R</td><td>Reset rotation</td></tr>
@@ -984,6 +985,7 @@ addEventListener('keydown', e => {
   if (ctl && e.key.toLowerCase() === 'a') { e.preventDefault(); items.forEach(i => sel.add(i.id)); paint(); return; }
   if (ctl && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if (ctl && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSel(); return; }
+  if (ctl && e.key.toLowerCase() === 'c' && sel.size) { e.preventDefault(); copySelectionToClipboard(); return; }
   if (ctl && e.key.toLowerCase() === 's') { e.preventDefault(); saveBoard(); return; }
   if (ctl && e.key.toLowerCase() === 'o') { e.preventDefault(); fJson.click(); return; }
   if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -1072,6 +1074,60 @@ function duplicateSel() { // imgIdを共有するのでメモリは増えない
   items.push(...copies);
   sel = new Set(copies.map(c => c.id));
   paint();
+}
+/* ボード上の画像/メモを外部アプリ(Photoshop、CLIP STUDIO PAINTなど)へ
+ * そのままペーストできるよう、OSクリップボードへPNGとして書き出す。
+ * 画像は現在のクロップ/回転/反転/グレースケール/不透明度を焼き込んだ上で、
+ * 元ファイルの解像度をそのまま使う(ボード上の表示サイズには縮小されない)。 */
+async function copySelectionToClipboard() {
+  if (sel.size !== 1) { toast('Select exactly one item to copy'); return; }
+  if (!('clipboard' in navigator) || typeof ClipboardItem === 'undefined') {
+    toast('Copy is not supported in this browser'); return;
+  }
+  const it = items.find(i => sel.has(i.id));
+  if (!it) return;
+  try {
+    progress('Copying', 0);
+    const c = document.createElement('canvas');
+    const g = c.getContext('2d');
+    if (it.type === 'note') {
+      const scale = 2; // テキストが潰れないよう高めの解像度で書き出す
+      c.width = Math.max(1, Math.round(it.w * scale));
+      c.height = Math.max(1, Math.round(it.h * scale));
+      g.scale(scale, scale);
+      g.translate(it.w / 2, it.h / 2);
+      g.globalAlpha = it.opacity;
+      drawNote(g, it);
+    } else {
+      const rec = store.get(it.imgId);
+      if (!rec) throw new Error('image unavailable');
+      const blob = await getBlob(rec.original);
+      const bmp = await createImageBitmap(blob);
+      const cr = it.crop;
+      const sx = cr ? cr.x * bmp.width : 0, sy = cr ? cr.y * bmp.height : 0;
+      const sw = cr ? Math.max(1, cr.w * bmp.width) : bmp.width, sh = cr ? Math.max(1, cr.h * bmp.height) : bmp.height;
+      const hw = sw / 2, hh = sh / 2, cos = Math.cos(it.rot), sin = Math.sin(it.rot);
+      const lc = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => [x * cos - y * sin, x * sin + y * cos]);
+      const xs = lc.map(p => p[0]), ys = lc.map(p => p[1]);
+      c.width = Math.max(1, Math.round(Math.max(...xs) - Math.min(...xs)));
+      c.height = Math.max(1, Math.round(Math.max(...ys) - Math.min(...ys)));
+      g.translate(c.width / 2, c.height / 2);
+      g.rotate(it.rot);
+      g.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
+      g.globalAlpha = it.opacity;
+      g.filter = it.gray ? 'grayscale(1)' : 'none';
+      g.drawImage(bmp, sx, sy, sw, sh, -sw / 2, -sh / 2, sw, sh);
+      bmp.close();
+    }
+    const pngBlob = await new Promise(res => c.toBlob(res, 'image/png'));
+    if (!pngBlob) throw new Error('failed to encode PNG');
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+    progressDone();
+    toast('Copied — paste it into another app with Ctrl+V');
+  } catch {
+    progressDone();
+    toast('Copy failed');
+  }
 }
 function fitToRect(x, y, w, h) {
   const pad = 60;
@@ -1623,7 +1679,7 @@ function openMenu(px, py) {
     ...(singleImg && selItems[0].crop ? [['Remove crop', '', () => clearCrop(selItems[0])]] : []),
     ...(singleNote ? [['Edit note', 'Double-click', () => openNoteEditor(selItems[0])],
                       ['Change note color', '', () => cycleNoteColor(selItems[0])]] : []),
-    ...(singleImg || singleNote ? [null] : []),
+    ...(singleImg || singleNote ? [['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard], null] : []),
     ['Duplicate', 'Ctrl+D', duplicateSel],
     ['Flip horizontal', 'H', () => keyAction('h')],
     ['Flip vertical', 'V', () => keyAction('v')],
