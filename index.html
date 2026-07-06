@@ -1126,7 +1126,7 @@ function arrange() {
  * =================================================================== */
 const GOOGLE_CLIENT_ID = '450909316141-2lus2vrh0m0t9ittp362nimqcqkfmm7h.apps.googleusercontent.com';
 const GOOGLE_APP_ID = '450909316141'; // Cloud プロジェクト番号(Picker用)
-const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
 
 let gisReady = false, pickerReady = false, tokenClient = null;
 let driveAccessToken = null, driveTokenExpiresAt = 0, driveUserEmail = null;
@@ -1208,6 +1208,7 @@ async function driveAuthClick() {
   try {
     progress('Googleに接続中', 0);
     await ensureDriveToken();
+    updateDriveUI(); // アカウント名取得の成否によらず、ログイン済み状態を即座に反映
     await fetchDriveUserInfo();
     progressDone();
     toast('ログインしました');
