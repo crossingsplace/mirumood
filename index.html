@@ -1289,22 +1289,62 @@ async function ensurePickerReady() {
   pickerReady = true;
 }
 function driveSignedIn() { return !!driveAccessToken && Date.now() < driveTokenExpiresAt; }
-function requestDriveToken(interactive) {
+const DRIVE_TOKEN_KEY = 'mm_drive_token';       // タブ内でのページ再読み込みをまたいで有効(閉じると消える)
+const DRIVE_EVER_SIGNED_KEY = 'mm_ever_signed'; // 「以前サインインしたことがあるか」の記録(ブラウザ再起動をまたいでも残る)
+function persistDriveToken() {
+  try { sessionStorage.setItem(DRIVE_TOKEN_KEY, JSON.stringify({ t: driveAccessToken, e: driveTokenExpiresAt })); } catch {}
+  try { localStorage.setItem(DRIVE_EVER_SIGNED_KEY, '1'); } catch {}
+}
+function restoreDriveToken() { // ページ再読み込み直後、有効なトークンが残っていれば即座に復元する
+  try {
+    const raw = sessionStorage.getItem(DRIVE_TOKEN_KEY);
+    if (!raw) return;
+    const { t, e } = JSON.parse(raw);
+    if (t && e && Date.now() < e) { driveAccessToken = t; driveTokenExpiresAt = e; }
+  } catch {}
+}
+function clearPersistedDriveToken() {
+  try { sessionStorage.removeItem(DRIVE_TOKEN_KEY); } catch {}
+}
+function requestDriveToken(silentOnly) {
   return new Promise((resolve, reject) => {
     ensureGisReady().then(() => {
+      let escalated = false;
       tokenClient.callback = resp => {
-        if (resp.error) { reject(new Error(resp.error)); return; }
+        if (resp.error) {
+          // サイレント認証(確認画面なし)に失敗した場合だけ、通常の確認画面にフォールバックする
+          if (!escalated && !silentOnly) { escalated = true; tokenClient.requestAccessToken({ prompt: 'consent' }); return; }
+          reject(new Error(resp.error)); return;
+        }
         driveAccessToken = resp.access_token;
         driveTokenExpiresAt = Date.now() + (Number(resp.expires_in || 3500) * 1000);
+        persistDriveToken();
         resolve(driveAccessToken);
       };
-      tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+      tokenClient.requestAccessToken({ prompt: '' }); // まずは確認画面なしのサイレント認証を試みる
     }, reject);
   });
 }
 async function ensureDriveToken() {
   if (driveSignedIn()) return driveAccessToken;
-  return requestDriveToken(true);
+  restoreDriveToken(); // 直前のページ再読み込みで消えていないか確認
+  if (driveSignedIn()) return driveAccessToken;
+  return requestDriveToken(false);
+}
+// ページを開いた直後、以前サインイン済みだった痕跡があれば裏側で静かに再認証を試みる。
+// 失敗しても何もしない(確認画面をいきなり出したりトーストを出したりしない、あくまで裏側の試み)。
+async function trySilentAutoSignIn() {
+  restoreDriveToken();
+  if (driveSignedIn()) { updateDriveUI(); updateStatus(); return; }
+  let everSignedIn = false;
+  try { everSignedIn = localStorage.getItem(DRIVE_EVER_SIGNED_KEY) === '1'; } catch {}
+  if (!everSignedIn) return;
+  try {
+    await requestDriveToken(true); // silentOnly
+    await fetchDriveUserInfo();
+    updateDriveUI();
+    updateStatus();
+  } catch {} // 静かに諦める(ボタンは「Sign in」のまま)
 }
 async function fetchDriveUserInfo() {
   try {
@@ -1333,6 +1373,8 @@ async function driveAuthClick() {
     try { google.accounts.oauth2.revoke(driveAccessToken, () => {}); } catch {}
     driveAccessToken = null; driveTokenExpiresAt = 0; driveUserEmail = null;
     currentDriveFolderId = null; currentDriveManifestId = null; driveRootFolderId = null; driveDirty = false;
+    clearPersistedDriveToken();
+    try { localStorage.removeItem(DRIVE_EVER_SIGNED_KEY); } catch {}
     updateDriveUI();
     updateStatus();
     toast('Signed out');
@@ -1812,13 +1854,15 @@ function progressDone() {
 }
 
 addEventListener('resize', paint);
+restoreDriveToken(); // 直前のページ再読み込みでログイン状態が残っていれば即座に復元する
 updateDriveUI();
 paint();
 
 // Google連携ライブラリの先読み: 初期描画を邪魔しないようアイドル時に裏側で読み込む。
 // 「Drive読込」クリック時の待ち時間をほぼゼロにするための最適化(失敗しても無視してよい)。
+// あわせて、以前サインインしたことがある場合は裏側で静かに再ログインを試みる。
 const prefetchGoogleLibs = () => {
-  ensureGisReady().catch(() => {});
+  ensureGisReady().then(() => trySilentAutoSignIn()).catch(() => {});
   ensurePickerReady().catch(() => {});
 };
 if ('requestIdleCallback' in window) requestIdleCallback(prefetchGoogleLibs, { timeout: 4000 });
