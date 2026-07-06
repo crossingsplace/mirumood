@@ -1312,14 +1312,19 @@ function dataURItoBlob(dataURI) {
   return new Blob([bytes], { type: mime });
 }
 
-async function saveBoardToDrive() {
+async function saveBoardToDrive(forceNewName) {
   if (!items.length) { toast('ボードが空です'); return; }
   try { await ensureDriveToken(); } catch { toast('Googleへのログインが必要です'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
 
-  const input = prompt('Driveに保存するボード名', currentBoardName || 'board');
-  if (input === null) return;
-  currentBoardName = input.trim() || 'board';
+  // 既にDriveに保存済みのボードなら、名前を聞かずそのまま上書き保存する。
+  // 「名前を付けて保存」(forceNewName)の時だけ、新しい名前・新しいフォルダとして保存し直す。
+  if (forceNewName || !currentDriveFolderId) {
+    const input = prompt('Driveに保存するボード名', currentBoardName || 'board');
+    if (input === null) return;
+    currentBoardName = input.trim() || 'board';
+    if (forceNewName) { currentDriveFolderId = null; currentDriveManifestId = null; }
+  }
 
   try {
     const folderId = await ensureBoardFolder(currentBoardName);
@@ -1399,6 +1404,11 @@ async function onDrivePickerResult(data) {
     if (manifest.app !== 'MiruMood') throw new Error('not a board');
     closeNoteEditor(false); cropState = null;
     currentDriveFolderId = folderId; currentDriveManifestId = fileId;
+    try {
+      const fRes = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${folderId}?fields=name`);
+      const fData = await fRes.json();
+      if (fData.name) currentBoardName = fData.name;
+    } catch {} // ボード名の取得に失敗しても読込自体は続行する
     store.clear();
     items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
     for (const im of manifest.images) {
@@ -1615,6 +1625,7 @@ function openMenu(px, py) {
     ['PNG書き出し', '', exportPNG],
     null,
     ['Driveに保存', '', saveBoardToDrive],
+    ['名前を付けてDriveに保存', '', () => saveBoardToDrive(true)],
     ['Driveから開く', '', openBoardFromDrive],
   ];
   menu.innerHTML = '';
