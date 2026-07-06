@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
@@ -54,75 +54,75 @@
 <canvas id="cv"></canvas>
 
 <div id="bar">
-  <button data-act="open"  title="画像を追加">＋ 画像</button>
-  <button data-act="note"  title="メモを追加 (N)">メモ</button>
-  <button data-act="grid"  title="グリッド切替 (S)">グリッド</button>
-  <button data-act="arrange" title="自動整列 (A)">整列</button>
-  <button data-act="fit"   title="全体表示 (F)">全体</button>
+  <button data-act="open"  title="Add images">+ Images</button>
+  <button data-act="note"  title="Add note (N)">Note</button>
+  <button data-act="grid"  title="Toggle grid (S)">Grid</button>
+  <button data-act="arrange" title="Auto arrange (A)">Arrange</button>
+  <button data-act="fit"   title="Fit all (F)">Fit</button>
   <div class="sep"></div>
-  <button data-act="save"  title="ボードを保存 (Ctrl+S)">保存</button>
-  <button data-act="load"  title="ボードを読込 (Ctrl+O)">読込</button>
-  <button data-act="png"   title="PNGとして書き出し">PNG</button>
+  <button data-act="save"  title="Save board (Ctrl+S)">Save</button>
+  <button data-act="load"  title="Open board (Ctrl+O)">Open</button>
+  <button data-act="png"   title="Export as PNG">PNG</button>
   <div class="sep"></div>
-  <button data-act="drive-auth" id="driveAuthBtn" title="Googleでログイン">Googleログイン</button>
-  <button data-act="drive-save" title="Google Driveに保存">Drive保存</button>
+  <button data-act="drive-auth" id="driveAuthBtn" title="Sign in with Google">Sign in</button>
+  <button data-act="drive-save" title="Save to Google Drive">Save to Drive</button>
   <span id="driveState"></span>
-  <button data-act="drive-open" title="Google Driveから開く">Drive読込</button>
+  <button data-act="drive-open" title="Open from Google Drive">Open from Drive</button>
   <div class="sep"></div>
-  <button data-act="help"  title="ショートカット一覧 (?)">?</button>
+  <button data-act="help"  title="Shortcuts (?)">?</button>
 </div>
 
 <div id="menu"></div>
 
 <div id="help"><div class="box">
-  <h2>MiruMood</h2><p class="sub">リファレンス &amp; ムードボード — Esc で閉じる</p>
+  <h2>MiruMood</h2><p class="sub">Reference &amp; mood board — press Esc to close</p>
   <table>
-    <tr><td class="grp" colspan="2">ナビゲーション</td></tr>
-    <tr><td>ホイール</td><td>ズーム（カーソル中心）</td></tr>
-    <tr><td>中/右ドラッグ・Space+ドラッグ</td><td>パン</td></tr>
-    <tr><td>F / Home</td><td>全体表示 / 100%表示</td></tr>
-    <tr><td>ダブルクリック</td><td>画像を画面にフィット（空白で100%）</td></tr>
-    <tr><td class="grp" colspan="2">選択・編集</td></tr>
-    <tr><td>クリック / Shift+クリック</td><td>選択 / 追加選択</td></tr>
-    <tr><td>空白ドラッグ</td><td>範囲選択</td></tr>
-    <tr><td>角ハンドル (Shift)</td><td>拡縮（Shiftで縦横比フリー）</td></tr>
-    <tr><td>上のハンドル (Shift)</td><td>回転（Shiftで15°スナップ）</td></tr>
-    <tr><td>Ctrl+A / Esc</td><td>全選択 / 選択解除</td></tr>
-    <tr><td>Delete / Ctrl+D</td><td>削除 / 複製（複製はメモリを消費しません）</td></tr>
-    <tr><td>H / V</td><td>左右反転 / 上下反転</td></tr>
-    <tr><td>G</td><td>グレースケール切替</td></tr>
-    <tr><td>R</td><td>回転をリセット</td></tr>
-    <tr><td>Alt+ホイール</td><td>不透明度を変更</td></tr>
-    <tr><td>C</td><td>クロップ（角・辺をドラッグ、Enter/Escで確定）</td></tr>
-    <tr><td>N</td><td>メモを追加（ダブルクリックで編集）</td></tr>
-    <tr><td>S</td><td>グリッド切替（非表示 → 表示 → スナップ）</td></tr>
-    <tr><td>PageUp / PageDown</td><td>前面へ / 背面へ</td></tr>
-    <tr><td class="grp" colspan="2">タッチ操作（タブレット）</td></tr>
-    <tr><td>1本指ドラッグ</td><td>画像を移動（空白ではパン）</td></tr>
-    <tr><td>2本指ピンチ</td><td>ズーム / パン</td></tr>
-    <tr><td>タップ / 空白タップ</td><td>選択 / 選択解除</td></tr>
-    <tr><td>ダブルタップ</td><td>フィット表示（空白で100%）</td></tr>
-    <tr><td>長押し</td><td>メニュー</td></tr>
-    <tr><td class="grp" colspan="2">ボード</td></tr>
-    <tr><td>Ctrl+V</td><td>クリップボードから貼り付け</td></tr>
-    <tr><td>A</td><td>選択（または全画像）を自動整列</td></tr>
-    <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>取り消し / やり直し</td></tr>
-    <tr><td>Ctrl+S / Ctrl+O</td><td>ボード保存 / 読込（.mrmd = 画像同梱・遅延読込対応）</td></tr>
+    <tr><td class="grp" colspan="2">Navigation</td></tr>
+    <tr><td>Wheel</td><td>Zoom (centered on cursor)</td></tr>
+    <tr><td>Middle/right drag, Space+drag</td><td>Pan</td></tr>
+    <tr><td>F / Home</td><td>Fit all / Reset to 100%</td></tr>
+    <tr><td>Double-click</td><td>Fit image to screen (100% on empty area)</td></tr>
+    <tr><td class="grp" colspan="2">Selection & editing</td></tr>
+    <tr><td>Click / Shift+click</td><td>Select / Add to selection</td></tr>
+    <tr><td>Drag empty area</td><td>Box select</td></tr>
+    <tr><td>Corner handle (Shift)</td><td>Scale (Shift = free aspect ratio)</td></tr>
+    <tr><td>Top handle (Shift)</td><td>Rotate (Shift = snap to 15°)</td></tr>
+    <tr><td>Ctrl+A / Esc</td><td>Select all / Deselect</td></tr>
+    <tr><td>Delete / Ctrl+D</td><td>Delete / Duplicate (duplicating uses no extra memory)</td></tr>
+    <tr><td>H / V</td><td>Flip horizontal / Flip vertical</td></tr>
+    <tr><td>G</td><td>Toggle grayscale</td></tr>
+    <tr><td>R</td><td>Reset rotation</td></tr>
+    <tr><td>Alt+Wheel</td><td>Change opacity</td></tr>
+    <tr><td>C</td><td>Crop (drag corners/edges, Enter/Esc to confirm)</td></tr>
+    <tr><td>N</td><td>Add note (double-click to edit)</td></tr>
+    <tr><td>S</td><td>Toggle grid (off → on → snap)</td></tr>
+    <tr><td>PageUp / PageDown</td><td>Bring to front / Send to back</td></tr>
+    <tr><td class="grp" colspan="2">Touch (tablet)</td></tr>
+    <tr><td>One-finger drag</td><td>Move image (pan on empty area)</td></tr>
+    <tr><td>Two-finger pinch</td><td>Zoom / pan</td></tr>
+    <tr><td>Tap / tap empty area</td><td>Select / Deselect</td></tr>
+    <tr><td>Double-tap</td><td>Fit to screen (100% on empty area)</td></tr>
+    <tr><td>Long-press</td><td>Menu</td></tr>
+    <tr><td class="grp" colspan="2">Board</td></tr>
+    <tr><td>Ctrl+V</td><td>Paste from clipboard</td></tr>
+    <tr><td>A</td><td>Auto-arrange selection (or all images)</td></tr>
+    <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>Undo / Redo</td></tr>
+    <tr><td>Ctrl+S / Ctrl+O</td><td>Save / open board (.mrmd — bundles images, supports lazy loading)</td></tr>
     <tr><td class="grp" colspan="2">Google Drive</td></tr>
-    <tr><td>Googleログイン</td><td>Googleアカウントで接続 / 再クリックでログアウト</td></tr>
-    <tr><td>Drive保存 / Drive読込</td><td>ボードをGoogle Driveに保存 / Driveから開く</td></tr>
-    <tr><td>画面右下の表示</td><td>「Drive: ボード名 ✓保存済み／●未保存の変更」で状態を確認できます</td></tr>
+    <tr><td>Sign in</td><td>Connect your Google account / click again to sign out</td></tr>
+    <tr><td>Save to Drive / Open from Drive</td><td>Save the board to Google Drive / open one from Drive</td></tr>
+    <tr><td>Toolbar status</td><td>Shows "board name ✓ saved" or "● unsaved changes"</td></tr>
   </table>
 </div></div>
 
 <div id="hint">
   <div>
-    <div class="big">画像をここにドラッグ＆ドロップ　または　Ctrl+V で貼り付け</div>
-    <div>ホイールでズーム・右ドラッグでパン・「?」でショートカット一覧</div>
+    <div class="big">Drag & drop images here, or paste with Ctrl+V</div>
+    <div>Scroll to zoom · right-drag to pan · press "?" for shortcuts</div>
   </div>
 </div>
 
-<div id="drop">ドロップして追加</div>
+<div id="drop">Drop to add</div>
 <textarea id="noteEdit" spellcheck="false"></textarea>
 <div id="toast"></div>
 <div id="status"></div>
@@ -486,7 +486,7 @@ function drawNote(g, it) {
   g.font = `${fs}px "Hiragino Sans","Noto Sans JP",sans-serif`;
   g.textBaseline = 'top';
   let txt = it.text || '';
-  if (!txt) { txt = 'ダブルクリックで編集'; g.globalAlpha *= 0.5; }
+  if (!txt) { txt = 'Double-click to edit'; g.globalAlpha *= 0.5; }
   g.fillStyle = it.fg || NOTE_COLORS[0][1];
   const lines = wrapText(g, txt, it.w - pad * 2);
   const lh = fs * 1.45;
@@ -547,9 +547,9 @@ noteEdit.addEventListener('keydown', e => {
 let cropState = null; // {id, Wf, Hf} Wf/Hf=フル画像の表示サイズ（クロップ中は不変）
 function toggleCrop() {
   if (cropState) { cropState = null; paint(); return; }
-  if (sel.size !== 1) { toast('画像を1枚だけ選択してください'); return; }
+  if (sel.size !== 1) { toast('Select exactly one image'); return; }
   const it = items.find(i => sel.has(i.id));
-  if (!it || it.type === 'note') { toast('メモはクロップできません'); return; }
+  if (!it || it.type === 'note') { toast("Notes can't be cropped"); return; }
   pushUndo(); // クロップ前の状態を積む（Ctrl+Zで丸ごと戻せる）
   if (!it.crop) it.crop = { x: 0, y: 0, w: 1, h: 1 };
   cropState = { id: it.id, Wf: it.w / it.crop.w, Hf: it.h / it.crop.h };
@@ -626,7 +626,7 @@ let gridMode = 1; // 0=非表示 1=表示 2=表示+スナップ
 const GRID = 64;
 function cycleGrid() {
   gridMode = (gridMode + 1) % 3;
-  toast(['グリッド: 非表示', 'グリッド: 表示', 'グリッド: スナップ有効'][gridMode]);
+  toast(['Grid: off', 'Grid: on', 'Grid: snap enabled'][gridMode]);
   paint();
 }
 const HANDLE = 6, ROT_OFF = 26;
@@ -654,14 +654,14 @@ function drawSelection(it) {
 }
 function updateStatus() {
   document.getElementById('status').textContent =
-    `${items.length}枚 ・ デコード ${(cacheBytes / 1048576) | 0}MB ・ ${Math.round(view.s * 100)}%`;
+    `${items.length} images ・ ${(cacheBytes / 1048576) | 0}MB decoded ・ ${Math.round(view.s * 100)}%`;
   updateDriveState();
 }
 function updateDriveState() {
   const el = document.getElementById('driveState');
   if (!el) return;
   if (!currentDriveFolderId) { el.textContent = ''; el.classList.remove('dirty'); return; }
-  el.textContent = `${currentBoardName} ${driveDirty ? '●未保存' : '✓保存済み'}`;
+  el.textContent = `${currentBoardName} ${driveDirty ? '● unsaved' : '✓ saved'}`;
   el.classList.toggle('dirty', driveDirty);
 }
 
@@ -1028,7 +1028,7 @@ async function addFiles(files, cx, cy) {
   let i = 0, added = 0;
   sel.clear();
   for (const f of list) {
-    progress('読み込み中', i / list.length);
+    progress('Loading', i / list.length);
     const imgId = await importImageBlob(f, f.type);
     if (imgId) {
       const gx = list.length === 1 ? wx : wx + (i % cols) * 520;
@@ -1040,7 +1040,7 @@ async function addFiles(files, cx, cy) {
     paint();
   }
   progressDone();
-  toast(added + ' 枚追加しました');
+  toast(added + ' image(s) added');
 }
 
 /* ドラッグ&ドロップ */
@@ -1152,7 +1152,7 @@ function loadScriptOnce(src) {
   return new Promise((resolve, reject) => {
     if ([...document.scripts].some(s => s.src === src)) { resolve(); return; }
     const s = document.createElement('script');
-    s.src = src; s.onload = () => resolve(); s.onerror = () => reject(new Error('読み込み失敗: ' + src));
+    s.src = src; s.onload = () => resolve(); s.onerror = () => reject(new Error('Failed to load: ' + src));
     document.head.appendChild(s);
   });
 }
@@ -1201,12 +1201,12 @@ function updateDriveUI() {
   const btn = document.getElementById('driveAuthBtn');
   if (!btn) return;
   if (driveSignedIn()) {
-    btn.textContent = driveUserEmail ? driveUserEmail.split('@')[0] : 'ログアウト';
-    btn.title = (driveUserEmail || 'Google') + ' からログアウト';
+    btn.textContent = driveUserEmail ? driveUserEmail.split('@')[0] : 'Sign out';
+    btn.title = 'Sign out of ' + (driveUserEmail || 'Google');
     btn.classList.add('connected');
   } else {
-    btn.textContent = 'Googleログイン';
-    btn.title = 'Googleでログイン';
+    btn.textContent = 'Sign in';
+    btn.title = 'Sign in with Google';
     btn.classList.remove('connected');
   }
 }
@@ -1217,19 +1217,19 @@ async function driveAuthClick() {
     currentDriveFolderId = null; currentDriveManifestId = null; driveRootFolderId = null; driveDirty = false;
     updateDriveUI();
     updateStatus();
-    toast('ログアウトしました');
+    toast('Signed out');
     return;
   }
   try {
-    progress('Googleに接続中', 0);
+    progress('Connecting to Google', 0);
     await ensureDriveToken();
     updateDriveUI(); // アカウント名取得の成否によらず、ログイン済み状態を即座に反映
     await fetchDriveUserInfo();
     progressDone();
-    toast('ログインしました');
+    toast('Signed in');
   } catch {
     progressDone();
-    toast('ログインをキャンセルしました');
+    toast('Sign-in cancelled');
   }
 }
 async function driveApiFetch(url, options = {}) {
@@ -1328,14 +1328,14 @@ function dataURItoBlob(dataURI) {
 }
 
 async function saveBoardToDrive(forceNewName) {
-  if (!items.length) { toast('ボードが空です'); return; }
-  try { await ensureDriveToken(); } catch { toast('Googleへのログインが必要です'); return; }
+  if (!items.length) { toast('Board is empty'); return; }
+  try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
 
   // 既にDriveに保存済みのボードなら、名前を聞かずそのまま上書き保存する。
   // 「名前を付けて保存」(forceNewName)の時だけ、新しい名前・新しいフォルダとして保存し直す。
   if (forceNewName || !currentDriveFolderId) {
-    const input = prompt('Driveに保存するボード名', currentBoardName || 'board');
+    const input = prompt('Board name to save to Drive', currentBoardName || 'board');
     if (input === null) return;
     currentBoardName = input.trim() || 'board';
     if (forceNewName) { currentDriveFolderId = null; currentDriveManifestId = null; }
@@ -1347,7 +1347,7 @@ async function saveBoardToDrive(forceNewName) {
     let done = 0;
     let embedBudgetLeft = THUMB_EMBED_BUDGET;
     const embeds = new Map(); // id -> data URI (予算内に収まったものだけ)
-    progress('Drive保存中', 0);
+    progress('Saving to Drive', 0);
     for (const id of used) {
       const rec = store.get(id);
       if (!rec.driveId) {
@@ -1370,7 +1370,7 @@ async function saveBoardToDrive(forceNewName) {
         }
       }
       done++;
-      progress('Drive保存中', done / used.length);
+      progress('Saving to Drive', done / used.length);
     }
     const manifest = {
       app: 'MiruMood', version: 3,
@@ -1384,17 +1384,17 @@ async function saveBoardToDrive(forceNewName) {
     driveDirty = false;
     progressDone();
     updateStatus();
-    toast(`「${currentBoardName}」をDriveに保存しました`);
+    toast(`Saved "${currentBoardName}" to Drive`);
   } catch {
     progressDone();
-    toast('Drive保存に失敗しました');
+    toast('Failed to save to Drive');
   }
 }
 
 async function openBoardFromDrive() {
-  try { await ensureDriveToken(); } catch { toast('Googleへのログインが必要です'); return; }
+  try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
-  try { await ensurePickerReady(); } catch { toast('Pickerの読み込みに失敗しました'); return; }
+  try { await ensurePickerReady(); } catch { toast('Failed to load the file picker'); return; }
 
   const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
     .setMimeTypes('application/json')
@@ -1413,7 +1413,7 @@ async function onDrivePickerResult(data) {
   const doc = data.docs && data.docs[0];
   if (!doc) return;
   try {
-    progress('Driveから読み込み中', 0);
+    progress('Loading from Drive', 0);
     const fileId = doc.id;
     const folderId = doc.parentId || await driveGetParent(fileId);
     const blob = await driveDownloadBlob(fileId);
@@ -1444,10 +1444,10 @@ async function onDrivePickerResult(data) {
     progressDone();
     updateDriveState();
     fitAll();
-    toast(`Driveから読み込みました（${items.length} 枚）`);
+    toast(`Loaded from Drive (${items.length} images)`);
   } catch {
     progressDone();
-    toast('読み込みに失敗しました（MiruMoodのボードではない可能性があります）');
+    toast('Failed to load (this may not be a MiruMood board)');
   }
 }
 
@@ -1458,8 +1458,8 @@ function download(name, blob) {
   setTimeout(() => URL.revokeObjectURL(a.href), 30000);
 }
 async function saveBoard() {
-  if (!items.length) { toast('ボードが空です'); return; }
-  const input = prompt('ボード名を入力してください', currentBoardName || 'board');
+  if (!items.length) { toast('Board is empty'); return; }
+  const input = prompt('Enter a board name', currentBoardName || 'board');
   if (input === null) return; // キャンセル
   currentBoardName = input.trim() || 'board';
   const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
@@ -1476,19 +1476,19 @@ async function saveBoard() {
       files.push({ name: `images/${id}.${r.ext}`, blob: await getBlob(r.original) });
       if (r.thumb) files.push({ name: `thumbs/${id}.webp`, blob: await getBlob(r.thumb) });
     }
-    const zip = await zipBuild(files, p => progress('保存中', p));
+    const zip = await zipBuild(files, p => progress('Saving', p));
     progressDone();
     download(`${currentBoardName}.mrmd`, zip);
-    toast(`「${currentBoardName}」を保存しました（${(zip.size / 1048576) | 0}MB）`);
+    toast(`Saved "${currentBoardName}" (${(zip.size / 1048576) | 0}MB)`);
   } catch (err) {
     progressDone();
-    toast(err.message === 'SIZE_LIMIT' ? '合計4GB超は未対応です（分割して保存してください）' : '保存に失敗しました');
+    toast(err.message === 'SIZE_LIMIT' ? 'Boards over 4GB are not supported (please split into smaller boards)' : 'Save failed');
   }
 }
 async function loadBoard(file) {
   try {
     if (/\.json$/i.test(file.name)) return await loadLegacy(file);
-    progress('読み込み中', 0);
+    progress('Loading', 0);
     const entries = await zipOpen(file);
     const mEntry = entries.get('board.json');
     if (!mEntry) throw 0;
@@ -1514,10 +1514,10 @@ async function loadBoard(file) {
     currentBoardName = file.name.replace(/\.mrmd$/i, '') || 'board';
     progressDone();
     fitAll();
-    toast(`読み込みました（${items.length} 枚）`);
+    toast(`Loaded (${items.length} images)`);
   } catch {
     progressDone();
-    toast('読み込みに失敗しました');
+    toast('Failed to load');
   }
 }
 async function loadLegacy(file) { // 旧形式(.mrmd.json / base64埋め込み)の取り込み
@@ -1529,7 +1529,7 @@ async function loadLegacy(file) { // 旧形式(.mrmd.json / base64埋め込み)�
   items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
   let i = 0;
   for (const rec of data.items) {
-    progress('変換中', i++ / data.items.length);
+    progress('Converting', i++ / data.items.length);
     const blob = await (await fetch(rec.src)).blob();
     const imgId = await importImageBlob(blob, blob.type);
     if (imgId) items.push({
@@ -1540,10 +1540,10 @@ async function loadLegacy(file) { // 旧形式(.mrmd.json / base64埋め込み)�
   }
   progressDone();
   fitAll();
-  toast(`旧形式から読み込みました（${items.length} 枚）— 保存すると新形式になります`);
+  toast(`Loaded from legacy format (${items.length} images) — saving will upgrade it`);
 }
 async function exportPNG() {
-  if (!items.length) { toast('ボードが空です'); return; }
+  if (!items.length) { toast('Board is empty'); return; }
   const [x0, y0, x1, y1] = boardBBox();
   const pad = 40, w = x1 - x0 + pad * 2, h = y1 - y0 + pad * 2;
   const k = Math.min(1, 8192 / Math.max(w, h));
@@ -1555,7 +1555,7 @@ async function exportPNG() {
   // 1枚ずつ「必要な解像度で」デコードして描き、即解放する（メモリ一定）
   let i = 0;
   for (const it of items) {
-    progress('書き出し中', i++ / items.length);
+    progress('Exporting', i++ / items.length);
     if (it.type === 'note') { // メモはそのまま描画
       g.save();
       g.translate(it.x, it.y); g.rotate(it.rot);
@@ -1590,7 +1590,7 @@ async function exportPNG() {
     bmp.close();
   }
   progressDone();
-  c.toBlob(b => { download('board.png', b); toast('PNGを書き出しました'); }, 'image/png');
+  c.toBlob(b => { download('board.png', b); toast('Exported PNG'); }, 'image/png');
 }
 
 /* ============ UI: ツールバー / メニュー / 通知 ============ */
@@ -1619,35 +1619,35 @@ function openMenu(px, py) {
   const singleImg = selItems.length === 1 && selItems[0].type !== 'note';
   const singleNote = selItems.length === 1 && selItems[0].type === 'note';
   const rows = has ? [
-    ...(singleImg ? [['クロップ', 'C', toggleCrop]] : []),
-    ...(singleImg && selItems[0].crop ? [['クロップ解除', '', () => clearCrop(selItems[0])]] : []),
-    ...(singleNote ? [['メモを編集', 'ダブルクリック', () => openNoteEditor(selItems[0])],
-                      ['メモの色を変更', '', () => cycleNoteColor(selItems[0])]] : []),
+    ...(singleImg ? [['Crop', 'C', toggleCrop]] : []),
+    ...(singleImg && selItems[0].crop ? [['Remove crop', '', () => clearCrop(selItems[0])]] : []),
+    ...(singleNote ? [['Edit note', 'Double-click', () => openNoteEditor(selItems[0])],
+                      ['Change note color', '', () => cycleNoteColor(selItems[0])]] : []),
     ...(singleImg || singleNote ? [null] : []),
-    ['複製', 'Ctrl+D', duplicateSel],
-    ['左右反転', 'H', () => keyAction('h')],
-    ['上下反転', 'V', () => keyAction('v')],
-    ['グレースケール', 'G', () => keyAction('g')],
-    ['回転リセット', 'R', () => keyAction('r')],
+    ['Duplicate', 'Ctrl+D', duplicateSel],
+    ['Flip horizontal', 'H', () => keyAction('h')],
+    ['Flip vertical', 'V', () => keyAction('v')],
+    ['Grayscale', 'G', () => keyAction('g')],
+    ['Reset rotation', 'R', () => keyAction('r')],
     null,
-    ['最前面へ', 'PgUp', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = items.filter(i => !sel.has(i.id)).concat(s); paint(); }],
-    ['最背面へ', 'PgDn', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }],
+    ['Bring to front', 'PgUp', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = items.filter(i => !sel.has(i.id)).concat(s); paint(); }],
+    ['Send to back', 'PgDn', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }],
     null,
-    ['削除', 'Del', () => { pushUndo(); items = items.filter(i => !sel.has(i.id)); sel.clear(); paint(); }],
+    ['Delete', 'Del', () => { pushUndo(); items = items.filter(i => !sel.has(i.id)); sel.clear(); paint(); }],
   ] : [
-    ['画像を追加…', '', () => fImg.click()],
-    ['メモを追加', 'N', () => addNote(wx, wy)],
-    ['貼り付け', 'Ctrl+V', () => toast('Ctrl+V で貼り付けできます')],
-    ['自動整列', 'A', arrange],
-    ['グリッド切替', 'S', cycleGrid],
-    ['全体表示', 'F', fitAll],
+    ['Add images…', '', () => fImg.click()],
+    ['Add note', 'N', () => addNote(wx, wy)],
+    ['Paste', 'Ctrl+V', () => toast('Paste with Ctrl+V')],
+    ['Auto arrange', 'A', arrange],
+    ['Toggle grid', 'S', cycleGrid],
+    ['Fit all', 'F', fitAll],
     null,
-    ['ボードを保存', 'Ctrl+S', saveBoard],
-    ['PNG書き出し', '', exportPNG],
+    ['Save board', 'Ctrl+S', saveBoard],
+    ['Export PNG', '', exportPNG],
     null,
-    ['Driveに保存', '', saveBoardToDrive],
-    ['名前を付けてDriveに保存', '', () => saveBoardToDrive(true)],
-    ['Driveから開く', '', openBoardFromDrive],
+    ['Save to Drive', '', saveBoardToDrive],
+    ['Save to Drive as…', '', () => saveBoardToDrive(true)],
+    ['Open from Drive', '', openBoardFromDrive],
   ];
   menu.innerHTML = '';
   for (const r of rows) {
