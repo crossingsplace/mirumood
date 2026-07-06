@@ -21,6 +21,8 @@
   #bar button:hover{background:#ffffff14}
   #bar .sep{width:1px;background:var(--line);margin:3px 2px}
   #driveAuthBtn.connected{color:var(--accent)}
+  #driveState{padding:5px 6px;font-size:11px;color:var(--dim);white-space:nowrap;align-self:center}
+  #driveState.dirty{color:var(--accent)}
   #menu{position:fixed;display:none;min-width:180px;padding:4px;z-index:30;
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:8px}
   #menu button{all:unset;display:flex;justify-content:space-between;gap:16px;cursor:pointer;
@@ -64,6 +66,7 @@
   <div class="sep"></div>
   <button data-act="drive-auth" id="driveAuthBtn" title="Googleでログイン">Googleログイン</button>
   <button data-act="drive-save" title="Google Driveに保存">Drive保存</button>
+  <span id="driveState"></span>
   <button data-act="drive-open" title="Google Driveから開く">Drive読込</button>
   <div class="sep"></div>
   <button data-act="help"  title="ショートカット一覧 (?)">?</button>
@@ -361,7 +364,7 @@ let nextId = 1;
 const undoStack = [], redoStack = [];
 function snapshot() { return items.map(it => ({ ...it, crop: it.crop ? { ...it.crop } : it.crop })); }
 let driveDirty = false; // 前回のDrive保存以降に変更があったか(状態表示用)
-function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 60) undoStack.shift(); redoStack.length = 0; driveDirty = true; }
+function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 60) undoStack.shift(); redoStack.length = 0; driveDirty = true; updateDriveState(); }
 function undo() { if (!undoStack.length) return; redoStack.push(snapshot()); items = undoStack.pop(); sel.clear(); cropState = null; paint(); }
 function redo() { if (!redoStack.length) return; undoStack.push(snapshot()); items = redoStack.pop(); sel.clear(); cropState = null; paint(); }
 
@@ -650,12 +653,16 @@ function drawSelection(it) {
   ctx.beginPath(); ctx.arc(rot[0], rot[1], HANDLE / 2 + 1, 0, 7); ctx.fill(); ctx.stroke();
 }
 function updateStatus() {
-  let driveInfo = '';
-  if (currentDriveFolderId) {
-    driveInfo = ` ・ Drive: ${currentBoardName}${driveDirty ? ' ●未保存の変更' : ' ✓保存済み'}`;
-  }
   document.getElementById('status').textContent =
-    `${items.length}枚 ・ デコード ${(cacheBytes / 1048576) | 0}MB ・ ${Math.round(view.s * 100)}%${driveInfo}`;
+    `${items.length}枚 ・ デコード ${(cacheBytes / 1048576) | 0}MB ・ ${Math.round(view.s * 100)}%`;
+  updateDriveState();
+}
+function updateDriveState() {
+  const el = document.getElementById('driveState');
+  if (!el) return;
+  if (!currentDriveFolderId) { el.textContent = ''; el.classList.remove('dirty'); return; }
+  el.textContent = `${currentBoardName} ${driveDirty ? '●未保存' : '✓保存済み'}`;
+  el.classList.toggle('dirty', driveDirty);
 }
 
 /* ============ ヒットテスト ============ */
@@ -1434,6 +1441,7 @@ async function onDrivePickerResult(data) {
     items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
     driveDirty = false;
     progressDone();
+    updateDriveState();
     fitAll();
     toast(`Driveから読み込みました（${items.length} 枚）`);
   } catch {
@@ -1486,6 +1494,7 @@ async function loadBoard(file) {
     const manifest = JSON.parse(await (await mEntry.data()).text());
     closeNoteEditor(false); cropState = null;
     currentDriveFolderId = null; currentDriveManifestId = null; driveDirty = false; store.clear();
+    updateDriveState();
     items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
     // 画像は遅延参照として登録（この時点ではファイルから読まない）
     for (const im of manifest.images) {
@@ -1515,6 +1524,7 @@ async function loadLegacy(file) { // 旧形式(.mrmd.json / base64埋め込み)�
   if (!data.items) throw 0;
   closeNoteEditor(false); cropState = null;
   currentDriveFolderId = null; currentDriveManifestId = null; driveDirty = false; store.clear();
+  updateDriveState();
   items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
   let i = 0;
   for (const rec of data.items) {
