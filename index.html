@@ -40,8 +40,8 @@
   #help .grp{padding-top:12px;color:var(--dim);font-size:11px;letter-spacing:.08em}
   #hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--dim);text-align:center;z-index:5}
   #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
-  #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);padding:7px 14px;border-radius:6px;
-    background:var(--panel);border:1px solid var(--line);opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;font-size:12px}
+  #toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;
+    background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);box-shadow:0 4px 16px #0006;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;font-size:13px}
   #status{position:fixed;bottom:10px;right:12px;color:var(--dim);font-family:ui-monospace,monospace;font-size:11px;z-index:5}
   #drop{position:fixed;inset:0;display:none;place-items:center;background:#ffb45410;border:2px dashed var(--accent);z-index:60;pointer-events:none;color:var(--accent);font-size:15px}
   #noteEdit{position:fixed;display:none;z-index:25;border:2px solid var(--accent);border-radius:8px;
@@ -85,7 +85,7 @@
     <tr><td class="grp" colspan="2">Selection & editing</td></tr>
     <tr><td>Click / Shift+click</td><td>Select / Add to selection</td></tr>
     <tr><td>Drag empty area</td><td>Box select</td></tr>
-    <tr><td>Corner handle (Shift)</td><td>Scale (Shift = free aspect ratio)</td></tr>
+    <tr><td>Corner handle (Shift)</td><td>Scale (Shift = free aspect ratio; notes are free by default)</td></tr>
     <tr><td>Top handle (Shift)</td><td>Rotate (Shift = snap to 15°)</td></tr>
     <tr><td>Ctrl+A / Esc</td><td>Select all / Deselect</td></tr>
     <tr><td>Delete / Ctrl+D</td><td>Delete / Duplicate (duplicating uses no extra memory)</td></tr>
@@ -419,6 +419,7 @@ function render() {
 
   ctx.setTransform(d, 0, 0, d, 0, 0);
   for (const it of items) if (sel.has(it.id) && !(cropState && cropState.id === it.id)) drawSelection(it);
+  if (sel.size > 1 && !cropState) drawGroupHandles();
   if (band) {
     ctx.strokeStyle = '#5ab0ff'; ctx.fillStyle = '#5ab0ff18'; ctx.lineWidth = 1;
     const x = Math.min(band.x0, band.x1), y = Math.min(band.y0, band.y1),
@@ -653,6 +654,29 @@ function drawSelection(it) {
   ctx.beginPath(); ctx.moveTo(top[0], top[1]); ctx.lineTo(rot[0], rot[1]); ctx.stroke();
   ctx.beginPath(); ctx.arc(rot[0], rot[1], HANDLE / 2 + 1, 0, 7); ctx.fill(); ctx.stroke();
 }
+/* 複数選択時のグループ拡縮: 個々の回転は保持したまま、軸並行の外接矩形を
+ * 基準に位置とサイズを一括でスケールする(単一アイテムのような回転ハンドルは持たない)。 */
+function selectionWorldBBox() {
+  let x0 = 1e15, y0 = 1e15, x1 = -1e15, y1 = -1e15;
+  for (const it of items) {
+    if (!sel.has(it.id)) continue;
+    for (const [px, py] of corners(it)) { x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py); }
+  }
+  return { x0, y0, x1, y1 };
+}
+function drawGroupHandles() {
+  const bb = selectionWorldBBox();
+  const cs = [[bb.x0, bb.y0], [bb.x1, bb.y0], [bb.x1, bb.y1], [bb.x0, bb.y1]].map(p => [w2sX(p[0]), w2sY(p[1])]);
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--sel');
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  cs.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+  ctx.closePath(); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#fff';
+  for (const p of cs) { ctx.fillRect(p[0] - HANDLE / 2, p[1] - HANDLE / 2, HANDLE, HANDLE); ctx.strokeRect(p[0] - HANDLE / 2, p[1] - HANDLE / 2, HANDLE, HANDLE); }
+}
 function updateStatus() {
   document.getElementById('status').textContent =
     `${items.length} images ・ ${(cacheBytes / 1048576) | 0}MB decoded ・ ${Math.round(view.s * 100)}%`;
@@ -675,6 +699,14 @@ function itemAt(wx, wy) {
   return null;
 }
 function handleAt(px, py, coarse) { // coarse=true(タッチ)は当たり判定を約2倍に
+  const hr0 = coarse ? 18 : 8;
+  if (sel.size > 1) { // 複数選択時: グループ外接矩形の角のみ(回転ハンドルはなし)
+    const bb = selectionWorldBBox();
+    const cs = [[bb.x0, bb.y0], [bb.x1, bb.y0], [bb.x1, bb.y1], [bb.x0, bb.y1]].map(p => [w2sX(p[0]), w2sY(p[1])]);
+    for (let k = 0; k < 4; k++)
+      if (Math.abs(px - cs[k][0]) < hr0 && Math.abs(py - cs[k][1]) < hr0) return { type: 'groupScale', k };
+    return null;
+  }
   if (sel.size !== 1) return null;
   const it = items.find(i => sel.has(i.id));
   if (!it) return null;
@@ -712,6 +744,7 @@ function movePinch() { // 2本指の中点を不動点として拡縮・移動
   paint();
 }
 function beginHandleDrag(h) { // 拡縮/回転ハンドルのドラッグ開始（マウス・タッチ共通）
+  if (h.type === 'groupScale') { beginGroupScaleDrag(h.k); return; }
   pushUndo();
   if (h.type === 'rotate') { mode = 'rotate'; drag.it = h.it; }
   else {
@@ -721,6 +754,18 @@ function beginHandleDrag(h) { // 拡縮/回転ハンドルのドラッグ開始�
     const [ax, ay] = worldOf(h.it, -sign[0] * h.it.w / 2, -sign[1] * h.it.h / 2);
     drag.anchor = [ax, ay]; drag.w0 = h.it.w; drag.h0 = h.it.h;
   }
+}
+function beginGroupScaleDrag(k) { // 複数選択のグループ拡縮開始: 軸並行の外接矩形を基準にする
+  pushUndo();
+  mode = 'groupScale';
+  const bb = selectionWorldBBox();
+  const cornersXY = [[bb.x0, bb.y0], [bb.x1, bb.y0], [bb.x1, bb.y1], [bb.x0, bb.y1]];
+  const sign = [[-1, -1], [1, -1], [1, 1], [-1, 1]][k];
+  drag.groupAnchor = cornersXY[(k + 2) % 4]; // ドラッグする角の対角(固定点)
+  drag.groupSign = sign;
+  drag.groupW0 = Math.max(1, bb.x1 - bb.x0);
+  drag.groupH0 = Math.max(1, bb.y1 - bb.y0);
+  drag.groupStarts = items.filter(i => sel.has(i.id)).map(i => ({ it: i, x: i.x, y: i.y, w0: i.w, h0: i.h }));
 }
 
 cv.addEventListener('pointerdown', e => {
@@ -883,13 +928,30 @@ cv.addEventListener('pointermove', e => {
     for (const s of drag.starts) { s.it.x = s.x + dx; s.it.y = s.y + dy; }
     paint(); return;
   }
+  if (mode === 'groupScale') {
+    const [ax, ay] = drag.groupAnchor;
+    let lx = (wx - ax) * drag.groupSign[0], ly = (wy - ay) * drag.groupSign[1];
+    let w = Math.max(8, lx), h = Math.max(8, ly);
+    if (!e.shiftKey) { const k = Math.max(w / drag.groupW0, h / drag.groupH0); w = drag.groupW0 * k; h = drag.groupH0 * k; }
+    const sx = w / drag.groupW0, sy = h / drag.groupH0;
+    for (const s of drag.groupStarts) {
+      s.it.x = ax + (s.x - ax) * sx;
+      s.it.y = ay + (s.y - ay) * sy;
+      s.it.w = s.w0 * sx;
+      s.it.h = s.h0 * sy;
+    }
+    paint(); return;
+  }
   if (mode === 'scale') {
     const it = drag.it, [ax, ay] = drag.anchor;
     const c = Math.cos(-it.rot), s = Math.sin(-it.rot);
     let lx = (wx - ax) * c - (wy - ay) * s, ly = (wx - ax) * s + (wy - ay) * c;
     lx *= drag.sign[0]; ly *= drag.sign[1];
     let w = Math.max(8, lx), h = Math.max(8, ly);
-    if (!e.shiftKey) { const k = Math.max(w / drag.w0, h / drag.h0); w = drag.w0 * k; h = drag.h0 * k; }
+    // メモ(テキスト枠)は画像と違って「正しい縦横比」という概念がないため、
+    // 既定で自由に縦横比を変えられるようにする(画像はShiftを押した時だけ自由)
+    const freeAspect = it.type === 'note' ? !e.shiftKey : e.shiftKey;
+    if (!freeAspect) { const k = Math.max(w / drag.w0, h / drag.h0); w = drag.w0 * k; h = drag.h0 * k; }
     it.w = w; it.h = h;
     const cxp = drag.sign[0] * w / 2, cyp = drag.sign[1] * h / 2;
     const cc = Math.cos(it.rot), ss = Math.sin(it.rot);
