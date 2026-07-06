@@ -365,8 +365,8 @@ const undoStack = [], redoStack = [];
 function snapshot() { return items.map(it => ({ ...it, crop: it.crop ? { ...it.crop } : it.crop })); }
 let driveDirty = false; // 前回のDrive保存以降に変更があったか(状態表示用)
 function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 60) undoStack.shift(); redoStack.length = 0; driveDirty = true; updateDriveState(); }
-function undo() { if (!undoStack.length) return; redoStack.push(snapshot()); items = undoStack.pop(); sel.clear(); cropState = null; paint(); }
-function redo() { if (!redoStack.length) return; undoStack.push(snapshot()); items = redoStack.pop(); sel.clear(); cropState = null; paint(); }
+function undo() { if (!undoStack.length) return; redoStack.push(snapshot()); items = undoStack.pop(); sel.clear(); cropState = null; driveDirty = true; updateDriveState(); paint(); }
+function redo() { if (!redoStack.length) return; undoStack.push(snapshot()); items = redoStack.pop(); sel.clear(); cropState = null; driveDirty = true; updateDriveState(); paint(); }
 
 /* ============ 座標変換 ============ */
 const w2sX = x => x * view.s + view.ox, w2sY = y => y * view.s + view.oy;
@@ -851,6 +851,7 @@ cv.addEventListener('pointermove', e => {
       if (undoStack.length > 60) undoStack.shift();
       redoStack.length = 0;
       drag.undoPushed = true;
+      driveDirty = true; updateDriveState(); // 移動もpushUndo()同様に「未保存の変更」として扱う
     }
     let dx = wx - drag.wx, dy = wy - drag.wy;
     if (gridMode === 2 && !e.altKey) { // グリッドスナップ（Altで一時無効）
