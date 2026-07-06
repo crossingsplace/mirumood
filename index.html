@@ -1290,6 +1290,28 @@ async function driveGetParent(fileId) {
   return data.parents && data.parents[0] ? data.parents[0] : null;
 }
 
+/* board.json へのサムネイル直接埋め込み(容量予算つき)
+ * 小〜中規模のボードは全サムネイルを埋め込んで「開いた瞬間に全部表示」を実現し、
+ * 予算を超える大規模ボードは超過分だけ従来どおりDriveへの個別遅延取得にフォールバックする。
+ * 「ある枚数を境に挙動が一変する崖」を避け、なだらかに劣化させるための仕組み。 */
+const THUMB_EMBED_BUDGET = 3 * 1024 * 1024; // board.json に埋め込むサムネイルの合計容量予算(概算)
+async function blobToDataURI(blob) {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return `data:${blob.type || 'image/webp'};base64,${btoa(binary)}`;
+}
+function dataURItoBlob(dataURI) {
+  const commaIdx = dataURI.indexOf(',');
+  const mime = (dataURI.slice(5, dataURI.indexOf(';')) || 'image/webp');
+  const binary = atob(dataURI.slice(commaIdx + 1));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
 async function saveBoardToDrive() {
   if (!items.length) { toast('ボードが空です'); return; }
   try { await ensureDriveToken(); } catch { toast('Googleへのログインが必要です'); return; }
@@ -1303,6 +1325,8 @@ async function saveBoardToDrive() {
     const folderId = await ensureBoardFolder(currentBoardName);
     const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
     let done = 0;
+    let embedBudgetLeft = THUMB_EMBED_BUDGET;
+    const embeds = new Map(); // id -> data URI (予算内に収まったものだけ)
     progress('Drive保存中', 0);
     for (const id of used) {
       const rec = store.get(id);
@@ -1310,9 +1334,20 @@ async function saveBoardToDrive() {
         const blob = await getBlob(rec.original);
         rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
       }
-      if (rec.thumb && !rec.thumbDriveId) {
-        const tblob = await getBlob(rec.thumb);
-        rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
+      if (rec.thumb) {
+        let tblob = null;
+        if (!rec.thumbDriveId) {
+          tblob = await getBlob(rec.thumb);
+          rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
+        }
+        if (embedBudgetLeft > 0) { // 予算が残っていればboard.jsonに直接埋め込む
+          tblob = tblob || await getBlob(rec.thumb);
+          const need = tblob.size * 1.37; // base64膨張分の見込み
+          if (need <= embedBudgetLeft) {
+            embeds.set(id, await blobToDataURI(tblob));
+            embedBudgetLeft -= need;
+          }
+        }
       }
       done++;
       progress('Drive保存中', done / used.length);
@@ -1321,7 +1356,7 @@ async function saveBoardToDrive() {
       app: 'MiruMood', version: 3,
       items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
         ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
-      images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId, thumbDriveId: r.thumbDriveId || null }; })
+      images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId, thumbDriveId: r.thumbDriveId || null, thumbEmbed: embeds.get(id) || null }; })
     };
     if (!currentDriveManifestId) currentDriveManifestId = await driveFindFileInFolder('board.json', folderId);
     const mBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
@@ -1371,7 +1406,8 @@ async function onDrivePickerResult(data) {
         w: im.w, h: im.h, ext: im.ext,
         driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
         original: () => driveDownloadBlob(im.driveId),
-        thumb: im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId) : null
+        thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
+             : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId) : null)
       });
       const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
       if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
@@ -1628,6 +1664,15 @@ function progressDone() {
 addEventListener('resize', paint);
 updateDriveUI();
 paint();
+
+// Google連携ライブラリの先読み: 初期描画を邪魔しないようアイドル時に裏側で読み込む。
+// 「Drive読込」クリック時の待ち時間をほぼゼロにするための最適化(失敗しても無視してよい)。
+const prefetchGoogleLibs = () => {
+  ensureGisReady().catch(() => {});
+  ensurePickerReady().catch(() => {});
+};
+if ('requestIdleCallback' in window) requestIdleCallback(prefetchGoogleLibs, { timeout: 4000 });
+else setTimeout(prefetchGoogleLibs, 1500);
 </script>
 </body>
 </html>
