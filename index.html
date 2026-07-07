@@ -58,6 +58,7 @@
   <button data-act="note"  title="Add note (N)">Note</button>
   <button data-act="grid"  title="Toggle grid (S)">Grid</button>
   <button data-act="canvasbg" title="Cycle canvas background color">Canvas</button>
+  <button data-act="jpeg" id="jpegBtn" title="Cycle JPG optimization for large images">JPG: Off</button>
   <button data-act="arrange" title="Auto arrange (A)">Arrange</button>
   <button data-act="fit"   title="Fit all (F)">Fit</button>
   <div class="sep"></div>
@@ -99,6 +100,7 @@
     <tr><td>N</td><td>Add note (double-click to edit)</td></tr>
     <tr><td>S</td><td>Toggle grid (off → on → snap)</td></tr>
     <tr><td>Canvas button</td><td>Cycle canvas background color (Dark / Mid Gray / Light / Black — saved per board)</td></tr>
+    <tr><td>JPG button</td><td>Cycle JPG optimization: Off / On / On+keep original PNG (asked once per board automatically for large images)</td></tr>
     <tr><td>PageUp / PageDown</td><td>Bring to front / Send to back</td></tr>
     <tr><td class="grp" colspan="2">Touch (tablet)</td></tr>
     <tr><td>One-finger drag</td><td>Move image (pan on empty area)</td></tr>
@@ -350,14 +352,84 @@ async function blobToThumb(srcBmp) { // 256px WebP サムネイル
   return new Promise(res => c.toBlob(res, 'image/webp', .8));
 }
 
+/* ============ JPG最適化 ============
+ * 透過のない大きな画像を検出し、必要ならJPGに変換して保存容量/読込速度を稼ぐ。
+ * 変換しても元より小さくならない場合(平坦な色面の多いスクショ等)は採用しない。
+ * ボードごとに一度だけ確認し、以後はそのボードの設定として記憶する。
+ * 「元データも残す」を有効にすると、色を正確に拾いたい用途(スポイト/外部コピー)
+ * では無劣化の原本を、画面表示や保存容量には軽いJPGを、両方使い分けられる。 */
+const OPTIMIZE_SIZE_THRESHOLD = 1024 * 1024; // これを超えるサイズの非JPG画像を対象にする
+const JPEG_QUALITY = 0.9;
+let jpegOptimize = false;          // このボードでJPG最適化を行うか
+let keepOriginalOnOptimize = false; // 最適化時、元データも保持するか
+let jpegPromptDismissed = false;    // このボードで一度確認済みか(以後は聞かない)
+
+async function bitmapHasAlpha(bmp) { // 小さく縮小して高速に透過の有無を判定
+  const size = 48;
+  const k = Math.min(1, size / Math.max(bmp.width, bmp.height));
+  const w = Math.max(1, Math.round(bmp.width * k)), h = Math.max(1, Math.round(bmp.height * k));
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(bmp, 0, 0, w, h);
+  const data = g.getImageData(0, 0, w, h).data;
+  for (let i = 3; i < data.length; i += 4) if (data[i] < 255) return true;
+  return false;
+}
+async function tryConvertToJpeg(bmp) {
+  const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height;
+  c.getContext('2d').drawImage(bmp, 0, 0);
+  return new Promise(res => c.toBlob(res, 'image/jpeg', JPEG_QUALITY));
+}
+function cycleJpegOptimize() { // Off → On → On+元データも保持 → Off
+  if (!jpegOptimize) { jpegOptimize = true; keepOriginalOnOptimize = false; toast('JPG optimization: On'); }
+  else if (!keepOriginalOnOptimize) { keepOriginalOnOptimize = true; toast('JPG optimization: On (keeping originals too)'); }
+  else { jpegOptimize = false; keepOriginalOnOptimize = false; toast('JPG optimization: Off'); }
+  jpegPromptDismissed = true; // 手動で設定した以上、以後は自動確認しない
+  driveDirty = true; updateDriveState();
+  updateJpegBtn();
+}
+function updateJpegBtn() {
+  const btn = document.getElementById('jpegBtn');
+  if (!btn) return;
+  btn.textContent = !jpegOptimize ? 'JPG: Off' : (keepOriginalOnOptimize ? 'JPG: On+PNG' : 'JPG: On');
+}
+
 async function importImageBlob(blob, typeHint) { // -> imgId | null
   let bmp;
   try { bmp = await createImageBitmap(blob); } catch { return null; }
   const id = 'i' + (imgSeq++);
-  const thumb = Math.max(bmp.width, bmp.height) > 320 ? await blobToThumb(bmp) : null;
   const ext = ((typeHint || blob.type || 'image/png').split('/')[1] || 'png')
     .replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'png';
-  store.set(id, { w: bmp.width, h: bmp.height, ext, original: blob, thumb });
+
+  const eligible = ext !== 'jpg' && blob.size > OPTIMIZE_SIZE_THRESHOLD;
+  if (eligible && !jpegPromptDismissed) {
+    jpegPromptDismissed = true;
+    const hasAlpha = await bitmapHasAlpha(bmp);
+    if (!hasAlpha) {
+      jpegOptimize = confirm(
+        'This board has a large image that isn\'t a JPG.\n\n' +
+        'Convert images like this to JPG automatically to speed up loading and saving? ' +
+        '(Only applied when it actually makes the file smaller; images with transparency are never converted. ' +
+        'You can change this anytime from the "JPG" button.)'
+      );
+      driveDirty = true; updateDriveState(); updateJpegBtn();
+    }
+  }
+
+  let storeBlob = blob, storeExt = ext, fullOriginal = null;
+  if (jpegOptimize && ext !== 'jpg') {
+    const hasAlpha = await bitmapHasAlpha(bmp);
+    if (!hasAlpha) {
+      const jpgBlob = await tryConvertToJpeg(bmp);
+      if (jpgBlob && jpgBlob.size < blob.size) {
+        if (keepOriginalOnOptimize) fullOriginal = blob; // 無劣化の原本も保持
+        storeBlob = jpgBlob; storeExt = 'jpg';
+      }
+    }
+  }
+
+  const thumb = Math.max(bmp.width, bmp.height) > 320 ? await blobToThumb(bmp) : null;
+  store.set(id, { w: bmp.width, h: bmp.height, ext: storeExt, original: storeBlob, thumb, fullOriginal, fullExt: fullOriginal ? ext : null });
   bmp.close();
   return id;
 }
@@ -1202,7 +1274,7 @@ async function copySelectionToClipboard() {
     } else {
       const rec = store.get(it.imgId);
       if (!rec) throw new Error('image unavailable');
-      const blob = await getBlob(rec.original);
+      const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
       const bmp = await createImageBitmap(blob);
       const cr = it.crop;
       const sx = cr ? cr.x * bmp.width : 0, sy = cr ? cr.y * bmp.height : 0;
@@ -1583,15 +1655,26 @@ async function saveBoardToDrive(forceNewName) {
           }
         }
       }
+      if (rec.fullOriginal && !rec.fullDriveId) { // 保持している無劣化の原本もアップロードする
+        const fblob = await getBlob(rec.fullOriginal);
+        rec.fullDriveId = await driveUploadFile(`${id}_full.${rec.fullExt}`, fblob, fblob.type || 'application/octet-stream', folderId);
+      }
       done++;
       progress('Saving to Drive', done / used.length);
     }
     const manifest = {
       app: 'MiruMood', version: 3,
       canvasBg: currentCanvasBg,
+      jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
       items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
         ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
-      images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId, thumbDriveId: r.thumbDriveId || null, thumbEmbed: embeds.get(id) || null }; })
+      images: used.map(id => {
+        const r = store.get(id);
+        return {
+          id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId, thumbDriveId: r.thumbDriveId || null, thumbEmbed: embeds.get(id) || null,
+          fullDriveId: r.fullDriveId || null, fullExt: r.fullExt || null
+        };
+      })
     };
     if (!currentDriveManifestId) currentDriveManifestId = await driveFindFileInFolder('board.json', folderId);
     const mBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
@@ -1647,15 +1730,21 @@ async function onDrivePickerResult(data) {
       store.set(im.id, {
         w: im.w, h: im.h, ext: im.ext,
         driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
+        fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
         original: () => driveDownloadBlob(im.driveId),
         thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
-             : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId) : null)
+             : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId) : null),
+        fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId) : null
       });
       const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
       if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
     }
     items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
     setCanvasBg(manifest.canvasBg || CANVAS_PRESETS[0].bg);
+    jpegOptimize = !!manifest.jpegOptimize;
+    keepOriginalOnOptimize = !!manifest.keepOriginalOnOptimize;
+    jpegPromptDismissed = !!manifest.jpegPromptDismissed;
+    updateJpegBtn();
     driveDirty = false;
     progressDone();
     updateDriveState();
@@ -1682,9 +1771,10 @@ async function saveBoard() {
   const manifest = {
     app: 'MiruMood', version: 2,
     canvasBg: currentCanvasBg,
+    jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
     items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
       ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
-    images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext }; })
+    images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, fullExt: r.fullExt || null }; })
   };
   const files = [{ name: 'board.json', blob: new Blob([JSON.stringify(manifest)]) }];
   try {
@@ -1692,6 +1782,7 @@ async function saveBoard() {
       const r = store.get(id);
       files.push({ name: `images/${id}.${r.ext}`, blob: await getBlob(r.original) });
       if (r.thumb) files.push({ name: `thumbs/${id}.webp`, blob: await getBlob(r.thumb) });
+      if (r.fullOriginal) files.push({ name: `images_full/${id}.${r.fullExt}`, blob: await getBlob(r.fullOriginal) });
     }
     const zip = await zipBuild(files, p => progress('Saving', p));
     progressDone();
@@ -1718,17 +1809,24 @@ async function loadBoard(file) {
     for (const im of manifest.images) {
       const orig = entries.get(`images/${im.id}.${im.ext}`);
       const th = entries.get(`thumbs/${im.id}.webp`);
+      const full = im.fullExt ? entries.get(`images_full/${im.id}.${im.fullExt}`) : null;
       if (!orig) continue;
       store.set(im.id, {
         w: im.w, h: im.h, ext: im.ext,
         original: () => orig.data(),
-        thumb: th ? () => th.data() : null
+        thumb: th ? () => th.data() : null,
+        fullOriginal: full ? () => full.data() : null,
+        fullExt: full ? im.fullExt : null
       });
       const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
       if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
     }
     items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
     setCanvasBg(manifest.canvasBg || CANVAS_PRESETS[0].bg);
+    jpegOptimize = !!manifest.jpegOptimize;
+    keepOriginalOnOptimize = !!manifest.keepOriginalOnOptimize;
+    jpegPromptDismissed = !!manifest.jpegPromptDismissed; // 旧形式(フィールドなし)は「未確認」扱いにして発見の機会を残す
+    updateJpegBtn();
     driveDirty = false;
     currentBoardName = file.name.replace(/\.mrmd$/i, '') || 'board';
     progressDone();
@@ -1745,6 +1843,7 @@ async function loadLegacy(file) { // 旧形式(.mrmd.json / base64埋め込み)�
   closeNoteEditor(false); cropState = null;
   currentDriveFolderId = null; currentDriveManifestId = null; store.clear(); clearBmpCache();
   setCanvasBg(CANVAS_PRESETS[0].bg);
+  jpegOptimize = false; keepOriginalOnOptimize = false; jpegPromptDismissed = false; updateJpegBtn();
   driveDirty = false;
   updateDriveState();
   items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
@@ -1789,7 +1888,7 @@ async function exportPNG() {
     if (!rec) continue;
     const cr = it.crop;
     const need = Math.max(it.w / (cr ? cr.w : 1), it.h / (cr ? cr.h : 1)) * k;
-    const blob = await getBlob(rec.original);
+    const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
     let bmp;
     if (need >= Math.max(rec.w, rec.h)) bmp = await createImageBitmap(blob);
     else {
@@ -1822,7 +1921,7 @@ fJson.addEventListener('change', () => { if (fJson.files[0]) loadBoard(fJson.fil
 document.getElementById('bar').addEventListener('click', e => {
   const act = e.target.dataset?.act; if (!act) return;
   ({ open: () => fImg.click(), note: () => addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)),
-     grid: cycleGrid, canvasbg: cycleCanvasBg, arrange, fit: fitAll, save: saveBoard,
+     grid: cycleGrid, canvasbg: cycleCanvasBg, jpeg: cycleJpegOptimize, arrange, fit: fitAll, save: saveBoard,
      load: () => fJson.click(), png: exportPNG,
      'drive-auth': driveAuthClick, 'drive-save': saveBoardToDrive, 'drive-open': openBoardFromDrive,
      help: () => helpBox.style.display = 'grid' })[act]();
@@ -1863,6 +1962,7 @@ function openMenu(px, py) {
     ['Auto arrange', 'A', arrange],
     ['Toggle grid', 'S', cycleGrid],
     ['Canvas color', '', cycleCanvasBg],
+    ['JPG optimization', '', cycleJpegOptimize],
     ['Fit all', 'F', fitAll],
     null,
     ['Save board', 'Ctrl+S', saveBoard],
@@ -1918,6 +2018,7 @@ function progressDone() {
 
 addEventListener('resize', paint);
 restoreDriveToken(); // 直前のページ再読み込みでログイン状態が残っていれば即座に復元する
+updateJpegBtn();
 updateDriveUI();
 paint();
 
