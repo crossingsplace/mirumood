@@ -57,6 +57,7 @@
   <button data-act="open"  title="Add images">+ Images</button>
   <button data-act="note"  title="Add note (N)">Note</button>
   <button data-act="grid"  title="Toggle grid (S)">Grid</button>
+  <button data-act="canvasbg" title="Cycle canvas background color">Canvas</button>
   <button data-act="arrange" title="Auto arrange (A)">Arrange</button>
   <button data-act="fit"   title="Fit all (F)">Fit</button>
   <div class="sep"></div>
@@ -97,6 +98,7 @@
     <tr><td>C</td><td>Crop (drag corners/edges, Enter/Esc to confirm)</td></tr>
     <tr><td>N</td><td>Add note (double-click to edit)</td></tr>
     <tr><td>S</td><td>Toggle grid (off → on → snap)</td></tr>
+    <tr><td>Canvas button</td><td>Cycle canvas background color (Dark / Mid Gray / Light / Black — saved per board)</td></tr>
     <tr><td>PageUp / PageDown</td><td>Bring to front / Send to back</td></tr>
     <tr><td class="grp" colspan="2">Touch (tablet)</td></tr>
     <tr><td>One-finger drag</td><td>Move image (pan on empty area)</td></tr>
@@ -397,9 +399,10 @@ function render() {
   ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg');
   ctx.fillRect(0, 0, W, H);
 
-  if (gridMode > 0 && view.s > .25) { // ドットグリッド
+  if (gridMode > 0 && view.s > .25) { // ドットグリッド(背景の明暗に応じて見やすい色に切り替える)
     const gs = GRID * view.s * d;
-    ctx.fillStyle = gridMode === 2 ? '#ffb45428' : '#ffffff10';
+    const light = isLightBg(currentCanvasBg);
+    ctx.fillStyle = gridMode === 2 ? '#ffb45450' : (light ? '#00000018' : '#ffffff10');
     const x0 = ((view.ox * d) % gs + gs) % gs, y0 = ((view.oy * d) % gs + gs) % gs;
     for (let x = x0; x < W; x += gs) for (let y = y0; y < H; y += gs) ctx.fillRect(x - 1, y - 1, 2, 2);
   }
@@ -631,6 +634,33 @@ function cycleGrid() {
   gridMode = (gridMode + 1) % 3;
   toast(['Grid: off', 'Grid: on', 'Grid: snap enabled'][gridMode]);
   paint();
+}
+/* ============ キャンバス背景色 ============ */
+// PureRefのテーマプリセット(Dark/Light/Glass)と、値の判断に使われる
+// 中間グレーの定番テクニックを参考にした4色。ボードごとに記憶する。
+const CANVAS_PRESETS = [
+  { name: 'Dark', bg: '#17181c' },
+  { name: 'Mid Gray', bg: '#808080' },
+  { name: 'Light', bg: '#e8e8e8' },
+  { name: 'Black', bg: '#000000' },
+];
+let currentCanvasBg = CANVAS_PRESETS[0].bg;
+function isLightBg(hex) { // 知覚輝度が閾値を超えたら「明るい背景」とみなす
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substr(0, 2), 16), g = parseInt(h.substr(2, 2), 16), b = parseInt(h.substr(4, 2), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) > 150;
+}
+function setCanvasBg(hex) {
+  currentCanvasBg = hex;
+  document.documentElement.style.setProperty('--bg', hex);
+  driveDirty = true; updateDriveState();
+  paint();
+}
+function cycleCanvasBg() {
+  const idx = CANVAS_PRESETS.findIndex(p => p.bg === currentCanvasBg);
+  const next = CANVAS_PRESETS[(idx + 1) % CANVAS_PRESETS.length];
+  setCanvasBg(next.bg);
+  toast('Canvas: ' + next.name);
 }
 const HANDLE = 6, ROT_OFF = 26;
 function handlePts(it) {
@@ -1550,6 +1580,7 @@ async function saveBoardToDrive(forceNewName) {
     }
     const manifest = {
       app: 'MiruMood', version: 3,
+      canvasBg: currentCanvasBg,
       items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
         ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
       images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId, thumbDriveId: r.thumbDriveId || null, thumbEmbed: embeds.get(id) || null }; })
@@ -1616,6 +1647,7 @@ async function onDrivePickerResult(data) {
       if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
     }
     items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
+    setCanvasBg(manifest.canvasBg || CANVAS_PRESETS[0].bg);
     driveDirty = false;
     progressDone();
     updateDriveState();
@@ -1641,6 +1673,7 @@ async function saveBoard() {
   const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
   const manifest = {
     app: 'MiruMood', version: 2,
+    canvasBg: currentCanvasBg,
     items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
       ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
     images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext }; })
@@ -1687,6 +1720,8 @@ async function loadBoard(file) {
       if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
     }
     items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
+    setCanvasBg(manifest.canvasBg || CANVAS_PRESETS[0].bg);
+    driveDirty = false;
     currentBoardName = file.name.replace(/\.mrmd$/i, '') || 'board';
     progressDone();
     fitAll();
@@ -1700,7 +1735,9 @@ async function loadLegacy(file) { // 旧形式(.mrmd.json / base64埋め込み)�
   const data = JSON.parse(await file.text());
   if (!data.items) throw 0;
   closeNoteEditor(false); cropState = null;
-  currentDriveFolderId = null; currentDriveManifestId = null; driveDirty = false; store.clear();
+  currentDriveFolderId = null; currentDriveManifestId = null; store.clear();
+  setCanvasBg(CANVAS_PRESETS[0].bg);
+  driveDirty = false;
   updateDriveState();
   items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
   let i = 0;
@@ -1777,7 +1814,7 @@ fJson.addEventListener('change', () => { if (fJson.files[0]) loadBoard(fJson.fil
 document.getElementById('bar').addEventListener('click', e => {
   const act = e.target.dataset?.act; if (!act) return;
   ({ open: () => fImg.click(), note: () => addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)),
-     grid: cycleGrid, arrange, fit: fitAll, save: saveBoard,
+     grid: cycleGrid, canvasbg: cycleCanvasBg, arrange, fit: fitAll, save: saveBoard,
      load: () => fJson.click(), png: exportPNG,
      'drive-auth': driveAuthClick, 'drive-save': saveBoardToDrive, 'drive-open': openBoardFromDrive,
      help: () => helpBox.style.display = 'grid' })[act]();
@@ -1817,6 +1854,7 @@ function openMenu(px, py) {
     ['Paste', 'Ctrl+V', () => toast('Paste with Ctrl+V')],
     ['Auto arrange', 'A', arrange],
     ['Toggle grid', 'S', cycleGrid],
+    ['Canvas color', '', cycleCanvasBg],
     ['Fit all', 'F', fitAll],
     null,
     ['Save board', 'Ctrl+S', saveBoard],
