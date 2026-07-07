@@ -70,6 +70,8 @@
   <button data-act="drive-save" title="Save to Google Drive">Save to Drive</button>
   <span id="driveState"></span>
   <button data-act="drive-open" title="Open from Google Drive">Open from Drive</button>
+  <button data-act="drive-folder" title="Open a Google Drive folder of images directly">Open Drive Folder</button>
+  <button data-act="drive-reveal" title="Open this board's Drive folder in a new tab">Show in Drive</button>
   <div class="sep"></div>
   <button data-act="help"  title="Shortcuts (?)">?</button>
 </div>
@@ -117,6 +119,8 @@
     <tr><td class="grp" colspan="2">Google Drive</td></tr>
     <tr><td>Sign in</td><td>Connect your Google account / click again to sign out</td></tr>
     <tr><td>Save to Drive / Open from Drive</td><td>Save the board to Google Drive / open one from Drive</td></tr>
+    <tr><td>Open Drive folder</td><td>Open a plain Drive folder of images directly as a new board (no board.json needed)</td></tr>
+    <tr><td>Show in Drive</td><td>Open this board's Drive folder in a new tab (only if it's saved to Drive)</td></tr>
     <tr><td>Toolbar status</td><td>Shows "board name ✓ saved" or "● unsaved changes"</td></tr>
   </table>
 </div></div>
@@ -1585,10 +1589,28 @@ async function driveDownloadBlob(fileId) {
   if (!res.ok) throw new Error('download failed');
   return res.blob();
 }
+// 今開いているボードの画像が実際に入っているDriveフォルダを、新しいタブでそのまま開く。
+function revealDriveFolder() {
+  if (!currentDriveFolderId) { toast("This board isn't saved to Drive yet"); return; }
+  window.open(`https://drive.google.com/drive/folders/${currentDriveFolderId}`, '_blank', 'noopener');
+}
 async function driveGetParent(fileId) {
   const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=parents`);
   const data = await res.json();
   return data.parents && data.parents[0] ? data.parents[0] : null;
+}
+async function listDriveImagesInFolder(folderId) { // フォルダ内の画像ファイルを列挙(1000件超も対応)
+  const q = encodeURIComponent(`'${folderId}' in parents and mimeType contains 'image/' and trashed = false`);
+  const fields = encodeURIComponent('nextPageToken,files(id,name,mimeType,imageMediaMetadata(width,height))');
+  let files = [], pageToken = '';
+  do {
+    const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=${fields}&pageSize=1000` + (pageToken ? `&pageToken=${pageToken}` : '');
+    const res = await driveApiFetch(url);
+    const data = await res.json();
+    files = files.concat(data.files || []);
+    pageToken = data.nextPageToken || '';
+  } while (pageToken);
+  return files;
 }
 
 /* board.json へのサムネイル直接埋め込み(容量予算つき)
@@ -1639,6 +1661,15 @@ async function saveBoardToDrive(forceNewName) {
       if (!rec.driveId) {
         const blob = await getBlob(rec.original);
         rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
+      }
+      if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
+        // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
+        try {
+          const origBlob = await getBlob(rec.original);
+          const obmp = await createImageBitmap(origBlob);
+          rec.thumb = await blobToThumb(obmp);
+          obmp.close();
+        } catch {}
       }
       if (rec.thumb) {
         let tblob = null;
@@ -1705,6 +1736,74 @@ async function openBoardFromDrive() {
     .setCallback(onDrivePickerResult)
     .build()
     .setVisible(true);
+}
+// Driveの「フォルダ」自体を選び、中に入っている画像をそのまま新しいボードとして開く。
+// (すでにMiruMoodで作ったボードでなく、素の画像フォルダをそのまま使いたい場合向け)
+async function openDriveFolder() {
+  try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
+  if (!driveUserEmail) await fetchDriveUserInfo();
+  try { await ensurePickerReady(); } catch { toast('Failed to load the file picker'); return; }
+
+  const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+    .setSelectFolderEnabled(true)
+    .setIncludeFolders(true)
+    .setMimeTypes('application/vnd.google-apps.folder');
+  new google.picker.PickerBuilder()
+    .addView(view)
+    .setOAuthToken(driveAccessToken)
+    .setAppId(GOOGLE_APP_ID)
+    .setTitle('Select a Drive folder of images to open')
+    .setCallback(onDriveFolderPickerResult)
+    .build()
+    .setVisible(true);
+}
+async function onDriveFolderPickerResult(data) {
+  if (data.action !== google.picker.Action.PICKED) return;
+  const doc = data.docs && data.docs[0];
+  if (!doc) return;
+  try {
+    progress('Loading folder', 0);
+    const folderId = doc.id;
+    const files = await listDriveImagesInFolder(folderId);
+    if (!files.length) { progressDone(); toast('No images found in that folder'); return; }
+
+    closeNoteEditor(false); cropState = null;
+    store.clear(); clearBmpCache();
+    items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
+    currentDriveFolderId = folderId;
+    currentDriveManifestId = null; // このフォルダにはまだboard.jsonがない(初回のDrive保存時に作られる)
+    currentBoardName = doc.name || 'board';
+    setCanvasBg(CANVAS_PRESETS[0].bg);
+    jpegOptimize = false; keepOriginalOnOptimize = false; jpegPromptDismissed = false; updateJpegBtn();
+
+    const cols = Math.ceil(Math.sqrt(files.length));
+    let i = 0;
+    for (const f of files) {
+      progress('Loading folder', i / files.length);
+      const meta = f.imageMediaMetadata;
+      const w0 = meta?.width || 1000, h0 = meta?.height || 1000;
+      const ext = ((f.mimeType || '').split('/')[1] || 'jpg').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'jpg';
+      const id = 'i' + (imgSeq++);
+      store.set(id, {
+        w: w0, h: h0, ext,
+        driveId: f.id, thumbDriveId: null, fullDriveId: null, fullExt: null,
+        original: () => driveDownloadBlob(f.id),
+        thumb: null // サムネイル未生成: 初回のDrive保存時に自動生成される
+      });
+      const k = Math.min(1, 480 / Math.max(w0, h0));
+      const gx = (i % cols) * 520, gy = Math.floor(i / cols) * 520;
+      items.push({ id: nextId++, imgId: id, x: gx, y: gy, w: w0 * k, h: h0 * k, rot: 0, flipH: false, flipV: false, gray: false, opacity: 1 });
+      i++;
+    }
+    driveDirty = true;
+    progressDone();
+    updateDriveState();
+    fitAll();
+    toast(`Loaded ${files.length} images from Drive folder — Save to Drive to keep this layout`);
+  } catch {
+    progressDone();
+    toast('Failed to load the folder');
+  }
 }
 async function onDrivePickerResult(data) {
   if (data.action !== google.picker.Action.PICKED) return;
@@ -1923,7 +2022,7 @@ document.getElementById('bar').addEventListener('click', e => {
   ({ open: () => fImg.click(), note: () => addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)),
      grid: cycleGrid, canvasbg: cycleCanvasBg, jpeg: cycleJpegOptimize, arrange, fit: fitAll, save: saveBoard,
      load: () => fJson.click(), png: exportPNG,
-     'drive-auth': driveAuthClick, 'drive-save': saveBoardToDrive, 'drive-open': openBoardFromDrive,
+     'drive-auth': driveAuthClick, 'drive-save': saveBoardToDrive, 'drive-open': openBoardFromDrive, 'drive-folder': openDriveFolder, 'drive-reveal': revealDriveFolder,
      help: () => helpBox.style.display = 'grid' })[act]();
 });
 helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
@@ -1971,6 +2070,8 @@ function openMenu(px, py) {
     ['Save to Drive', '', saveBoardToDrive],
     ['Save to Drive as…', '', () => saveBoardToDrive(true)],
     ['Open from Drive', '', openBoardFromDrive],
+    ['Open Drive folder…', '', openDriveFolder],
+    ['Show this board in Drive', '', revealDriveFolder],
   ];
   menu.innerHTML = '';
   for (const r of rows) {
