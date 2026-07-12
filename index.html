@@ -1873,11 +1873,15 @@ async function saveBoard() {
   };
   const files = [{ name: 'board.json', blob: new Blob([JSON.stringify(manifest)]) }];
   try {
+    progress('Preparing', 0);
+    let done = 0;
     for (const id of used) {
       const r = store.get(id);
       files.push({ name: `images/${id}.${r.ext}`, blob: await getBlob(r.original) });
       if (r.thumb) files.push({ name: `thumbs/${id}.webp`, blob: await getBlob(r.thumb) });
       if (r.fullOriginal) files.push({ name: `images_full/${id}.${r.fullExt}`, blob: await getBlob(r.fullOriginal) });
+      done++;
+      progress('Preparing', done / used.length);
     }
     const zip = await zipBuild(files, p => progress('Saving', p));
     progressDone();
