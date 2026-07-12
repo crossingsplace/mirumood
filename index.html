@@ -52,6 +52,15 @@
   #toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);box-shadow:0 4px 16px #0006;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;font-size:13px}
   #status{position:fixed;bottom:10px;right:12px;color:var(--dim);font-family:ui-monospace,monospace;font-size:11px;z-index:5}
+  #noteToolbar{position:fixed;display:none;align-items:center;gap:2px;padding:4px;transform:translateX(-50%);
+    background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:8px;
+    box-shadow:0 4px 16px #0006;z-index:20}
+  #noteToolbar button{all:unset;cursor:pointer;padding:5px 9px;border-radius:5px;color:var(--text);font-size:12px}
+  #noteToolbar button:hover{background:#ffffff14}
+  #noteToolbar button#ntbBold{font-weight:bold}
+  #noteToolbar button.active{color:var(--accent);background:#ffb45422}
+  #noteToolbar span{padding:0 4px;font-size:11px;color:var(--dim);min-width:34px;text-align:center}
+  #noteToolbar .sep{width:1px;align-self:stretch;background:var(--line);margin:2px 2px}
   #drop{position:fixed;inset:0;display:none;place-items:center;background:#ffb45410;border:2px dashed var(--accent);z-index:60;pointer-events:none;color:var(--accent);font-size:15px}
   #noteEdit{position:fixed;display:none;z-index:25;border:2px solid var(--accent);border-radius:8px;
     padding:10px;box-sizing:border-box;resize:none;outline:none;
@@ -113,6 +122,7 @@
     <tr><td>Ctrl+V</td><td>Paste from clipboard</td></tr>
     <tr><td>A</td><td>Auto-arrange the selected items (2+ selected)</td></tr>
     <tr><td>Right-click (2+ selected)</td><td>Match width / Match height — resize to the average, aspect ratio kept</td></tr>
+    <tr><td>Right-click (note selected)</td><td>Bold / Font size — quick text styling</td></tr>
     <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>Undo / Redo</td></tr>
     <tr><td>Ctrl+S / Ctrl+O</td><td>Save / open board (.mrmd — bundles images, supports lazy loading)</td></tr>
     <tr><td class="grp" colspan="2">Google Drive</td></tr>
@@ -141,6 +151,13 @@
 <textarea id="noteEdit" spellcheck="false"></textarea>
 <div id="toast"></div>
 <div id="status"></div>
+<div id="noteToolbar">
+  <button id="ntbBold" title="Bold">B</button>
+  <div class="sep"></div>
+  <button id="ntbSizeDown" title="Decrease font size">A−</button>
+  <span id="ntbSize">18px</span>
+  <button id="ntbSizeUp" title="Increase font size">A+</button>
+</div>
 
 <input type="file" id="fImg" accept="image/*" multiple>
 <input type="file" id="fJson" accept=".mrmd,.zip,.json">
@@ -578,7 +595,7 @@ function drawNote(g, it) {
   g.fill();
   const fs = it.fontSize || 18;
   const pad = fs * 0.7;
-  g.font = `${fs}px "Hiragino Sans","Noto Sans JP",sans-serif`;
+  g.font = `${it.bold ? 'bold ' : ''}${fs}px "Hiragino Sans","Noto Sans JP",sans-serif`;
   g.textBaseline = 'top';
   let txt = it.text || '';
   if (!txt) { txt = 'Double-click to edit'; g.globalAlpha *= 0.5; }
@@ -596,7 +613,7 @@ function addNote(wx, wy) {
   pushUndo();
   const it = { id: nextId++, type: 'note', text: '', x: wx, y: wy, w: 260, h: 150,
     rot: 0, flipH: false, flipV: false, gray: false, opacity: 1,
-    bg: NOTE_COLORS[0][0], fg: NOTE_COLORS[0][1], fontSize: 18 };
+    bg: NOTE_COLORS[0][0], fg: NOTE_COLORS[0][1], fontSize: 18, bold: false };
   items.push(it);
   sel.clear(); sel.add(it.id);
   paint();
@@ -610,6 +627,16 @@ function cycleNoteColor(it) {
   it.bg = nx[0]; it.fg = nx[1];
   paint();
 }
+function adjustNoteFontSize(it, delta) {
+  pushUndo();
+  it.fontSize = Math.max(10, Math.min(72, (it.fontSize || 18) + delta));
+  paint();
+}
+function toggleNoteBold(it) {
+  pushUndo();
+  it.bold = !it.bold;
+  paint();
+}
 const noteEdit = document.getElementById('noteEdit');
 let editingNote = null;
 function openNoteEditor(it) {
@@ -621,6 +648,7 @@ function openNoteEditor(it) {
     width: w + 'px', height: h + 'px',
     background: it.bg || NOTE_COLORS[0][0], color: it.fg || NOTE_COLORS[0][1],
     fontSize: Math.max(11, (it.fontSize || 18) * view.s) + 'px',
+    fontWeight: it.bold ? 'bold' : 'normal',
   });
   noteEdit.value = it.text || '';
   noteEdit.focus();
@@ -801,6 +829,21 @@ function updateStatus() {
   document.getElementById('status').textContent =
     `${items.length} images ・ ${(cacheBytes / 1048576) | 0}MB decoded ・ ${Math.round(view.s * 100)}%`;
   updateDriveState();
+  updateNoteToolbar();
+}
+function updateNoteToolbar() {
+  const bar = document.getElementById('noteToolbar');
+  if (!bar) return;
+  const it = sel.size === 1 ? items.find(i => sel.has(i.id)) : null;
+  if (!it || it.type !== 'note') { bar.style.display = 'none'; return; }
+  const cs = corners(it).map(p => [w2sX(p[0]), w2sY(p[1])]);
+  const minY = Math.min(...cs.map(p => p[1]));
+  const cx = cs.reduce((s, p) => s + p[0], 0) / cs.length;
+  bar.style.display = 'flex';
+  bar.style.left = Math.min(Math.max(cx, 90), innerWidth - 90) + 'px';
+  bar.style.top = Math.max(8, minY - 44) + 'px';
+  document.getElementById('ntbBold').classList.toggle('active', !!it.bold);
+  document.getElementById('ntbSize').textContent = (it.fontSize || 18) + 'px';
 }
 function updateDriveState() {
   const el = document.getElementById('driveState');
@@ -1723,8 +1766,8 @@ async function saveBoardToDrive(forceNewName) {
       app: 'MiruMood', version: 3,
       canvasBg: currentCanvasBg,
       jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
-      items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
-        ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
+      items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
+        ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
       images: used.map(id => {
         const r = store.get(id);
         return {
@@ -1939,8 +1982,8 @@ async function saveBoard() {
     app: 'MiruMood', version: 2,
     canvasBg: currentCanvasBg,
     jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
-    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
-      ({ id, imgId, type, text, bg, fg, fontSize, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
+    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
+      ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
     images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, fullExt: r.fullExt || null }; })
   };
   const files = [{ name: 'board.json', blob: new Blob([JSON.stringify(manifest)]) }];
@@ -2099,6 +2142,18 @@ document.getElementById('bar').addEventListener('click', e => {
 });
 helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
 document.getElementById('boardPicker').addEventListener('click', e => { if (e.target.id === 'boardPicker') e.currentTarget.style.display = 'none'; });
+document.getElementById('ntbBold').addEventListener('click', () => {
+  const it = items.find(i => sel.has(i.id));
+  if (it) { toggleNoteBold(it); updateNoteToolbar(); }
+});
+document.getElementById('ntbSizeUp').addEventListener('click', () => {
+  const it = items.find(i => sel.has(i.id));
+  if (it) { adjustNoteFontSize(it, 2); updateNoteToolbar(); }
+});
+document.getElementById('ntbSizeDown').addEventListener('click', () => {
+  const it = items.find(i => sel.has(i.id));
+  if (it) { adjustNoteFontSize(it, -2); updateNoteToolbar(); }
+});
 
 const menu = document.getElementById('menu');
 function hideMenu() { menu.style.display = 'none'; }
@@ -2114,7 +2169,10 @@ function openMenu(px, py) {
     ...(singleImg ? [['Crop', 'C', toggleCrop]] : []),
     ...(singleImg && selItems[0].crop ? [['Remove crop', '', () => clearCrop(selItems[0])]] : []),
     ...(singleNote ? [['Edit note', 'Double-click', () => openNoteEditor(selItems[0])],
-                      ['Change note color', '', () => cycleNoteColor(selItems[0])]] : []),
+                      ['Change note color', '', () => cycleNoteColor(selItems[0])],
+                      [`Bold (${selItems[0].bold ? 'On' : 'Off'})`, '', () => toggleNoteBold(selItems[0])],
+                      [`Font size + (${selItems[0].fontSize || 18}px)`, '', () => adjustNoteFontSize(selItems[0], 2)],
+                      ['Font size -', '', () => adjustNoteFontSize(selItems[0], -2)]] : []),
     ...(singleImg || singleNote ? [['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard], null] : []),
     ...(selItems.length >= 2 ? [['Match width', '', () => matchDimension('w')], ['Match height', '', () => matchDimension('h')], ['Auto arrange selection', 'A', arrange], null] : []),
     ['Duplicate', 'Ctrl+D', duplicateSel],
