@@ -1794,6 +1794,12 @@ async function openDriveFolder() {
   const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
     .setSelectFolderEnabled(true)
     .setIncludeFolders(true);
+  if (currentDriveFolderId) { // 既にボードを開いている場合は、その親フォルダを起点にする(近くのフォルダから探せて分かりやすい)
+    try {
+      const parentId = await driveGetParent(currentDriveFolderId);
+      if (parentId) view.setParent(parentId);
+    } catch {} // 取得できなくてもDrive全体から選べる形にフォールバック
+  }
   new google.picker.PickerBuilder()
     .addView(view)
     .setOAuthToken(driveAccessToken)
