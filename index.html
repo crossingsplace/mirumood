@@ -1712,29 +1712,32 @@ async function saveBoardToDrive(forceNewName) {
   }
 }
 
+// フォルダを選ぶだけでよいようにする: 中にboard.jsonがあれば既存ボードとして、
+// なければ素の画像フォルダとして自動判定して開く。JSONファイルを直接選ばせない。
 async function openBoardFromDrive() {
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
   try { await ensurePickerReady(); } catch { toast('Failed to load the file picker'); return; }
 
-  const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
-    .setMimeTypes('application/json')
+  const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+    .setSelectFolderEnabled(true)
     .setIncludeFolders(true)
-    .setSelectFolderEnabled(false);
+    .setMimeTypes('application/vnd.google-apps.folder');
   try {
-    const rootId = await ensureRootFolder(); // board.jsonは必ずMiruMoodフォルダ配下にあるので、そこを起点にする
+    const rootId = await ensureRootFolder(); // ボードは必ずMiruMoodフォルダ配下にあるので、そこを起点にする
     view.setParent(rootId);
   } catch {} // 取得できなくてもDrive全体から選べる形にフォールバック
   new google.picker.PickerBuilder()
     .addView(view)
     .setOAuthToken(driveAccessToken)
     .setAppId(GOOGLE_APP_ID)
-    .setCallback(onDrivePickerResult)
+    .setTitle('Select a board folder to open')
+    .setCallback(onDriveFolderOpenResult)
     .build()
     .setVisible(true);
 }
-// Driveの「フォルダ」自体を選び、中に入っている画像をそのまま新しいボードとして開く。
-// (すでにMiruMoodで作ったボードでなく、素の画像フォルダをそのまま使いたい場合向け)
+// Driveの任意のフォルダを選び、中身をそのまま開く。
+// (MiruMoodフォルダに限らず、外部で整理した画像フォルダをそのまま使いたい場合向け)
 async function openDriveFolder() {
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
@@ -1749,106 +1752,101 @@ async function openDriveFolder() {
     .setOAuthToken(driveAccessToken)
     .setAppId(GOOGLE_APP_ID)
     .setTitle('Select a Drive folder of images to open')
-    .setCallback(onDriveFolderPickerResult)
+    .setCallback(onDriveFolderOpenResult)
     .build()
     .setVisible(true);
 }
-async function onDriveFolderPickerResult(data) {
+// 選んだフォルダの中にboard.jsonがあるかどうかで、既存ボード読込/素の画像フォルダ読込を自動振り分けする。
+async function onDriveFolderOpenResult(data) {
   if (data.action !== google.picker.Action.PICKED) return;
   const doc = data.docs && data.docs[0];
   if (!doc) return;
+  const folderId = doc.id;
   try {
-    progress('Loading folder', 0);
-    const folderId = doc.id;
-    const files = await listDriveImagesInFolder(folderId);
-    if (!files.length) { progressDone(); toast('No images found in that folder'); return; }
-
-    closeNoteEditor(false); cropState = null;
-    store.clear(); clearBmpCache();
-    items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
-    currentDriveFolderId = folderId;
-    currentDriveManifestId = null; // このフォルダにはまだboard.jsonがない(初回のDrive保存時に作られる)
-    currentBoardName = doc.name || 'board';
-    setCanvasBg(CANVAS_PRESETS[0].bg);
-    jpegOptimize = false; keepOriginalOnOptimize = false; jpegPromptDismissed = false; updateJpegBtn();
-
-    const cols = Math.ceil(Math.sqrt(files.length));
-    let i = 0;
-    for (const f of files) {
-      progress('Loading folder', i / files.length);
-      const meta = f.imageMediaMetadata;
-      const w0 = meta?.width || 1000, h0 = meta?.height || 1000;
-      const ext = ((f.mimeType || '').split('/')[1] || 'jpg').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'jpg';
-      const id = 'i' + (imgSeq++);
-      store.set(id, {
-        w: w0, h: h0, ext,
-        driveId: f.id, thumbDriveId: null, fullDriveId: null, fullExt: null,
-        original: () => driveDownloadBlob(f.id),
-        thumb: null // サムネイル未生成: 初回のDrive保存時に自動生成される
-      });
-      const k = Math.min(1, 480 / Math.max(w0, h0));
-      const gx = (i % cols) * 520, gy = Math.floor(i / cols) * 520;
-      items.push({ id: nextId++, imgId: id, x: gx, y: gy, w: w0 * k, h: h0 * k, rot: 0, flipH: false, flipV: false, gray: false, opacity: 1 });
-      i++;
+    progress('Opening folder', 0);
+    const manifestId = await driveFindFileInFolder('board.json', folderId);
+    if (manifestId) {
+      const blob = await driveDownloadBlob(manifestId);
+      const manifest = JSON.parse(await blob.text());
+      if (manifest.app !== 'MiruMood') throw new Error('not a board');
+      loadManifestIntoBoard(manifest, folderId, manifestId, doc.name);
+      progressDone();
+      updateDriveState();
+      fitAll();
+      toast(`Loaded from Drive (${items.length} images)`);
+      return;
     }
-    driveDirty = true;
+    const files = await listDriveImagesInFolder(folderId);
+    if (!files.length) { progressDone(); toast('No board or images found in that folder'); return; }
+    await loadLooseImagesIntoBoard(files, folderId, doc.name);
     progressDone();
     updateDriveState();
     fitAll();
     toast(`Loaded ${files.length} images from Drive folder — Save to Drive to keep this layout`);
   } catch {
     progressDone();
-    toast('Failed to load the folder');
+    toast('Failed to open that folder');
   }
 }
-async function onDrivePickerResult(data) {
-  if (data.action !== google.picker.Action.PICKED) return;
-  const doc = data.docs && data.docs[0];
-  if (!doc) return;
-  try {
-    progress('Loading from Drive', 0);
-    const fileId = doc.id;
-    const folderId = doc.parentId || await driveGetParent(fileId);
-    const blob = await driveDownloadBlob(fileId);
-    const manifest = JSON.parse(await blob.text());
-    if (manifest.app !== 'MiruMood') throw new Error('not a board');
-    closeNoteEditor(false); cropState = null;
-    currentDriveFolderId = folderId; currentDriveManifestId = fileId;
-    try {
-      const fRes = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${folderId}?fields=name`);
-      const fData = await fRes.json();
-      if (fData.name) currentBoardName = fData.name;
-    } catch {} // ボード名の取得に失敗しても読込自体は続行する
-    store.clear(); clearBmpCache();
-    items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
-    for (const im of manifest.images) {
-      store.set(im.id, {
-        w: im.w, h: im.h, ext: im.ext,
-        driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
-        fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
-        original: () => driveDownloadBlob(im.driveId),
-        thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
-             : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId) : null),
-        fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId) : null
-      });
-      const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
-      if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
-    }
-    items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
-    setCanvasBg(manifest.canvasBg || CANVAS_PRESETS[0].bg);
-    jpegOptimize = !!manifest.jpegOptimize;
-    keepOriginalOnOptimize = !!manifest.keepOriginalOnOptimize;
-    jpegPromptDismissed = !!manifest.jpegPromptDismissed;
-    updateJpegBtn();
-    driveDirty = false;
-    progressDone();
-    updateDriveState();
-    fitAll();
-    toast(`Loaded from Drive (${items.length} images)`);
-  } catch {
-    progressDone();
-    toast('Failed to load (this may not be a MiruMood board)');
+// board.jsonのmanifestから現在のボード状態を復元する(既存ボードを開く際の共通処理)
+function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
+  closeNoteEditor(false); cropState = null;
+  currentDriveFolderId = folderId; currentDriveManifestId = manifestId;
+  currentBoardName = folderName || currentBoardName;
+  store.clear(); clearBmpCache();
+  items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
+  for (const im of manifest.images) {
+    store.set(im.id, {
+      w: im.w, h: im.h, ext: im.ext,
+      driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
+      fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
+      original: () => driveDownloadBlob(im.driveId),
+      thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
+           : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId) : null),
+      fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId) : null
+    });
+    const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
+    if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
   }
+  items = manifest.items.map(rec => ({ ...rec, id: nextId++ }));
+  setCanvasBg(manifest.canvasBg || CANVAS_PRESETS[0].bg);
+  jpegOptimize = !!manifest.jpegOptimize;
+  keepOriginalOnOptimize = !!manifest.keepOriginalOnOptimize;
+  jpegPromptDismissed = !!manifest.jpegPromptDismissed;
+  updateJpegBtn();
+  driveDirty = false;
+}
+// board.jsonのないフォルダを、素の画像フォルダとして新規ボード扱いで読み込む(共通処理)
+async function loadLooseImagesIntoBoard(files, folderId, folderName) {
+  closeNoteEditor(false); cropState = null;
+  store.clear(); clearBmpCache();
+  items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
+  currentDriveFolderId = folderId;
+  currentDriveManifestId = null; // このフォルダにはまだboard.jsonがない(初回のDrive保存時に作られる)
+  currentBoardName = folderName || 'board';
+  setCanvasBg(CANVAS_PRESETS[0].bg);
+  jpegOptimize = false; keepOriginalOnOptimize = false; jpegPromptDismissed = false; updateJpegBtn();
+
+  const cols = Math.ceil(Math.sqrt(files.length));
+  let i = 0;
+  for (const f of files) {
+    progress('Opening folder', i / files.length);
+    const meta = f.imageMediaMetadata;
+    const w0 = meta?.width || 1000, h0 = meta?.height || 1000;
+    const ext = ((f.mimeType || '').split('/')[1] || 'jpg').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'jpg';
+    const id = 'i' + (imgSeq++);
+    store.set(id, {
+      w: w0, h: h0, ext,
+      driveId: f.id, thumbDriveId: null, fullDriveId: null, fullExt: null,
+      original: () => driveDownloadBlob(f.id),
+      thumb: null // サムネイル未生成: 初回のDrive保存時に自動生成される
+    });
+    const k = Math.min(1, 480 / Math.max(w0, h0));
+    const gx = (i % cols) * 520, gy = Math.floor(i / cols) * 520;
+    items.push({ id: nextId++, imgId: id, x: gx, y: gy, w: w0 * k, h: h0 * k, rot: 0, flipH: false, flipV: false, gray: false, opacity: 1 });
+    i++;
+  }
+  driveDirty = true;
 }
 
 /* ============ 保存 / 読込 / 書き出し ============ */
