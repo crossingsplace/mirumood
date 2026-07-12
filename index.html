@@ -39,6 +39,14 @@
   #help td{padding:3px 6px;font-size:12px}
   #help td:first-child{font-family:ui-monospace,monospace;color:var(--accent);white-space:nowrap;padding-right:18px}
   #help .grp{padding-top:12px;color:var(--dim);font-size:11px;letter-spacing:.08em}
+  #boardPicker{position:fixed;inset:0;display:none;place-items:center;background:#000a;z-index:40}
+  #boardPicker .box{background:#1d1f24;border:1px solid var(--line);border-radius:12px;padding:24px 28px;max-height:70vh;overflow:auto;min-width:320px;max-width:480px}
+  #boardPicker h2{margin:0 0 4px;font-size:15px;color:var(--accent);font-weight:600}
+  #boardPicker p.sub{margin:0 0 14px;color:var(--dim);font-size:12px}
+  #boardPickerItems{display:flex;flex-direction:column;gap:2px}
+  #boardPickerItems button{all:unset;cursor:pointer;padding:8px 10px;border-radius:6px;font-size:13px;color:var(--text)}
+  #boardPickerItems button:hover{background:#ffffff14}
+  #boardPickerItems .empty{padding:8px 10px;color:var(--dim);font-size:12px}
   #hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--dim);text-align:center;z-index:5}
   #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
   #toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;
@@ -114,6 +122,12 @@
     <tr><td>Show in Drive</td><td>Open this board's Drive folder in a new tab (only if it's saved to Drive)</td></tr>
     <tr><td>Toolbar status</td><td>Shows "board name ✓ saved" or "● unsaved changes"</td></tr>
   </table>
+</div></div>
+
+<div id="boardPicker"><div class="box">
+  <h2>Open a board</h2>
+  <p class="sub">Click a board to open it</p>
+  <div id="boardPickerItems"></div>
 </div></div>
 
 <div id="hint">
@@ -1149,7 +1163,7 @@ addEventListener('keydown', e => {
   if (cropState && (e.key === 'Enter' || e.key === 'Escape' || e.key.toLowerCase() === 'c')) {
     cropState = null; paint(); return; // クロップ確定
   }
-  if (e.key === 'Escape') { sel.clear(); hideMenu(); helpBox.style.display = 'none'; paint(); return; }
+  if (e.key === 'Escape') { sel.clear(); hideMenu(); helpBox.style.display = 'none'; document.getElementById('boardPicker').style.display = 'none'; paint(); return; }
   if (ctl && e.key.toLowerCase() === 'a') { e.preventDefault(); items.forEach(i => sel.add(i.id)); paint(); return; }
   if (ctl && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if (ctl && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSel(); return; }
@@ -1734,39 +1748,52 @@ async function saveBoardToDrive(forceNewName) {
 
 // フォルダを選ぶだけでよいようにする: 中にboard.jsonがあれば既存ボードとして、
 // なければ素の画像フォルダとして自動判定して開く。JSONファイルを直接選ばせない。
+// MiruMoodフォルダ直下のボード一覧を取得し、自前のリストUIでワンクリックで開けるようにする。
+// (Google Pickerだとフォルダのダブルクリックが常に「中へ移動」になり、
+//  board.jsonのようなフォルダでない中身は行き止まりで見えなくなるため、Pickerを使わない)
 async function openBoardFromDrive() {
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
-  try { await ensurePickerReady(); } catch { toast('Failed to load the file picker'); return; }
-
-  const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
-    .setSelectFolderEnabled(true)
-    .setIncludeFolders(true)
-    .setMimeTypes('application/vnd.google-apps.folder');
   try {
-    const rootId = await ensureRootFolder(); // ボードは必ずMiruMoodフォルダ配下にあるので、そこを起点にする
-    view.setParent(rootId);
-  } catch {} // 取得できなくてもDrive全体から選べる形にフォールバック
-  new google.picker.PickerBuilder()
-    .addView(view)
-    .setOAuthToken(driveAccessToken)
-    .setAppId(GOOGLE_APP_ID)
-    .setTitle('Select a board folder to open')
-    .setCallback(onDriveFolderOpenResult)
-    .build()
-    .setVisible(true);
+    progress('Loading boards', 0);
+    const rootId = await ensureRootFolder();
+    const q = encodeURIComponent(`'${rootId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
+    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
+    const data = await res.json();
+    progressDone();
+    showBoardListModal(data.files || []);
+  } catch {
+    progressDone();
+    toast('Failed to list boards');
+  }
+}
+function showBoardListModal(folders) {
+  const modal = document.getElementById('boardPicker');
+  const list = document.getElementById('boardPickerItems');
+  list.innerHTML = '';
+  if (!folders.length) {
+    list.innerHTML = '<div class="empty">No boards saved to Drive yet</div>';
+  } else {
+    for (const f of folders) {
+      const b = document.createElement('button');
+      b.textContent = f.name;
+      b.onclick = () => { modal.style.display = 'none'; openDriveFolderById(f.id, f.name); };
+      list.appendChild(b);
+    }
+  }
+  modal.style.display = 'grid';
 }
 // Driveの任意のフォルダを選び、中身をそのまま開く。
-// (MiruMoodフォルダに限らず、外部で整理した画像フォルダをそのまま使いたい場合向け)
+// (MiruMoodフォルダに限らず、外部で整理した画像フォルダをそのまま使いたい場合向け。
+//  こちらは深い階層をたどる必要があるので、引き続きGoogle Pickerを使う)
 async function openDriveFolder() {
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
   try { await ensurePickerReady(); } catch { toast('Failed to load the file picker'); return; }
 
-  const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+  const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
     .setSelectFolderEnabled(true)
-    .setIncludeFolders(true)
-    .setMimeTypes('application/vnd.google-apps.folder');
+    .setIncludeFolders(true);
   new google.picker.PickerBuilder()
     .addView(view)
     .setOAuthToken(driveAccessToken)
@@ -1776,12 +1803,30 @@ async function openDriveFolder() {
     .build()
     .setVisible(true);
 }
-// 選んだフォルダの中にboard.jsonがあるかどうかで、既存ボード読込/素の画像フォルダ読込を自動振り分けする。
+// 選んだのがフォルダかファイル(board.jsonを直接ダブルクリックした場合)かを判定し、
+// どちらでも正しくボードを開けるようにする(openDriveFolder=Picker経由でのみ使用)。
 async function onDriveFolderOpenResult(data) {
   if (data.action !== google.picker.Action.PICKED) return;
   const doc = data.docs && data.docs[0];
   if (!doc) return;
-  const folderId = doc.id;
+  const isFolder = doc.mimeType === 'application/vnd.google-apps.folder';
+  let folderId, folderName = doc.name;
+  if (isFolder) {
+    folderId = doc.id;
+  } else {
+    folderId = doc.parentId || await driveGetParent(doc.id).catch(() => null);
+    if (!folderId) { toast('Failed to open that folder'); return; }
+    try {
+      const fRes = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${folderId}?fields=name`);
+      const fData = await fRes.json();
+      if (fData.name) folderName = fData.name;
+    } catch {} // フォルダ名が取れなくても読込自体は続行する
+  }
+  openDriveFolderById(folderId, folderName);
+}
+// フォルダIDを指定して開く共通処理: 中にboard.jsonがあれば既存ボードとして、
+// なければ素の画像フォルダとして自動判定して開く。
+async function openDriveFolderById(folderId, folderName) {
   try {
     progress('Opening folder', 0);
     const manifestId = await driveFindFileInFolder('board.json', folderId);
@@ -1789,7 +1834,7 @@ async function onDriveFolderOpenResult(data) {
       const blob = await driveDownloadBlob(manifestId);
       const manifest = JSON.parse(await blob.text());
       if (manifest.app !== 'MiruMood') throw new Error('not a board');
-      loadManifestIntoBoard(manifest, folderId, manifestId, doc.name);
+      loadManifestIntoBoard(manifest, folderId, manifestId, folderName);
       progressDone();
       updateDriveState();
       fitAll();
@@ -1798,7 +1843,7 @@ async function onDriveFolderOpenResult(data) {
     }
     const files = await listDriveImagesInFolder(folderId);
     if (!files.length) { progressDone(); toast('No board or images found in that folder'); return; }
-    await loadLooseImagesIntoBoard(files, folderId, doc.name);
+    await loadLooseImagesIntoBoard(files, folderId, folderName);
     progressDone();
     updateDriveState();
     fitAll();
@@ -2047,6 +2092,7 @@ document.getElementById('bar').addEventListener('click', e => {
      help: () => helpBox.style.display = 'grid' })[act]();
 });
 helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
+document.getElementById('boardPicker').addEventListener('click', e => { if (e.target.id === 'boardPicker') e.currentTarget.style.display = 'none'; });
 
 const menu = document.getElementById('menu');
 function hideMenu() { menu.style.display = 'none'; }
