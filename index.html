@@ -54,26 +54,8 @@
 <canvas id="cv"></canvas>
 
 <div id="bar">
-  <button data-act="open"  title="Add images">+ Images</button>
-  <button data-act="note"  title="Add note (N)">Note</button>
-  <button data-act="grid"  title="Toggle grid (S)">Grid</button>
-  <button data-act="canvasbg" title="Cycle canvas background color">Canvas</button>
-  <button data-act="jpeg" id="jpegBtn" title="Cycle JPG optimization for large images">JPG: Off</button>
-  <button data-act="arrange" title="Auto arrange (A)">Arrange</button>
-  <button data-act="fit"   title="Fit all (F)">Fit</button>
-  <div class="sep"></div>
-  <button data-act="save"  title="Save board (Ctrl+S)">Save</button>
-  <button data-act="load"  title="Open board (Ctrl+O)">Open</button>
-  <button data-act="png"   title="Export as PNG">PNG</button>
-  <div class="sep"></div>
   <button data-act="drive-auth" id="driveAuthBtn" title="Sign in with Google">Sign in</button>
-  <button data-act="drive-save" title="Save to Google Drive">Save to Drive</button>
   <span id="driveState"></span>
-  <button data-act="drive-open" title="Open from Google Drive">Open from Drive</button>
-  <button data-act="drive-folder" title="Open a Google Drive folder of images directly">Open Drive Folder</button>
-  <button data-act="drive-reveal" title="Open this board's Drive folder in a new tab">Show in Drive</button>
-  <div class="sep"></div>
-  <button data-act="help"  title="Shortcuts (?)">?</button>
 </div>
 
 <div id="menu"></div>
@@ -2059,12 +2041,13 @@ function openMenu(px, py) {
     ['Add note', 'N', () => addNote(wx, wy)],
     ['Paste', 'Ctrl+V', () => toast('Paste with Ctrl+V')],
     ['Auto arrange', 'A', arrange],
-    ['Toggle grid', 'S', cycleGrid],
-    ['Canvas color', '', cycleCanvasBg],
-    ['JPG optimization', '', cycleJpegOptimize],
+    [`Toggle grid (${['off', 'on', 'snap'][gridMode]})`, 'S', cycleGrid],
+    [`Canvas color (${(CANVAS_PRESETS.find(p => p.bg === currentCanvasBg) || {}).name || '?'})`, '', cycleCanvasBg],
+    [`JPG optimization (${!jpegOptimize ? 'Off' : (keepOriginalOnOptimize ? 'On+PNG' : 'On')})`, '', cycleJpegOptimize],
     ['Fit all', 'F', fitAll],
     null,
     ['Save board', 'Ctrl+S', saveBoard],
+    ['Open board…', 'Ctrl+O', () => fJson.click()],
     ['Export PNG', '', exportPNG],
     null,
     ['Save to Drive', '', saveBoardToDrive],
@@ -2072,6 +2055,8 @@ function openMenu(px, py) {
     ['Open from Drive', '', openBoardFromDrive],
     ['Open Drive folder…', '', openDriveFolder],
     ['Show this board in Drive', '', revealDriveFolder],
+    null,
+    ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
   ];
   menu.innerHTML = '';
   for (const r of rows) {
