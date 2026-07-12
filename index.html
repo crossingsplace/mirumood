@@ -1721,6 +1721,10 @@ async function openBoardFromDrive() {
     .setMimeTypes('application/json')
     .setIncludeFolders(true)
     .setSelectFolderEnabled(false);
+  try {
+    const rootId = await ensureRootFolder(); // board.jsonは必ずMiruMoodフォルダ配下にあるので、そこを起点にする
+    view.setParent(rootId);
+  } catch {} // 取得できなくてもDrive全体から選べる形にフォールバック
   new google.picker.PickerBuilder()
     .addView(view)
     .setOAuthToken(driveAccessToken)
