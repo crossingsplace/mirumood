@@ -1279,6 +1279,8 @@ addEventListener('dragleave', e => { if (e.relatedTarget === null) dropOverlay.s
 addEventListener('drop', e => {
   e.preventDefault(); dropOverlay.style.display = 'none';
   const fs = [...e.dataTransfer.files];
+  const pur = fs.find(f => /\.pur$/i.test(f.name)); // PUR-IMPORT hook
+  if (pur && window.__purImport) { window.__purImport.load(pur, e.clientX, e.clientY); return; }
   const board = fs.find(f => /\.(mrmd|zip)$/i.test(f.name));
   if (board) { loadBoard(board); return; }
   if (fs.length) addFiles(fs, e.clientX, e.clientY);
@@ -2265,6 +2267,346 @@ const prefetchGoogleLibs = () => {
 };
 if ('requestIdleCallback' in window) requestIdleCallback(prefetchGoogleLibs, { timeout: 4000 });
 else setTimeout(prefetchGoogleLibs, 1500);
+
+/* ==================== PUR-IMPORT (undocumented, removable) ====================
+ * PureRef 2.x の .pur を読み込む隠し機能。ドラッグ&ドロップ専用・UI表記なし。
+ * この機能を削除する場合: このブロック全体と、drop ハンドラ内の
+ * 「PUR-IMPORT hook」1行を消すだけでよい。他コードへの依存追加はない。
+ *
+ * 形式メモ (実ファイルのリバースエンジニアリング結果):
+ *  .pur = SQLite DB の先頭 tailLen バイトをファイル末尾へ退避し、
+ *  空いた先頭に独自ヘッダ+サムネJPEGを書いた構造。
+ *  header: u32len+UTF16BE fmtVer("2.1") / u32 0 / u64 dbSize(=退避先オフセット)
+ *          / u32len+UTF16BE appVer / u32len+UTF16BE uuid / u32len+thumbnail(JPEG)
+ *  DB仮想位置 p → ファイル位置: p < tailLen ? dbSize + p : p
+ *  tables: images(id,source_type,origin,source,format,checksum,data,width,height)
+ *          items(parent,id,name,transform,sort_order,z,opacity,locked,comment)
+ *          items_images(image,id,image_transform,image_bounds,flags)
+ *          items_notes(text_color,id,fixed_size,background_color,text,style)
+ *  transform = QVariant(5B) + 9×f64BE (m11 m12 m13 m21 m22 m23 tx ty m33)
+ *  image_bounds = QVariant "QPainterPath" → bbox が表示範囲(=クロップ)
+ *  TEXT列に入ったバイナリは UTF-8 化けしているので utf8→charCode で復元する
+ * ============================================================================ */
+(() => {
+  const PUR = {};
+
+  /* ---- 低レベル: ファイル読み (1MBブロックキャッシュ、巨大ファイル対応) ---- */
+  function makeReader(file, dbSize, tailLen) {
+    const BLK = 1 << 20, cache = new Map(), MAXBLK = 8;
+    const mapPos = p => (p < tailLen ? dbSize + p : p);
+    async function readBlock(bi) {
+      if (cache.has(bi)) { const v = cache.get(bi); cache.delete(bi); cache.set(bi, v); return v; }
+      const buf = new Uint8Array(await file.slice(bi * BLK, Math.min(file.size, (bi + 1) * BLK)).arrayBuffer());
+      cache.set(bi, buf);
+      if (cache.size > MAXBLK) cache.delete(cache.keys().next().value);
+      return buf;
+    }
+    async function readFile(pos, len) { // ファイル座標で読む
+      const out = new Uint8Array(len);
+      let o = 0;
+      while (o < len) {
+        const p = pos + o, bi = Math.floor(p / BLK), off = p - bi * BLK;
+        const blk = await readBlock(bi);
+        const n = Math.min(len - o, blk.length - off);
+        if (n <= 0) throw new Error('EOF');
+        out.set(blk.subarray(off, off + n), o); o += n;
+      }
+      return out;
+    }
+    return async function readDb(pos, len) { // DB仮想座標で読む(退避境界をまたいでもよい)
+      if (pos + len <= tailLen || pos >= tailLen) return readFile(mapPos(pos), len);
+      const a = await readFile(mapPos(pos), tailLen - pos);
+      const b = await readFile(tailLen, len - a.length);
+      const out = new Uint8Array(len); out.set(a); out.set(b, a.length);
+      return out;
+    };
+  }
+
+  /* ---- 低レベル: 最小SQLiteリーダー (読み取り専用・テーブル全走査のみ) ---- */
+  async function openSqlite(readDb) {
+    const h = await readDb(0, 100);
+    if (String.fromCharCode(...h.subarray(0, 15)) !== 'SQLite format 3') throw new Error('not sqlite');
+    const dv = new DataView(h.buffer);
+    let pageSize = dv.getUint16(16); if (pageSize === 1) pageSize = 65536;
+    const usable = pageSize - h[20];
+    const page = n => readDb((n - 1) * pageSize, pageSize);
+    const varint = (b, o) => { // -> [value, nextOffset] (53bit範囲で十分)
+      let v = 0;
+      for (let i = 0; i < 8; i++) { const c = b[o + i]; if (c < 0x80) { return [v * 128 + c, o + i + 1]; } v = v * 128 + (c & 0x7f); }
+      return [v * 256 + b[o + 8], o + 9];
+    };
+    async function payloadOf(pg, cellOff) { // leaf table cell -> 完全ペイロード
+      let [plen, o] = varint(pg, cellOff);
+      let o2 = varint(pg, o)[1]; // rowid読み飛ばし
+      const rowid = varint(pg, o)[0];
+      const maxL = usable - 35, minL = Math.floor((usable - 12) * 32 / 255) - 23;
+      let local = plen;
+      if (plen > maxL) { local = minL + (plen - minL) % (usable - 4); if (local > maxL) local = minL; }
+      const out = new Uint8Array(plen);
+      out.set(pg.subarray(o2, o2 + local));
+      let got = local;
+      if (got < plen) {
+        const dvp = new DataView(pg.buffer, pg.byteOffset);
+        let next = dvp.getUint32(o2 + local);
+        while (next && got < plen) {
+          const op = await page(next);
+          const odv = new DataView(op.buffer, op.byteOffset);
+          next = odv.getUint32(0);
+          const n = Math.min(usable - 4, plen - got);
+          out.set(op.subarray(4, 4 + n), got); got += n;
+        }
+      }
+      return { rowid, payload: out };
+    }
+    function record(payload) { // -> 値の配列 (raw Uint8Array / number / null)
+      let [hlen, o] = varint(payload, 0);
+      const types = [];
+      while (o < hlen) { const [t, no] = varint(payload, o); types.push(t); o = no; }
+      let p = hlen;
+      const dv2 = new DataView(payload.buffer, payload.byteOffset);
+      return types.map(t => {
+        if (t === 0) return null;
+        if (t >= 1 && t <= 6) {
+          const n = [1, 2, 3, 4, 6, 8][t - 1];
+          let v = 0;
+          for (let i = 0; i < n; i++) v = v * 256 + payload[p + i];
+          if (payload[p] & 0x80) v -= Math.pow(2, 8 * n); // 符号付き
+          p += n; return v;
+        }
+        if (t === 7) { const v = dv2.getFloat64(p); p += 8; return v; }
+        if (t === 8) return 0;
+        if (t === 9) return 1;
+        const n = Math.floor((t - 12) / 2), v = payload.subarray(p, p + n); p += n;
+        return v; // TEXT/BLOBともrawバイトで返す
+      });
+    }
+    async function* rows(root) { // テーブルB-treeを全走査 (page1のみ先頭100Bがヘッダ)
+      const stack = [root];
+      while (stack.length) {
+        const pno = stack.pop();
+        const pg = await page(pno);
+        const hdrOff = pno === 1 ? 100 : 0;
+        const type = pg[hdrOff];
+        const dvp = new DataView(pg.buffer, pg.byteOffset);
+        const ncell = dvp.getUint16(hdrOff + 3);
+        if (type === 0x05) {
+          stack.push(dvp.getUint32(hdrOff + 8));
+          for (let i = 0; i < ncell; i++) stack.push(dvp.getUint32(dvp.getUint16(hdrOff + 12 + i * 2)));
+        } else if (type === 0x0d) {
+          for (let i = 0; i < ncell; i++) {
+            const co = dvp.getUint16(hdrOff + 8 + i * 2);
+            const { rowid, payload } = await payloadOf(pg, co);
+            yield { rowid, values: record(payload) };
+          }
+        } else throw new Error('page type ' + type);
+      }
+    }
+    async function tables() { // sqlite_master -> {name: {root, cols[]}}
+      const out = {};
+      for await (const r of rows(1)) {
+        const [type, name, , root, sql] = r.values;
+        if (bytesToStr(type) !== 'table') continue;
+        const cols = [...bytesToStr(sql).matchAll(/[(,]\s*([A-Za-z_]+)\s+[A-Z]/g)].map(m => m[1]);
+        out[bytesToStr(name)] = { root, cols };
+      }
+      return out;
+    }
+    return { rows, tables };
+  }
+  const bytesToStr = b => (b == null ? '' : (typeof b === 'string' ? b : new TextDecoder().decode(b)));
+
+  /* ---- Qt バイナリ復元 ---- */
+  function unmangle(b) { // TEXT列に入ったバイナリ: UTF-8化けを元バイト列へ戻す
+    if (b == null) return null;
+    try {
+      const s = new TextDecoder('utf-8', { fatal: true }).decode(b);
+      const out = new Uint8Array(s.length);
+      for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c > 255) throw 0; out[i] = c; }
+      return out;
+    } catch { return b; }
+  }
+  function qTransform(b) { // -> [m11 m12 m13 m21 m22 m23 tx ty m33]
+    const u = unmangle(b), dv = new DataView(u.buffer, u.byteOffset);
+    const m = [];
+    for (let i = 0; i < 9; i++) m.push(dv.getFloat64(5 + i * 8));
+    return m;
+  }
+  function qPainterPathBBox(b) { // -> {x0,y0,x1,y1} | null
+    const u = unmangle(b);
+    if (!u || u.length < 26) return null;
+    const dv = new DataView(u.buffer, u.byteOffset);
+    const nameLen = dv.getUint32(5);
+    let o = 9 + nameLen;
+    const cnt = dv.getUint32(o); o += 4;
+    if (!cnt || cnt > 10000) return null;
+    let x0 = 1/0, y0 = 1/0, x1 = -1/0, y1 = -1/0;
+    for (let i = 0; i < cnt; i++) {
+      o += 4; // element type
+      const x = dv.getFloat64(o), y = dv.getFloat64(o + 8); o += 16;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    return { x0, y0, x1, y1 };
+  }
+  function qtHtmlToPlain(html) { // Qtリッチテキスト -> プレーンテキスト & bold判定
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const ps = [...doc.body.querySelectorAll('p')];
+    const text = (ps.length ? ps.map(p => p.textContent) : [doc.body.textContent]).join('\n').trim();
+    return { text, bold: /font-weight:\s*7\d\d/.test(html) };
+  }
+
+  /* ---- .pur 本体パース ---- */
+  PUR.parse = async function (file, hooks) { // hooks: {progress(frac), importImage(blob)->imgId}
+    const head = new DataView(await file.slice(0, 24).arrayBuffer());
+    const verLen = head.getUint32(0);
+    let fmtVer = '';
+    { const b = new Uint8Array(await file.slice(4, 4 + verLen).arrayBuffer());
+      for (let i = 0; i < b.length; i += 2) fmtVer += String.fromCharCode((b[i] << 8) | b[i + 1]); }
+    if (!/^2\./.test(fmtVer)) throw new Error('Unsupported .pur version: ' + (fmtVer || '1.x'));
+    const off = 4 + verLen + 4;
+    const dbSize = Number(new DataView(await file.slice(off, off + 8).arrayBuffer()).getBigUint64(0));
+    if (!(dbSize > 0 && dbSize <= file.size)) throw new Error('bad header');
+    const tailLen = file.size - dbSize;
+    const readDb = makeReader(file, dbSize, tailLen);
+    const db = await openSqlite(readDb);
+    const T = await db.tables();
+    const need = ['images', 'items', 'items_images', 'items_notes'];
+    for (const n of need) if (!T[n]) throw new Error('missing table ' + n);
+    const col = (t, name) => T[t].cols.indexOf(name);
+
+    /* 先に小さいテーブルを読んで画像点数を把握 */
+    const imgItems = new Map(), noteItems = new Map();
+    for await (const r of db.rows(T.items_images.root)) {
+      const v = r.values, id = v[col('items_images', 'id')] ?? r.rowid;
+      imgItems.set(id, { image: v[col('items_images', 'image')], bounds: v[col('items_images', 'image_bounds')] });
+    }
+    for await (const r of db.rows(T.items_notes.root)) {
+      const v = r.values, id = v[col('items_notes', 'id')] ?? r.rowid;
+      noteItems.set(id, { text: bytesToStr(v[col('items_notes', 'text')]) });
+    }
+
+    /* images -> imgId (元フォーマットのバイト列をそのままBlobに) */
+    const imgMap = new Map(); // pur image id -> {imgId,w,h}
+    let count = 0;
+    const total = new Set([...imgItems.values()].map(x => x.image)).size || 1;
+    for await (const r of db.rows(T.images.root)) {
+      hooks.progress && hooks.progress(count / Math.max(1, total));
+      const v = r.values;
+      const id = v[col('images', 'id')] ?? r.rowid;
+      const fmt = (bytesToStr(v[col('images', 'format')]) || 'png').toLowerCase();
+      const data = v[col('images', 'data')];
+      const w = v[col('images', 'width')], h = v[col('images', 'height')];
+      if (data && data.length) {
+        const mime = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' }[fmt] || 'image/png';
+        const imgId = await hooks.importImage(new Blob([data], { type: mime }), mime);
+        if (imgId) imgMap.set(id, { imgId, w, h });
+      }
+      count++;
+    }
+
+    /* items と突き合わせて配置情報へ変換 */
+    const out = [];
+    for await (const r of db.rows(T.items.root)) {
+      const v = r.values, id = v[col('items', 'id')] ?? r.rowid;
+      const m = qTransform(v[col('items', 'transform')]);
+      const scale = Math.hypot(m[0], m[1]) || 1;
+      const det = m[0] * m[4] - m[1] * m[3];
+      const rot = Math.atan2(m[1], m[0]);
+      const z = v[col('items', 'z')] ?? 0;
+      const opacity = v[col('items', 'opacity')] ?? 1;
+      const apply = (x, y) => [m[0] * x + m[3] * y + m[6], m[1] * x + m[4] * y + m[7]];
+      if (imgItems.has(id)) {
+        const ii = imgItems.get(id), ref = imgMap.get(ii.image);
+        if (!ref) continue;
+        const bb = qPainterPathBBox(ii.bounds) ||
+          { x0: -ref.w / 2, y0: -ref.h / 2, x1: ref.w / 2, y1: ref.h / 2 };
+        const bw = bb.x1 - bb.x0, bh = bb.y1 - bb.y0;
+        const [cx, cy] = apply((bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2);
+        // クロップ: bbox が全体(±w/2,±h/2)より小さければ正規化クロップに変換
+        let crop = null;
+        if (ref.w && ref.h && (bw < ref.w - 0.5 || bh < ref.h - 0.5)) {
+          crop = { x: Math.max(0, (bb.x0 + ref.w / 2) / ref.w), y: Math.max(0, (bb.y0 + ref.h / 2) / ref.h),
+                   w: Math.min(1, bw / ref.w), h: Math.min(1, bh / ref.h) };
+        }
+        out.push({ kind: 'image', imgId: ref.imgId, x: cx, y: cy,
+          w: Math.abs(bw * scale), h: Math.abs(bh * scale), rot,
+          flipH: det < 0, crop, z, opacity });
+      } else if (noteItems.has(id)) {
+        const { text, bold } = qtHtmlToPlain(noteItems.get(id).text);
+        const [cx, cy] = apply(0, 0);
+        out.push({ kind: 'note', text, bold, x: cx, y: cy, fontSize: 22 * scale, z, opacity });
+      }
+    }
+    out.sort((a, b) => a.z - b.z);
+    return out;
+  };
+
+
+  /* ---- MiruMoodへの取り込み (座標正規化 + item生成) ---- */
+  PUR.load = async function (file, cx, cy) {
+    try {
+      progress('Loading', 0);
+      const parsed = await PUR.parse(file, {
+        progress: f => progress('Loading', f * 0.95),
+        importImage: (blob, mime) => importImageBlob(blob, mime)
+      });
+      if (!parsed.length) { progressDone(); toast('No items found'); return; }
+      const wasEmpty = !items.length;
+      pushUndo();
+      /* PureRefのシーン座標は巨大になりがちなので、画像の表示サイズ中央値が
+       * MiruMoodの標準追加サイズ(480px)相当になるよう相対配置を保って縮尺する */
+      const dims = parsed.filter(p => p.kind === 'image').map(p => Math.max(p.w, p.h)).sort((a, b) => a - b);
+      const median = dims.length ? dims[Math.floor(dims.length / 2)] : 480;
+      const k = Math.min(20, Math.max(0.02, 480 / median));
+      let x0 = 1/0, y0 = 1/0, x1 = -1/0, y1 = -1/0;
+      for (const p of parsed) {
+        const hw = (p.w || 0) / 2, hh = (p.h || 0) / 2;
+        x0 = Math.min(x0, p.x - hw); x1 = Math.max(x1, p.x + hw);
+        y0 = Math.min(y0, p.y - hh); y1 = Math.max(y1, p.y + hh);
+      }
+      const gcx = (x0 + x1) / 2, gcy = (y0 + y1) / 2;
+      const wx = cx !== undefined ? s2wX(cx) : s2wX(innerWidth / 2);
+      const wy = cy !== undefined ? s2wY(cy) : s2wY(innerHeight / 2);
+      const mc = document.createElement('canvas').getContext('2d'); // メモの自動サイズ計測用
+      sel.clear();
+      for (const p of parsed) { // parsedはz昇順ソート済み → そのままpush順=重なり順
+        if (p.kind === 'image') {
+          const it = { id: nextId++, imgId: p.imgId,
+            x: wx + (p.x - gcx) * k, y: wy + (p.y - gcy) * k,
+            w: Math.max(1, p.w * k), h: Math.max(1, p.h * k),
+            rot: p.rot || 0, flipH: !!p.flipH, flipV: false, gray: false,
+            opacity: p.opacity ?? 1 };
+          if (p.crop) it.crop = p.crop;
+          items.push(it); sel.add(it.id);
+        } else {
+          const fs = Math.max(10, Math.min(400, p.fontSize * k || 18));
+          mc.font = (p.bold ? 'bold ' : '') + fs + 'px "Hiragino Sans","Noto Sans JP",sans-serif';
+          const lines = String(p.text || ' ').split('\n');
+          const pad = fs * 0.7;
+          const w = Math.max(120, ...lines.map(l => mc.measureText(l).width)) + pad * 2;
+          const h = lines.length * fs * 1.45 + pad * 2;
+          const it = { id: nextId++, type: 'note', text: p.text, bold: !!p.bold,
+            x: wx + (p.x - gcx) * k, y: wy + (p.y - gcy) * k, w, h,
+            rot: p.rot || 0, flipH: false, flipV: false, gray: false,
+            opacity: p.opacity ?? 1,
+            bg: NOTE_COLORS[0][0], fg: NOTE_COLORS[0][1], fontSize: fs };
+          items.push(it); sel.add(it.id);
+        }
+      }
+      driveDirty = true; updateDriveState();
+      progressDone();
+      paint();
+      if (wasEmpty) fitAll();
+      toast(parsed.length + ' item(s) imported');
+    } catch (err) {
+      console.warn('pur import:', err);
+      progressDone();
+      toast('Could not read this file');
+    }
+  };
+
+  window.__purImport = PUR; // drop ハンドラのフックから参照
+})();
+/* ==================== /PUR-IMPORT ==================== */
 </script>
 </body>
 </html>
