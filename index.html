@@ -1655,10 +1655,206 @@ async function driveUploadFile(name, blob, mimeType, folderId, existingFileId) {
   if (!data.id) throw new Error('upload failed');
   return data.id;
 }
-async function driveDownloadBlob(fileId) {
+/* ==================== LOCAL-CACHE (画像バイナリのローカル永続キャッシュ) ====================
+ * 目的: Driveからダウンロードした画像バイナリをこの端末に保存しておき、
+ *       同じボードを再度開いた時にネットワークへ行かず即座に使えるようにする。
+ *
+ * 前提: images[].driveId / thumbDriveId / fullDriveId は一度アップロードされたら
+ *       中身が変わらない(saveBoardToDriveは新規画像のみ新しいIDで追加し、
+ *       既存IDへの再アップロードは行わない)。そのため「更新されていないか確認する」
+ *       手順は不要で、driveIdをそのままキャッシュキーとして使い回してよい。
+ *
+ * 保存先は2段構え:
+ *   ① 既定: IndexedDB(ブラウザ管理領域、通常このPCのブラウザプロフィール配下)
+ *   ② 対応ブラウザ(Chrome/Edge)でユーザーが明示的にフォルダを選んだ場合:
+ *      File System Access APIで、選ばれた任意のフォルダ(Dドライブ・外付けSSD等)に
+ *      実ファイルとして書き込む。エクスプローラーから直接見える・消せる。
+ *   どちらの場合もget/putの呼び出し側からは同じ関数で透過的に使える。
+ *   「どのフォルダを選んだか」はこの端末のブラウザだけに閉じたローカル設定で、
+ *   board.jsonにもDriveにも一切書き込まない(他のPCでは意味を持たないパスだから)。
+ *
+ * 構成: メモリ層(Map、セッション中は常に即答) → 外部フォルダ(設定していれば) → IndexedDB層
+ *       → どれも無ければ呼び出し元が通常通りDriveへ取りに行く。
+ *       IndexedDBが使えない環境(プライベートブラウジング等)や、外部フォルダの権限が
+ *       切れている場合でも、get/putは静かに失敗して素通りするだけでアプリの動作自体は変わらない。
+ *
+ * 削除する場合: このブロックを消し、driveDownloadBlob / saveBoardToDrive内の
+ *       LocalCache.get(...) / LocalCache.put(...) の呼び出し行を戻すだけでよい。
+ * ============================================================================ */
+const LocalCache = (() => {
+  const DB_NAME = 'mirumood-cache', STORE = 'blobs', META = 'meta', DIR_KEY = 'cacheDirHandle';
+  const BYTE_BUDGET = 10 * 1024 * 1024 * 1024; // IndexedDB側の既定10GB(外部フォルダ使用時はOS/ディスク容量任せで上限を設けない)
+  const mem = new Map(); // セッション内メモリ層: 同じ画像を連続で参照する時(パン/ズームでLODを取り直す等)にIndexedDB/外部フォルダ往復すら省く
+  let dbPromise = null;
+  let dirHandle = null; // ユーザーが選んだ外部フォルダ(FileSystemDirectoryHandle) | null
+
+  function reqToPromise(req) {
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function openDb() {
+    if (dbPromise) return dbPromise;
+    dbPromise = new Promise((resolve, reject) => {
+      if (typeof indexedDB === 'undefined') { reject(new Error('no indexedDB')); return; }
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE);
+        if (!req.result.objectStoreNames.contains(META)) req.result.createObjectStore(META);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return dbPromise;
+  }
+
+  async function store(name, mode) {
+    const db = await openDb();
+    return db.transaction(name, mode).objectStore(name);
+  }
+
+  /* ---------- 外部フォルダ(File System Access API)側 ---------- */
+  function dirSupported() { return typeof window !== 'undefined' && 'showDirectoryPicker' in window; }
+  function safeFileName(key) { return String(key).replace(/[^A-Za-z0-9_-]/g, '_'); } // driveIdは通常安全な文字だが念のため
+
+  async function dirGet(key) {
+    if (!dirHandle) return null;
+    try {
+      if (await dirHandle.queryPermission({ mode: 'readwrite' }) !== 'granted') return null;
+      const fh = await dirHandle.getFileHandle(safeFileName(key), { create: false });
+      return await fh.getFile();
+    } catch { return null; } // 未生成/権限失効/フォルダが移動された等、理由を問わず「キャッシュなし」扱いにする
+  }
+  async function dirPut(key, blob) {
+    if (!dirHandle) return false;
+    try {
+      if (await dirHandle.queryPermission({ mode: 'readwrite' }) !== 'granted') return false;
+      const fh = await dirHandle.getFileHandle(safeFileName(key), { create: true });
+      const w = await fh.createWritable();
+      await w.write(blob);
+      await w.close();
+      return true;
+    } catch { return false; } // 書き込めなくても致命的ではない(IndexedDB側へフォールバックする)
+  }
+
+  async function chooseFolder() {
+    if (!dirSupported()) return { ok: false, reason: 'unsupported' };
+    try {
+      const h = await window.showDirectoryPicker({ mode: 'readwrite', id: 'mirumood-cache' });
+      dirHandle = h;
+      try {
+        const os = await store(META, 'readwrite');
+        const req = os.put(h, DIR_KEY);
+        req.onerror = () => {}; // 保存(次回起動時の復元)に失敗しても、今回のセッションでは使えるので致命的ではない
+      } catch {}
+      return { ok: true, name: h.name };
+    } catch { return { ok: false, reason: 'cancelled' }; } // ダイアログをキャンセルした場合など
+  }
+  async function clearFolder() {
+    dirHandle = null;
+    try { const os = await store(META, 'readwrite'); os.delete(DIR_KEY); } catch {}
+  }
+  async function restoreFolder() { // アプリ起動時に一度呼ぶ: 前回選んだフォルダを覚えていれば復元する
+    try {
+      const os = await store(META, 'readonly');
+      const h = await reqToPromise(os.get(DIR_KEY));
+      if (h) dirHandle = h; // 権限が切れていてもハンドル自体は保持し、実際の使用時にqueryPermissionで都度判定する
+    } catch {}
+  }
+  function folderLabel() {
+    if (!dirSupported()) return null; // メニュー項目自体を出さない合図
+    return dirHandle ? dirHandle.name : null;
+  }
+
+  /* ---------- IndexedDB側(既定のフォールバック) ---------- */
+  async function get(key) {
+    if (mem.has(key)) return mem.get(key);
+    const fromDir = await dirGet(key);
+    if (fromDir) { mem.set(key, fromDir); return fromDir; }
+    try {
+      const os = await store(STORE, 'readonly');
+      const rec = await reqToPromise(os.get(key));
+      if (!rec) return null;
+      mem.set(key, rec.blob);
+      touch(key).catch(() => {}); // LRU用のtだけ更新(失敗しても致命的ではないので投げっぱなし)
+      return rec.blob;
+    } catch { return null; } // IndexedDB不可時は「キャッシュなし」として通常の取得フローに任せる
+  }
+
+  async function touch(key) {
+    const os = await store(STORE, 'readwrite');
+    const rec = await reqToPromise(os.get(key));
+    if (rec) { rec.t = ++clockSeq; os.put(rec, key); }
+  }
+
+  let clockSeq = 0;
+  async function put(key, blob) {
+    mem.set(key, blob);
+    if (await dirPut(key, blob)) return; // 外部フォルダに書けたらそちらを正としてIndexedDBには二重保存しない
+    // blob.sizeが数値でない(想定外の値が渡された)場合、evictIfNeededの合計計算がNaN化して
+    // 予算判定が常に偽になり、キャッシュ全体を巻き込んで消してしまう事故を防ぐため0扱いにする。
+    const size = (typeof blob.size === 'number' && !Number.isNaN(blob.size)) ? blob.size : 0;
+    try {
+      const os = await store(STORE, 'readwrite');
+      os.put({ blob, size, t: ++clockSeq }, key);
+      await evictIfNeeded();
+    } catch {} // 保存に失敗しても致命的ではない(次回また普通にDriveから取ってくるだけ)
+  }
+
+  async function evictIfNeeded() {
+    const os = await store(STORE, 'readonly');
+    const all = []; // カーソルで全件集計(件数は画像の枚数程度なので重くならない)
+    await new Promise((resolve, reject) => {
+      const cur = os.openCursor();
+      cur.onsuccess = () => {
+        const c = cur.result;
+        if (!c) { resolve(); return; }
+        all.push({ key: c.primaryKey, size: c.value.size, t: c.value.t });
+        c.continue();
+      };
+      cur.onerror = () => reject(cur.error);
+    });
+    let total = all.reduce((s, e) => s + e.size, 0);
+    if (total <= BYTE_BUDGET) return;
+    all.sort((a, b) => a.t - b.t); // 最後に使われたのが古い順
+    const target = BYTE_BUDGET * 0.85;
+    const delOs = await store(STORE, 'readwrite');
+    for (const e of all) {
+      if (total <= target) break;
+      delOs.delete(e.key);
+      mem.delete(e.key);
+      total -= e.size;
+    }
+  }
+
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} // 追い出されにくくする(結果は問わないベストエフォート)
+
+  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported };
+})();
+/* ==================== /LOCAL-CACHE ==================== */
+
+async function driveDownloadBlob(fileId, opts) {
+  // board.json(manifest)は同じdriveIdのまま中身が上書きされ得るのでキャッシュ対象外にする。
+  // 画像本体/サムネイル/原本は一度アップロードされたら不変なのでキャッシュしてよい。
+  const noCache = opts && opts.noCache;
+  if (!noCache) {
+    const cached = await LocalCache.get(fileId);
+    if (cached) return cached;
+  }
   const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
   if (!res.ok) throw new Error('download failed');
-  return res.blob();
+  const blob = await res.blob();
+  if (!noCache) LocalCache.put(fileId, blob).catch(() => {}); // 保存は非同期・失敗しても無視(表示自体はブロックしない)
+  return blob;
+}
+// キャッシュの保存先フォルダを選ばせる(Chrome/Edgeのみ)。この端末のブラウザだけに閉じた設定で、
+// board.jsonにもDriveにも書き込まない(他のPCではパス自体に意味がないため)。
+async function chooseCacheFolder() {
+  const res = await LocalCache.chooseFolder();
+  if (res.ok) toast(`Cache folder set: ${res.name}`);
+  else if (res.reason !== 'cancelled') toast('Could not set the cache folder');
 }
 // 今開いているボードの画像が実際に入っているDriveフォルダを、新しいタブでそのまま開く。
 function revealDriveFolder() {
@@ -1732,6 +1928,7 @@ async function saveBoardToDrive(forceNewName) {
       if (!rec.driveId) {
         const blob = await getBlob(rec.original);
         rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
+        LocalCache.put(rec.driveId, blob).catch(() => {});
       }
       if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
         // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
@@ -1747,6 +1944,7 @@ async function saveBoardToDrive(forceNewName) {
         if (!rec.thumbDriveId) {
           tblob = await getBlob(rec.thumb);
           rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
+          LocalCache.put(rec.thumbDriveId, tblob).catch(() => {});
         }
         if (embedBudgetLeft > 0) { // 予算が残っていればboard.jsonに直接埋め込む
           tblob = tblob || await getBlob(rec.thumb);
@@ -1760,6 +1958,7 @@ async function saveBoardToDrive(forceNewName) {
       if (rec.fullOriginal && !rec.fullDriveId) { // 保持している無劣化の原本もアップロードする
         const fblob = await getBlob(rec.fullOriginal);
         rec.fullDriveId = await driveUploadFile(`${id}_full.${rec.fullExt}`, fblob, fblob.type || 'application/octet-stream', folderId);
+        LocalCache.put(rec.fullDriveId, fblob).catch(() => {});
       }
       done++;
       progress('Saving to Drive', done / used.length);
@@ -1882,7 +2081,7 @@ async function openDriveFolderById(folderId, folderName) {
     progress('Opening folder', 0);
     const manifestId = await driveFindFileInFolder('board.json', folderId);
     if (manifestId) {
-      const blob = await driveDownloadBlob(manifestId);
+      const blob = await driveDownloadBlob(manifestId, { noCache: true }); // manifestは可変なので必ず最新を取りに行く
       const manifest = JSON.parse(await blob.text());
       if (manifest.app !== 'MiruMood') throw new Error('not a board');
       loadManifestIntoBoard(manifest, folderId, manifestId, folderName);
@@ -2205,6 +2404,7 @@ function openMenu(px, py) {
     ['Open from Drive', '', openBoardFromDrive],
     ['Open Drive folder…', '', openDriveFolder],
     ['Show this board in Drive', '', revealDriveFolder],
+    ...(LocalCache.dirSupported() ? [[`Cache folder (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
   ];
@@ -2254,6 +2454,7 @@ function progressDone() {
 
 addEventListener('resize', paint);
 restoreDriveToken(); // 直前のページ再読み込みでログイン状態が残っていれば即座に復元する
+LocalCache.restoreFolder().catch(() => {}); // 以前選んだキャッシュ用フォルダがあれば復元する(失敗しても既定のIndexedDBが使われるだけ)
 updateJpegBtn();
 updateDriveUI();
 paint();
