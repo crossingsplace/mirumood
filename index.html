@@ -1639,6 +1639,13 @@ async function ensureBoardFolder(name) {
   currentDriveFolderId = id;
   return id;
 }
+async function driveTrashFile(fileId) { // ゴミ箱へ移動する(後でDrive側から復元可能。完全削除ではない)
+  const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trashed: true })
+  });
+  if (!res.ok) throw new Error('trash failed');
+}
 async function driveFindFileInFolder(name, folderId) {
   const esc = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   const q = encodeURIComponent(`name = '${esc}' and '${folderId}' in parents and trashed = false`);
@@ -1686,11 +1693,13 @@ async function driveUploadFile(name, blob, mimeType, folderId, existingFileId) {
  *       LocalCache.get(...) / LocalCache.put(...) の呼び出し行を戻すだけでよい。
  * ============================================================================ */
 const LocalCache = (() => {
-  const DB_NAME = 'mirumood-cache', STORE = 'blobs', META = 'meta', DIR_KEY = 'cacheDirHandle';
+  const DB_NAME = 'mirumood-cache', STORE = 'blobs', META = 'meta', DIR_KEY = 'cacheDirHandle', DIR_LABEL_KEY = 'cacheDirLabel';
+  const CACHE_SUBFOLDER_NAME = 'MiruMood Cache'; // 選んだフォルダ直下に作る専用サブフォルダ名。ここにしか書き込まない。
   const BYTE_BUDGET = 10 * 1024 * 1024 * 1024; // IndexedDB側の既定10GB(外部フォルダ使用時はOS/ディスク容量任せで上限を設けない)
   const mem = new Map(); // セッション内メモリ層: 同じ画像を連続で参照する時(パン/ズームでLODを取り直す等)にIndexedDB/外部フォルダ往復すら省く
   let dbPromise = null;
-  let dirHandle = null; // ユーザーが選んだ外部フォルダ(FileSystemDirectoryHandle) | null
+  let dirHandle = null; // 実際に読み書きするフォルダ(ユーザーが選んだフォルダの中の、専用サブフォルダ) | null
+  let dirLabel = null; // 表示用のラベル(「選んだフォルダ名/MiruMood Cache」)。dirHandle.nameだけだと常に同じ名前になり分かりにくいため。
   let totalBytes = null; // IndexedDB側の合計使用量(状態表示用)。未計測はnull、evictIfNeeded実行時に必ず最新化される。
 
   function reqToPromise(req) {
@@ -1723,20 +1732,41 @@ const LocalCache = (() => {
   /* ---------- 外部フォルダ(File System Access API)側 ---------- */
   function dirSupported() { return typeof window !== 'undefined' && 'showDirectoryPicker' in window; }
   function safeFileName(key) { return String(key).replace(/[^A-Za-z0-9_-]/g, '_'); } // driveIdは通常安全な文字だが念のため
+  const UNSORTED_BOARD = 'Unsorted'; // ボード名が分からない呼び出し元用のフォールバック
+  const UNKNOWN_ACCOUNT = 'Unknown Account'; // サインインしているアカウントが分からない呼び出し元用のフォールバック
+  function sanitizeFolderName(name) { // フォルダ名として安全な形にする(スペースなど見た目の分かりやすさは保つ)
+    const cleaned = String(name || '').replace(/[\/\\:*?"<>|]/g, '_').trim().replace(/[. ]+$/, '');
+    return cleaned.slice(0, 100) || UNSORTED_BOARD;
+  }
+  async function boardDirHandle(account, board, create) {
+    // 「MiruMood Cache」直下にアカウントごとのフォルダ、その中にボードごとのフォルダ、という2段構成。
+    // 複数のGoogleアカウントを行き来する場合、違うアカウントに同名のボードがあっても
+    // ローカルキャッシュ上で混ざらないようにするため(内容が混ざる心配は無いが、フォルダを見た時に
+    // どちらのアカウントのものか分からなくなる・「このボードだけ消す」が両方消してしまう、を防ぐ)。
+    if (!dirHandle) return null;
+    try {
+      const ad = await dirHandle.getDirectoryHandle(sanitizeFolderName(account || UNKNOWN_ACCOUNT), { create });
+      return await ad.getDirectoryHandle(sanitizeFolderName(board), { create });
+    } catch { return null; } // create:falseで存在しない場合はここに来る(=そのボードはまだキャッシュされていない)
+  }
 
-  async function dirGet(key) {
+  async function dirGet(key, board, account) {
     if (!dirHandle) return null;
     try {
       if (await dirHandle.queryPermission({ mode: 'readwrite' }) !== 'granted') return null;
-      const fh = await dirHandle.getFileHandle(safeFileName(key), { create: false });
+      const bd = await boardDirHandle(account, board, false);
+      if (!bd) return null;
+      const fh = await bd.getFileHandle(safeFileName(key), { create: false });
       return await fh.getFile();
     } catch { return null; } // 未生成/権限失効/フォルダが移動された等、理由を問わず「キャッシュなし」扱いにする
   }
-  async function dirPut(key, blob) {
+  async function dirPut(key, blob, board, account) {
     if (!dirHandle) return false;
     try {
       if (await dirHandle.queryPermission({ mode: 'readwrite' }) !== 'granted') return false;
-      const fh = await dirHandle.getFileHandle(safeFileName(key), { create: true });
+      const bd = await boardDirHandle(account, board, true);
+      if (!bd) return false;
+      const fh = await bd.getFileHandle(safeFileName(key), { create: true });
       const w = await fh.createWritable();
       await w.write(blob);
       await w.close();
@@ -1759,33 +1789,41 @@ const LocalCache = (() => {
   async function clearDirContents(handle) { // 外部フォルダの中身を空にする(別のフォルダへ切り替えた後、もう使われないので)
     try {
       if (await handle.queryPermission({ mode: 'readwrite' }) !== 'granted') return; // 権限が無ければ無理に消そうとしない
-      for await (const name of handle.keys()) { await handle.removeEntry(name).catch(() => {}); }
+      // 直下の子はボードごとのサブフォルダ(中身入り)なので、recursive:trueを付けないと
+      // 「空でないディレクトリは消せない」エラーになり、静かに失敗して何も消えなくなってしまう。
+      for await (const name of handle.keys()) { await handle.removeEntry(name, { recursive: true }).catch(() => {}); }
     } catch {}
   }
   async function chooseFolder() {
     if (!dirSupported()) return { ok: false, reason: 'unsupported' };
     try {
-      const h = await window.showDirectoryPicker({ mode: 'readwrite', id: 'mirumood-cache' });
-      const previousDir = dirHandle; // 切り替え前に使っていた外部フォルダ(無ければnull=それまではブラウザ保存だった)
-      const sameAsBefore = previousDir ? await previousDir.isSameEntry(h).catch(() => false) : false;
-      dirHandle = h;
+      const picked = await window.showDirectoryPicker({ mode: 'readwrite', id: 'mirumood-cache' });
+      // 選んだフォルダの直下に直接書き込むと、他のファイルに混ざって「謎のデータ」に見えてしまうため、
+      // 専用のサブフォルダを作り(既にあれば作らずそのまま使う)、その中にしか書き込まない。
+      const cacheDir = await picked.getDirectoryHandle(CACHE_SUBFOLDER_NAME, { create: true });
+      const previousDir = dirHandle; // 切り替え前に使っていたサブフォルダ(無ければnull=それまではブラウザ保存だった)
+      const sameAsBefore = previousDir ? await previousDir.isSameEntry(cacheDir).catch(() => false) : false;
+      dirHandle = cacheDir;
+      dirLabel = `${picked.name}/${CACHE_SUBFOLDER_NAME}`;
       try {
         const os = await store(META, 'readwrite');
-        const req = os.put(h, DIR_KEY);
-        req.onerror = () => {}; // 保存(次回起動時の復元)に失敗しても、今回のセッションでは使えるので致命的ではない
-      } catch {}
+        const req1 = os.put(cacheDir, DIR_KEY); req1.onerror = () => {};
+        const req2 = os.put(dirLabel, DIR_LABEL_KEY); req2.onerror = () => {};
+      } catch {} // 保存(次回起動時の復元)に失敗しても、今回のセッションでは使えるので致命的ではない
       // 切り替え前の保存先はもう参照されなくなるだけで自動では空にならないため、ここで明示的に空にする。
       // キャッシュは失っても次回アクセス時にDriveから再取得されるだけなので、消しても実害はない。
       // ただし「同じフォルダを選び直しただけ(権限の再確認など)」の場合は当然消してはいけないので、
       // isSameEntryで別のフォルダだと確認できた時だけ実行する。
       if (!sameAsBefore) { if (previousDir) await clearDirContents(previousDir); else await clearIndexedDbBlobs(); }
-      return { ok: true, name: h.name };
+      return { ok: true, name: dirLabel };
     } catch { return { ok: false, reason: 'cancelled' }; } // ダイアログをキャンセルした場合など
   }
   async function clearFolder() {
     const previousDir = dirHandle;
     dirHandle = null;
+    dirLabel = null;
     try { const os = await store(META, 'readwrite'); os.delete(DIR_KEY); } catch {}
+    try { const os = await store(META, 'readwrite'); os.delete(DIR_LABEL_KEY); } catch {}
     if (previousDir) await clearDirContents(previousDir); // ブラウザ保存に戻すので、外部フォルダ側は空にしておく
   }
   async function restoreFolder() { // アプリ起動時に一度呼ぶ: 前回選んだフォルダを覚えていれば復元する
@@ -1794,16 +1832,21 @@ const LocalCache = (() => {
       const h = await reqToPromise(os.get(DIR_KEY));
       if (h) dirHandle = h; // 権限が切れていてもハンドル自体は保持し、実際の使用時にqueryPermissionで都度判定する
     } catch {}
+    try {
+      const os = await store(META, 'readonly');
+      const lbl = await reqToPromise(os.get(DIR_LABEL_KEY));
+      if (lbl) dirLabel = lbl;
+    } catch {}
   }
   function folderLabel() {
     if (!dirSupported()) return null; // メニュー項目自体を出さない合図
-    return dirHandle ? dirHandle.name : null;
+    return dirHandle ? (dirLabel || dirHandle.name) : null;
   }
 
   /* ---------- IndexedDB側(既定のフォールバック) ---------- */
-  async function get(key) {
+  async function get(key, board, account) {
     if (mem.has(key)) return mem.get(key);
-    const fromDir = await dirGet(key);
+    const fromDir = await dirGet(key, board, account);
     if (fromDir) { mem.set(key, fromDir); return fromDir; }
     try {
       const os = await store(STORE, 'readonly');
@@ -1822,17 +1865,52 @@ const LocalCache = (() => {
   }
 
   let clockSeq = 0;
-  async function put(key, blob) {
+  async function put(key, blob, board, account) {
     mem.set(key, blob);
-    if (await dirPut(key, blob)) return; // 外部フォルダに書けたらそちらを正としてIndexedDBには二重保存しない
+    if (await dirPut(key, blob, board, account)) return; // 外部フォルダに書けたらそちらを正としてIndexedDBには二重保存しない
     // blob.sizeが数値でない(想定外の値が渡された)場合、evictIfNeededの合計計算がNaN化して
     // 予算判定が常に偽になり、キャッシュ全体を巻き込んで消してしまう事故を防ぐため0扱いにする。
     const size = (typeof blob.size === 'number' && !Number.isNaN(blob.size)) ? blob.size : 0;
     try {
       const os = await store(STORE, 'readwrite');
-      os.put({ blob, size, t: ++clockSeq }, key);
+      // board名・account名を付けておき、後で「このアカウントのこのボードだけ消す」を可能にする
+      os.put({ blob, size, t: ++clockSeq, board: sanitizeFolderName(board), account: sanitizeFolderName(account || UNKNOWN_ACCOUNT) }, key);
       await evictIfNeeded();
     } catch {} // 保存に失敗しても致命的ではない(次回また普通にDriveから取ってくるだけ)
+  }
+
+  // 特定のアカウントの、特定のボードのキャッシュだけを消す(外部フォルダならそのサブフォルダごと、
+  // IndexedDBならタグの一致するレコードだけ)。消してもDriveの複製が無くなるだけなので実害はない。
+  async function clearBoardCache(board, account) {
+    const name = sanitizeFolderName(board);
+    const acc = sanitizeFolderName(account || UNKNOWN_ACCOUNT);
+    if (dirHandle) {
+      try {
+        if (await dirHandle.queryPermission({ mode: 'readwrite' }) === 'granted') {
+          const ad = await dirHandle.getDirectoryHandle(acc, { create: false }).catch(() => null);
+          if (ad) await ad.removeEntry(name, { recursive: true }).catch(() => {});
+        }
+      } catch {}
+    }
+    try {
+      const os = await store(STORE, 'readwrite');
+      const toDelete = [];
+      await new Promise((resolve, reject) => {
+        const cur = os.openCursor();
+        cur.onsuccess = () => {
+          const c = cur.result;
+          if (!c) { resolve(); return; }
+          if ((c.value.board || UNSORTED_BOARD) === name && (c.value.account || UNKNOWN_ACCOUNT) === acc) toDelete.push({ key: c.primaryKey, size: c.value.size });
+          c.continue();
+        };
+        cur.onerror = () => reject(cur.error);
+      });
+      for (const e of toDelete) { os.delete(e.key); mem.delete(e.key); if (totalBytes !== null) totalBytes -= (e.size || 0); }
+    } catch {}
+    // メモリ層(mem)はボードのタグを持っていないため、外部フォルダ経由で入った分だけ選んで消すことができない。
+    // 安全側に倒して丸ごと空にする(他のボード分もこのセッション中は失うが、ディスク/外部フォルダには
+    // まだ残っているので、次にアクセスした時に読み直されるだけで実害はない)。
+    mem.clear();
   }
 
   async function evictIfNeeded() {
@@ -1867,14 +1945,14 @@ const LocalCache = (() => {
   // 外部フォルダ使用時は上限を設けていないため合計サイズは計測しない(bytes:null)。
   async function getUsage() {
     const dirOk = dirHandle && await dirHandle.queryPermission({ mode: 'readwrite' }).catch(() => 'denied') === 'granted';
-    if (dirOk) return { backend: 'dir', label: dirHandle.name, bytes: null };
+    if (dirOk) return { backend: 'dir', label: dirLabel || dirHandle.name, bytes: null };
     if (totalBytes === null) { try { await evictIfNeeded(); } catch {} } // 未計測ならこの呼び出しで一度スキャンさせる(閾値未満なら削除は起きない)
     return { backend: 'indexeddb', label: 'Browser storage', bytes: totalBytes || 0 };
   }
 
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} // 追い出されにくくする(結果は問わないベストエフォート)
 
-  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage };
+  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache };
 })();
 /* ==================== /LOCAL-CACHE ==================== */
 
@@ -1882,14 +1960,16 @@ async function driveDownloadBlob(fileId, opts) {
   // board.json(manifest)は同じdriveIdのまま中身が上書きされ得るのでキャッシュ対象外にする。
   // 画像本体/サムネイル/原本は一度アップロードされたら不変なのでキャッシュしてよい。
   const noCache = opts && opts.noCache;
+  const board = opts && opts.board; // ボードごとにキャッシュを分けるためのタグ(未指定なら「Unsorted」扱い)
+  const account = opts && opts.account; // アカウントごとにキャッシュを分けるためのタグ(未指定なら「Unknown Account」扱い)
   if (!noCache) {
-    const cached = await LocalCache.get(fileId);
+    const cached = await LocalCache.get(fileId, board, account);
     if (cached) return cached;
   }
   const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
   if (!res.ok) throw new Error('download failed');
   const blob = await res.blob();
-  if (!noCache) LocalCache.put(fileId, blob).catch(() => {}); // 保存は非同期・失敗しても無視(表示自体はブロックしない)
+  if (!noCache) LocalCache.put(fileId, blob, board, account).catch(() => {}); // 保存は非同期・失敗しても無視(表示自体はブロックしない)
   return blob;
 }
 // キャッシュの保存先フォルダを選ばせる(Chrome/Edgeのみ)。この端末のブラウザだけに閉じた設定で、
@@ -1898,6 +1978,13 @@ async function chooseCacheFolder() {
   const res = await LocalCache.chooseFolder();
   if (res.ok) toast(`Cache folder set: ${res.name}`);
   else if (res.reason !== 'cancelled') toast('Could not set the cache folder');
+  updateCacheState();
+}
+// 今開いているボードのローカルキャッシュだけを消す(外部フォルダならそのボード専用サブフォルダごと、
+// ブラウザ保存ならタグの一致する分だけ)。Driveの複製が無くなるだけなので、次に開けば再取得されるだけで実害はない。
+async function clearCurrentBoardCache() {
+  await LocalCache.clearBoardCache(currentBoardName, driveUserEmail);
+  toast(`Cleared local cache for "${currentBoardName}"`);
   updateCacheState();
 }
 // 画面上部に常時「今どこにキャッシュしているか」を出す。右クリックメニューを開かなくても
@@ -2024,7 +2111,7 @@ async function saveBoardToDrive(forceNewName) {
       if (!rec.driveId) {
         const blob = await getBlob(rec.original);
         rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
-        LocalCache.put(rec.driveId, blob).catch(() => {});
+        LocalCache.put(rec.driveId, blob, currentBoardName, driveUserEmail).catch(() => {});
       }
       if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
         // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
@@ -2040,7 +2127,7 @@ async function saveBoardToDrive(forceNewName) {
         if (!rec.thumbDriveId) {
           tblob = await getBlob(rec.thumb);
           rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
-          LocalCache.put(rec.thumbDriveId, tblob).catch(() => {});
+          LocalCache.put(rec.thumbDriveId, tblob, currentBoardName, driveUserEmail).catch(() => {});
         }
         if (embedBudgetLeft > 0) { // 予算が残っていればboard.jsonに直接埋め込む
           tblob = tblob || await getBlob(rec.thumb);
@@ -2054,7 +2141,7 @@ async function saveBoardToDrive(forceNewName) {
       if (rec.fullOriginal && !rec.fullDriveId) { // 保持している無劣化の原本もアップロードする
         const fblob = await getBlob(rec.fullOriginal);
         rec.fullDriveId = await driveUploadFile(`${id}_full.${rec.fullExt}`, fblob, fblob.type || 'application/octet-stream', folderId);
-        LocalCache.put(rec.fullDriveId, fblob).catch(() => {});
+        LocalCache.put(rec.fullDriveId, fblob, currentBoardName, driveUserEmail).catch(() => {});
       }
       done++;
       progress('Saving to Drive', done / used.length);
@@ -2092,15 +2179,59 @@ async function openBoardFromDrive() {
     const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
     const data = await res.json();
     progressDone();
-    showBoardListModal(data.files || []);
+    showBoardListModal(data.files || [], 'open');
   } catch {
     progressDone();
     toast('Failed to list boards');
   }
 }
-function showBoardListModal(folders) {
+// 一覧から選んでゴミ箱に移動する(完全削除ではない。Drive側のゴミ箱からいつでも復元できる)。
+// 1回のダイアログでは1枚ずつ選ぶ形にしてある: 消した瞬間に一覧を再取得し直す複雑さを避けつつ、
+// 続けてもう1つ消したい場合はメニューから同じ操作をもう一度呼べば新しい一覧が出る。
+async function deleteBoardFromDrive() {
+  try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
+  if (!driveUserEmail) await fetchDriveUserInfo();
+  try {
+    progress('Loading boards', 0);
+    const rootId = await ensureRootFolder();
+    const q = encodeURIComponent(`'${rootId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
+    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
+    const data = await res.json();
+    progressDone();
+    showBoardListModal(data.files || [], 'delete');
+  } catch {
+    progressDone();
+    toast('Failed to list boards');
+  }
+}
+async function confirmDeleteBoard(f, modal) {
+  if (!confirm(`Move "${f.name}" to Drive's trash?\nYou can restore it later from Drive's own trash if needed.`)) return;
+  modal.style.display = 'none';
+  try {
+    progress('Deleting board', 0);
+    await driveTrashFile(f.id);
+    await LocalCache.clearBoardCache(f.name, driveUserEmail); // ローカルキャッシュも合わせて片付ける(Driveの複製なので消しても実害はない)
+    if (currentDriveFolderId === f.id) { // 今まさに開いていたボードを消した場合は、空の新規ボードとして仕切り直す
+      currentDriveFolderId = null; currentDriveManifestId = null; currentBoardName = 'board';
+      store.clear(); clearBmpCache();
+      items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
+      driveDirty = false; updateDriveState(); paint();
+    }
+    progressDone();
+    updateCacheState();
+    toast(`Moved "${f.name}" to Drive's trash`);
+  } catch {
+    progressDone();
+    toast('Failed to delete the board');
+  }
+}
+function showBoardListModal(folders, mode) {
+  mode = mode || 'open';
   const modal = document.getElementById('boardPicker');
   const list = document.getElementById('boardPickerItems');
+  const h2 = modal.querySelector('h2'), sub = modal.querySelector('p.sub');
+  if (mode === 'delete') { h2.textContent = 'Delete a board'; sub.textContent = "Click a board to move it to Drive's trash"; }
+  else { h2.textContent = 'Open a board'; sub.textContent = 'Click a board to open it'; }
   list.innerHTML = '';
   if (!folders.length) {
     list.innerHTML = '<div class="empty">No boards saved to Drive yet</div>';
@@ -2108,7 +2239,9 @@ function showBoardListModal(folders) {
     for (const f of folders) {
       const b = document.createElement('button');
       b.textContent = f.name;
-      b.onclick = () => { modal.style.display = 'none'; openDriveFolderById(f.id, f.name); };
+      b.onclick = mode === 'delete'
+        ? () => confirmDeleteBoard(f, modal)
+        : () => { modal.style.display = 'none'; openDriveFolderById(f.id, f.name); };
       list.appendChild(b);
     }
   }
@@ -2206,10 +2339,10 @@ function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
       w: im.w, h: im.h, ext: im.ext,
       driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
       fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
-      original: () => driveDownloadBlob(im.driveId),
+      original: () => driveDownloadBlob(im.driveId, { board: folderName, account: driveUserEmail }),
       thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
-           : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId) : null),
-      fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId) : null
+           : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId, { board: folderName, account: driveUserEmail }) : null),
+      fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId, { board: folderName, account: driveUserEmail }) : null
     });
     const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
     if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
@@ -2245,7 +2378,7 @@ async function loadLooseImagesIntoBoard(files, folderId, folderName) {
     store.set(id, {
       w: w0, h: h0, ext,
       driveId: f.id, thumbDriveId: null, fullDriveId: null, fullExt: null,
-      original: () => driveDownloadBlob(f.id),
+      original: () => driveDownloadBlob(f.id, { board: folderName, account: driveUserEmail }),
       thumb: null // サムネイル未生成: 初回のDrive保存時に自動生成される
     });
     const k = Math.min(1, 480 / Math.max(w0, h0));
@@ -2496,9 +2629,11 @@ function openMenu(px, py) {
     ['Save to Drive', '', saveBoardToDrive],
     ['Save to Drive as…', '', () => saveBoardToDrive(true)],
     ['Open from Drive', '', openBoardFromDrive],
+    ['Delete a board…', '', deleteBoardFromDrive],
     ['Open Drive folder…', '', openDriveFolder],
     ['Show this board in Drive', '', revealDriveFolder],
     ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
+    [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
   ];
