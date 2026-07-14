@@ -24,6 +24,8 @@
   #driveAuthBtn.connected{color:var(--accent)}
   #driveState{padding:5px 6px;font-size:11px;color:var(--dim);white-space:nowrap;align-self:center}
   #driveState.dirty{color:var(--accent)}
+  #cacheState{padding:5px 6px;font-size:11px;color:var(--dim);white-space:nowrap;align-self:center;cursor:pointer}
+  #cacheState:hover{color:var(--text)}
   #menu{position:fixed;display:none;min-width:180px;padding:4px;z-index:30;
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:8px}
   #menu button{all:unset;display:flex;justify-content:space-between;gap:16px;cursor:pointer;
@@ -82,6 +84,7 @@
     <span id="gLabel">Sign in</span>
   </button>
   <span id="driveState"></span>
+  <span id="cacheState" data-act="cache-folder" title="Click to change where the local image cache is stored"></span>
 </div>
 
 <div id="menu"></div>
@@ -474,6 +477,7 @@ let nextId = 1;
 const undoStack = [], redoStack = [];
 function snapshot() { return items.map(it => ({ ...it, crop: it.crop ? { ...it.crop } : it.crop })); }
 let driveDirty = false; // 前回のDrive保存以降に変更があったか(状態表示用)
+let driveSaveInProgress = false; // Driveへの保存(アップロードループ)が進行中かどうか。beforeunloadでの警告に使う。
 function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 60) undoStack.shift(); redoStack.length = 0; driveDirty = true; updateDriveState(); }
 function undo() { if (!undoStack.length) return; redoStack.push(snapshot()); items = undoStack.pop(); sel.clear(); cropState = null; driveDirty = true; updateDriveState(); paint(); }
 function redo() { if (!redoStack.length) return; undoStack.push(snapshot()); items = redoStack.pop(); sel.clear(); cropState = null; driveDirty = true; updateDriveState(); paint(); }
@@ -1687,6 +1691,7 @@ const LocalCache = (() => {
   const mem = new Map(); // セッション内メモリ層: 同じ画像を連続で参照する時(パン/ズームでLODを取り直す等)にIndexedDB/外部フォルダ往復すら省く
   let dbPromise = null;
   let dirHandle = null; // ユーザーが選んだ外部フォルダ(FileSystemDirectoryHandle) | null
+  let totalBytes = null; // IndexedDB側の合計使用量(状態表示用)。未計測はnull、evictIfNeeded実行時に必ず最新化される。
 
   function reqToPromise(req) {
     return new Promise((resolve, reject) => {
@@ -1817,6 +1822,7 @@ const LocalCache = (() => {
       cur.onerror = () => reject(cur.error);
     });
     let total = all.reduce((s, e) => s + e.size, 0);
+    totalBytes = total; // このスキャンで正確な合計が取れているので状態表示用に覚えておく
     if (total <= BYTE_BUDGET) return;
     all.sort((a, b) => a.t - b.t); // 最後に使われたのが古い順
     const target = BYTE_BUDGET * 0.85;
@@ -1827,11 +1833,21 @@ const LocalCache = (() => {
       mem.delete(e.key);
       total -= e.size;
     }
+    totalBytes = total; // 削除後の最新値に更新
+  }
+
+  // 状態表示用: 現在どちらの保存先を使っていて、どれだけ使っているかを返す。
+  // 外部フォルダ使用時は上限を設けていないため合計サイズは計測しない(bytes:null)。
+  async function getUsage() {
+    const dirOk = dirHandle && await dirHandle.queryPermission({ mode: 'readwrite' }).catch(() => 'denied') === 'granted';
+    if (dirOk) return { backend: 'dir', label: dirHandle.name, bytes: null };
+    if (totalBytes === null) { try { await evictIfNeeded(); } catch {} } // 未計測ならこの呼び出しで一度スキャンさせる(閾値未満なら削除は起きない)
+    return { backend: 'indexeddb', label: 'Browser storage', bytes: totalBytes || 0 };
   }
 
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} // 追い出されにくくする(結果は問わないベストエフォート)
 
-  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported };
+  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage };
 })();
 /* ==================== /LOCAL-CACHE ==================== */
 
@@ -1855,6 +1871,27 @@ async function chooseCacheFolder() {
   const res = await LocalCache.chooseFolder();
   if (res.ok) toast(`Cache folder set: ${res.name}`);
   else if (res.reason !== 'cancelled') toast('Could not set the cache folder');
+  updateCacheState();
+}
+// 画面上部に常時「今どこにキャッシュしているか」を出す。右クリックメニューを開かなくても
+// 一目で分かるようにするための表示(クリックでchooseCacheFolderと同じ動作)。
+async function updateCacheState() {
+  const el = document.getElementById('cacheState');
+  if (!el || !LocalCache.dirSupported()) { if (el) el.textContent = ''; return; } // 未対応ブラウザでは何も出さない
+  const u = await LocalCache.getUsage();
+  el.textContent = u.backend === 'dir' ? `Cache: ${u.label}` : `Cache: ${(u.bytes / (1024 ** 3)).toFixed(1)} GB`;
+}
+const CACHE_NUDGE_THRESHOLD = 2 * 1024 * 1024 * 1024; // このサイズを超えたら一度だけ外部フォルダを勧める
+const CACHE_NUDGE_KEY = 'mirumood-cache-nudge-shown';
+// ブラウザ保存のまま容量が育ってきた場合に、一度だけ「外に逃がせますよ」と知らせる。
+// 一度出したら二度と出さない(しつこくしない)。既に外部フォルダを設定済みなら何もしない。
+async function maybeNotifyCacheThreshold() {
+  if (!LocalCache.dirSupported() || LocalCache.folderLabel()) return;
+  try { if (localStorage.getItem(CACHE_NUDGE_KEY)) return; } catch { return; }
+  const u = await LocalCache.getUsage();
+  if (u.backend !== 'indexeddb' || u.bytes < CACHE_NUDGE_THRESHOLD) return;
+  try { localStorage.setItem(CACHE_NUDGE_KEY, '1'); } catch {}
+  toast('Local cache is getting large — right-click → "Local image cache" to choose where it\'s stored');
 }
 // 今開いているボードの画像が実際に入っているDriveフォルダを、新しいタブでそのまま開く。
 function revealDriveFolder() {
@@ -1902,6 +1939,31 @@ function dataURItoBlob(dataURI) {
   return new Blob([bytes], { type: mime });
 }
 
+// manifest(board.json)を組み立てて書き込む。アップロードループの前・進行中・完了後、
+// どのタイミングで呼ばれても構わない: items(レイアウト)は常に確定済みの値をそのまま使い、
+// images側はその時点でdriveIdが確定しているものだけを正直に反映する(未確定はnullのまま)。
+// これにより、途中でブラウザが閉じられても「board.json自体は存在し、レイアウトは正しい」
+// 状態を常に保てる(欠けているのはまだ終わっていない画像のバイナリだけ、という状態になる)。
+async function writeManifestCheckpoint(folderId, used, embeds) {
+  const manifest = {
+    app: 'MiruMood', version: 3,
+    canvasBg: currentCanvasBg,
+    jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
+    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
+      ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
+    images: used.map(id => {
+      const r = store.get(id);
+      return {
+        id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId || null, thumbDriveId: r.thumbDriveId || null, thumbEmbed: embeds.get(id) || null,
+        fullDriveId: r.fullDriveId || null, fullExt: r.fullExt || null
+      };
+    })
+  };
+  if (!currentDriveManifestId) currentDriveManifestId = await driveFindFileInFolder('board.json', folderId);
+  const mBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+  currentDriveManifestId = await driveUploadFile('board.json', mBlob, 'application/json', folderId, currentDriveManifestId);
+}
+
 async function saveBoardToDrive(forceNewName) {
   if (!items.length) { toast('Board is empty'); return; }
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
@@ -1916,12 +1978,19 @@ async function saveBoardToDrive(forceNewName) {
     if (forceNewName) { currentDriveFolderId = null; currentDriveManifestId = null; }
   }
 
+  driveSaveInProgress = true;
   try {
     const folderId = await ensureBoardFolder(currentBoardName);
     const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
     let done = 0;
     let embedBudgetLeft = THUMB_EMBED_BUDGET;
     const embeds = new Map(); // id -> data URI (予算内に収まったものだけ)
+
+    // 画像のアップロードを始める前に、まずレイアウトだけでもboard.jsonとして書いておく。
+    // この時点ではdriveIdが未確定の画像も多いが、それでも「board.jsonが存在する」ことが
+    // 何より重要で、これだけで以後は中断されても画像フォルダ扱いへ転落しなくなる。
+    await writeManifestCheckpoint(folderId, used, embeds);
+
     progress('Saving to Drive', 0);
     for (const id of used) {
       const rec = store.get(id);
@@ -1962,31 +2031,22 @@ async function saveBoardToDrive(forceNewName) {
       }
       done++;
       progress('Saving to Drive', done / used.length);
+      // 5枚ごと(+最後の1枚は端数でも必ず)にboard.jsonへ進捗を反映する。
+      // 毎回書くと画像の枚数だけDriveへの小さい書き込みが増えるため、頻度を落として
+      // それでも「直近4枚分の紐付け」以上は失われない程度の粒度に留めている。
+      if (done % 5 === 0 || done === used.length) await writeManifestCheckpoint(folderId, used, embeds);
     }
-    const manifest = {
-      app: 'MiruMood', version: 3,
-      canvasBg: currentCanvasBg,
-      jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
-      items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
-        ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
-      images: used.map(id => {
-        const r = store.get(id);
-        return {
-          id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId, thumbDriveId: r.thumbDriveId || null, thumbEmbed: embeds.get(id) || null,
-          fullDriveId: r.fullDriveId || null, fullExt: r.fullExt || null
-        };
-      })
-    };
-    if (!currentDriveManifestId) currentDriveManifestId = await driveFindFileInFolder('board.json', folderId);
-    const mBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
-    currentDriveManifestId = await driveUploadFile('board.json', mBlob, 'application/json', folderId, currentDriveManifestId);
     driveDirty = false;
     progressDone();
     updateStatus();
     toast(`Saved "${currentBoardName}" to Drive`);
+    updateCacheState();
+    maybeNotifyCacheThreshold();
   } catch {
     progressDone();
     toast('Failed to save to Drive');
+  } finally {
+    driveSaveInProgress = false;
   }
 }
 
@@ -2089,6 +2149,8 @@ async function openDriveFolderById(folderId, folderName) {
       updateDriveState();
       fitAll();
       toast(`Loaded from Drive (${items.length} images)`);
+      updateCacheState();
+      maybeNotifyCacheThreshold();
       return;
     }
     const files = await listDriveImagesInFolder(folderId);
@@ -2098,6 +2160,8 @@ async function openDriveFolderById(folderId, folderName) {
     updateDriveState();
     fitAll();
     toast(`Loaded ${files.length} images from Drive folder — Save to Drive to keep this layout`);
+    updateCacheState();
+    maybeNotifyCacheThreshold();
   } catch {
     progressDone();
     toast('Failed to open that folder');
@@ -2338,7 +2402,7 @@ document.getElementById('bar').addEventListener('click', e => {
   ({ open: () => fImg.click(), note: () => addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)),
      grid: cycleGrid, canvasbg: cycleCanvasBg, jpeg: cycleJpegOptimize, arrange, fit: fitAll, save: saveBoard,
      load: () => fJson.click(), png: exportPNG,
-     'drive-auth': driveAuthClick, 'drive-save': saveBoardToDrive, 'drive-open': openBoardFromDrive, 'drive-folder': openDriveFolder, 'drive-reveal': revealDriveFolder,
+     'drive-auth': driveAuthClick, 'drive-save': saveBoardToDrive, 'drive-open': openBoardFromDrive, 'drive-folder': openDriveFolder, 'drive-reveal': revealDriveFolder, 'cache-folder': chooseCacheFolder,
      help: () => helpBox.style.display = 'grid' })[act]();
 });
 helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
@@ -2404,7 +2468,7 @@ function openMenu(px, py) {
     ['Open from Drive', '', openBoardFromDrive],
     ['Open Drive folder…', '', openDriveFolder],
     ['Show this board in Drive', '', revealDriveFolder],
-    ...(LocalCache.dirSupported() ? [[`Cache folder (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
+    ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
   ];
@@ -2453,8 +2517,14 @@ function progressDone() {
 }
 
 addEventListener('resize', paint);
+// 画像アップロード中にタブを閉じる/リロードすると、board.jsonが書き込まれる前に中断されて
+// レイアウトが保存されないまま画像だけDriveに残ってしまう(見た目上「レイアウトがリセットされた」ように見える)。
+// これを防ぐため、保存進行中はブラウザ標準の「このページを離れますか」警告を出す。
+addEventListener('beforeunload', e => {
+  if (driveSaveInProgress) { e.preventDefault(); e.returnValue = ''; }
+});
 restoreDriveToken(); // 直前のページ再読み込みでログイン状態が残っていれば即座に復元する
-LocalCache.restoreFolder().catch(() => {}); // 以前選んだキャッシュ用フォルダがあれば復元する(失敗しても既定のIndexedDBが使われるだけ)
+LocalCache.restoreFolder().then(updateCacheState).then(maybeNotifyCacheThreshold).catch(() => {}); // 以前選んだキャッシュ用フォルダがあれば復元する(失敗しても既定のIndexedDBが使われるだけ)
 updateJpegBtn();
 updateDriveUI();
 paint();
