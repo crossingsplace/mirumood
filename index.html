@@ -1744,22 +1744,49 @@ const LocalCache = (() => {
     } catch { return false; } // 書き込めなくても致命的ではない(IndexedDB側へフォールバックする)
   }
 
+  async function clearIndexedDbBlobs() { // ブラウザ保存側の中身を空にする(外部フォルダへ切り替えた後、もう使われないので)
+    try {
+      const os = await store(STORE, 'readwrite');
+      await new Promise((resolve, reject) => {
+        const req = os.clear();
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+      totalBytes = 0;
+      mem.clear();
+    } catch {} // 消せなくても致命的ではない(単に古いデータが残るだけ)
+  }
+  async function clearDirContents(handle) { // 外部フォルダの中身を空にする(別のフォルダへ切り替えた後、もう使われないので)
+    try {
+      if (await handle.queryPermission({ mode: 'readwrite' }) !== 'granted') return; // 権限が無ければ無理に消そうとしない
+      for await (const name of handle.keys()) { await handle.removeEntry(name).catch(() => {}); }
+    } catch {}
+  }
   async function chooseFolder() {
     if (!dirSupported()) return { ok: false, reason: 'unsupported' };
     try {
       const h = await window.showDirectoryPicker({ mode: 'readwrite', id: 'mirumood-cache' });
+      const previousDir = dirHandle; // 切り替え前に使っていた外部フォルダ(無ければnull=それまではブラウザ保存だった)
+      const sameAsBefore = previousDir ? await previousDir.isSameEntry(h).catch(() => false) : false;
       dirHandle = h;
       try {
         const os = await store(META, 'readwrite');
         const req = os.put(h, DIR_KEY);
         req.onerror = () => {}; // 保存(次回起動時の復元)に失敗しても、今回のセッションでは使えるので致命的ではない
       } catch {}
+      // 切り替え前の保存先はもう参照されなくなるだけで自動では空にならないため、ここで明示的に空にする。
+      // キャッシュは失っても次回アクセス時にDriveから再取得されるだけなので、消しても実害はない。
+      // ただし「同じフォルダを選び直しただけ(権限の再確認など)」の場合は当然消してはいけないので、
+      // isSameEntryで別のフォルダだと確認できた時だけ実行する。
+      if (!sameAsBefore) { if (previousDir) await clearDirContents(previousDir); else await clearIndexedDbBlobs(); }
       return { ok: true, name: h.name };
     } catch { return { ok: false, reason: 'cancelled' }; } // ダイアログをキャンセルした場合など
   }
   async function clearFolder() {
+    const previousDir = dirHandle;
     dirHandle = null;
     try { const os = await store(META, 'readwrite'); os.delete(DIR_KEY); } catch {}
+    if (previousDir) await clearDirContents(previousDir); // ブラウザ保存に戻すので、外部フォルダ側は空にしておく
   }
   async function restoreFolder() { // アプリ起動時に一度呼ぶ: 前回選んだフォルダを覚えていれば復元する
     try {
