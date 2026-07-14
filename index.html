@@ -19,6 +19,7 @@
   #bar:hover{opacity:1}
   #bar button{all:unset;cursor:pointer;padding:5px 9px;border-radius:5px;color:var(--text);font-size:12px}
   #driveAuthBtn{display:inline-flex;align-items:center;gap:7px}
+  #driveAuthBtn:disabled{opacity:.5;cursor:default}
   #bar button:hover{background:#ffffff14}
   #bar .sep{width:1px;background:var(--line);margin:3px 2px}
   #driveAuthBtn.connected{color:var(--accent)}
@@ -2532,8 +2533,17 @@ paint();
 // Google連携ライブラリの先読み: 初期描画を邪魔しないようアイドル時に裏側で読み込む。
 // 「Drive読込」クリック時の待ち時間をほぼゼロにするための最適化(失敗しても無視してよい)。
 // あわせて、以前サインインしたことがある場合は裏側で静かに再ログインを試みる。
+//
+// サインインボタンは、この先読みが終わるまで押せないようにしておく。理由: 先読みが終わる前に
+// クリックすると、ポップアップを開くまでの間にライブラリのダウンロード待ちが挟まってしまい、
+// クリック直後だけ有効な「ユーザー操作の合図」が切れた状態でポップアップを開こうとして、
+// ブラウザに「勝手に開こうとした」ものとしてブロックされてしまう(GSI_LOGGERの
+// "Failed to open popup window... Maybe blocked by the browser?" の典型的な原因)。
+// 押せるようになった時点では既にライブラリが手元にあるので、この経路には入らなくなる。
+const driveAuthBtnEl = document.getElementById('driveAuthBtn');
+driveAuthBtnEl.disabled = true;
 const prefetchGoogleLibs = () => {
-  ensureGisReady().then(() => trySilentAutoSignIn()).catch(() => {});
+  ensureGisReady().then(() => { driveAuthBtnEl.disabled = false; trySilentAutoSignIn(); }, () => { driveAuthBtnEl.disabled = false; });
   ensurePickerReady().catch(() => {});
 };
 if ('requestIdleCallback' in window) requestIdleCallback(prefetchGoogleLibs, { timeout: 4000 });
