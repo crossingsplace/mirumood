@@ -2173,6 +2173,29 @@ async function clearCurrentBoardCache() {
   toast(`Cleared local cache for "${currentBoardName}"`);
   updateCacheState();
 }
+// 今開いているボードの画像を、表示に必要な分だけでなく全部まとめてキャッシュする。
+// 普段は「表示に必要になった時に少しずつ」キャッシュされる仕組みなので、
+// 「今キャッシュが終わっているのか」が分かりづらいという声を受けて追加した、
+// 明示的に実行でき、進捗と完了がはっきり分かる操作。既にキャッシュ済みの画像は
+// 一瞬で終わる(何もダウンロードし直さない)ので、何度呼んでも安全。
+async function cacheAllBoardImages() {
+  const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
+  if (!used.length) { toast('No images in this board'); return; }
+  let done = 0;
+  progress('Caching images', 0);
+  for (const id of used) {
+    const rec = store.get(id);
+    if (rec) {
+      try { await getBlob(rec.original); } catch {}
+      if (rec.thumb) { try { await getBlob(rec.thumb); } catch {} }
+    }
+    done++;
+    progress('Caching images', done / used.length);
+  }
+  progressDone();
+  updateCacheState();
+  toast(`Cached ${used.length} image(s) for "${currentBoardName}"`);
+}
 // 画面上部に常時「今どこにキャッシュしているか」を出す。右クリックメニューを開かなくても
 // 一目で分かるようにするための表示(クリックでchooseCacheFolderと同じ動作)。
 async function updateCacheState() {
@@ -2813,10 +2836,6 @@ function openMenu(px, py) {
     [`JPG optimization (${!jpegOptimize ? 'Off' : (keepOriginalOnOptimize ? 'On+PNG' : 'On')})`, '', cycleJpegOptimize],
     ['Fit all', 'F', fitAll],
     null,
-    ['Save board', 'Ctrl+S', saveBoard],
-    ['Open board…', 'Ctrl+O', () => fJson.click()],
-    ['Export PNG', '', exportPNG],
-    null,
     ...(gisReady
       ? [[driveSignedIn() ? `Sign out (${driveUserEmail || 'Google'})` : 'Sign in with Google', '', driveAuthClick]]
       : [['Sign in with Google (starting up…)', '', () => toast('Just a moment — still connecting to Google')]]),
@@ -2826,8 +2845,14 @@ function openMenu(px, py) {
     ['Delete a board…', '', deleteBoardFromDrive],
     ['Open Drive folder…', '', openDriveFolder],
     ['Show this board in Drive', '', revealDriveFolder],
+    null,
     ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
+    [`Cache all images in "${currentBoardName}"`, '', cacheAllBoardImages],
     [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
+    null,
+    ['Save board', 'Ctrl+S', saveBoard],
+    ['Open board…', 'Ctrl+O', () => fJson.click()],
+    ['Export PNG', '', exportPNG],
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
     ['Close board', '', closeBoard],
