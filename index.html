@@ -1752,6 +1752,14 @@ const LocalCache = (() => {
   function newId() {
     try { return crypto.randomUUID(); } catch { return 'id-' + Date.now() + '-' + Math.random().toString(36).slice(2); }
   }
+  async function readMarkerId(handle) { // 目印ファイルが既にあれば、その中のIDを返す。無ければnull(何も作らない、確認だけ)。
+    try {
+      const fh = await handle.getFileHandle(MARKER_FILE, { create: false });
+      const data = JSON.parse(await (await fh.getFile()).text());
+      if (data && data.app === 'MiruMood' && data.id) return data.id;
+    } catch {}
+    return null;
+  }
   async function ensureMarker(handle) { // 既存の目印があればそのIDを尊重し、無ければ今この瞬間に新しく発行して書き込む
     try {
       const fh = await handle.getFileHandle(MARKER_FILE, { create: false });
@@ -1904,10 +1912,21 @@ const LocalCache = (() => {
     if (!dirSupported()) return { ok: false, reason: 'unsupported' };
     try {
       const picked = await window.showDirectoryPicker({ mode: 'readwrite', id: 'mirumood-cache' });
-      // 選んだフォルダの直下に直接書き込むと、他のファイルに混ざって「謎のデータ」に見えてしまうため、
-      // 専用のサブフォルダを作り(既にあれば作らずそのまま使う)、その中にしか書き込まない。
-      const cacheDir = await picked.getDirectoryHandle(CACHE_SUBFOLDER_NAME, { create: true });
-      const id = await ensureMarker(cacheDir); // 所有権の証明となるIDを確認・発行する
+      // 選んだフォルダ自体が、既に確認済みのMiruMood Cacheそのものだった場合は、その中に
+      // もう一段作らずそのまま使う。例えば別のPCで、既にVドライブ等に出来ている
+      // 「MiruMood Cache」フォルダを直接指定した時、MiruMood Cache/MiruMood Cacheのような
+      // 入れ子ができてしまうのを防ぐ(Steamがライブラリフォルダを再認識するのと同じ考え方)。
+      // 名前が一致するだけでなく、実際に自分の目印ファイルがあることまで確認してから採用する。
+      const pickedIsAlreadyOurs = picked.name === CACHE_SUBFOLDER_NAME && !!(await readMarkerId(picked));
+      let cacheDir;
+      if (pickedIsAlreadyOurs) {
+        cacheDir = picked;
+      } else {
+        // 選んだフォルダの直下に直接書き込むと、他のファイルに混ざって「謎のデータ」に見えてしまうため、
+        // 専用のサブフォルダを作り(既にあれば作らずそのまま使う)、その中にしか書き込まない。
+        cacheDir = await picked.getDirectoryHandle(CACHE_SUBFOLDER_NAME, { create: true });
+      }
+      const id = await ensureMarker(cacheDir); // 所有権の証明となるIDを確認・発行する(既存の目印があればそれを尊重する)
       const previousDir = dirHandle; // 切り替え前に使っていたフォルダ(無ければnull=それまではブラウザ保存だった)
       const previousDirId = dirId; // 切り替え前の所有権ID。dirIdはこの後上書きされるので、先に控えておく。
       const previousLabel = dirLabel;
@@ -1915,7 +1934,7 @@ const LocalCache = (() => {
       dirHandle = cacheDir;
       dirId = id;
       verifiedHandle = cacheDir; // 今まさに確認・発行したばかりなので、このセッションでは確認済み扱いにしてよい
-      dirLabel = `${picked.name}/${CACHE_SUBFOLDER_NAME}`;
+      dirLabel = pickedIsAlreadyOurs ? picked.name : `${picked.name}/${CACHE_SUBFOLDER_NAME}`;
       try {
         const os = await store(META, 'readwrite');
         const req1 = os.put(cacheDir, DIR_KEY); req1.onerror = () => {};
