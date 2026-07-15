@@ -1693,13 +1693,14 @@ async function driveUploadFile(name, blob, mimeType, folderId, existingFileId) {
  *       LocalCache.get(...) / LocalCache.put(...) の呼び出し行を戻すだけでよい。
  * ============================================================================ */
 const LocalCache = (() => {
-  const DB_NAME = 'mirumood-cache', STORE = 'blobs', META = 'meta', DIR_KEY = 'cacheDirHandle', DIR_LABEL_KEY = 'cacheDirLabel';
+  const DB_NAME = 'mirumood-cache', STORE = 'blobs', META = 'meta', DIRIDX = 'dirindex', DIR_KEY = 'cacheDirHandle', DIR_LABEL_KEY = 'cacheDirLabel', DIR_ID_KEY = 'cacheDirId';
   const CACHE_SUBFOLDER_NAME = 'MiruMood Cache'; // 選んだフォルダ直下に作る専用サブフォルダ名。ここにしか書き込まない。
   const BYTE_BUDGET = 10 * 1024 * 1024 * 1024; // IndexedDB側の既定10GB(外部フォルダ使用時はOS/ディスク容量任せで上限を設けない)
   const mem = new Map(); // セッション内メモリ層: 同じ画像を連続で参照する時(パン/ズームでLODを取り直す等)にIndexedDB/外部フォルダ往復すら省く
   let dbPromise = null;
   let dirHandle = null; // 実際に読み書きするフォルダ(ユーザーが選んだフォルダの中の、専用サブフォルダ) | null
   let dirLabel = null; // 表示用のラベル(「選んだフォルダ名/MiruMood Cache」)。dirHandle.nameだけだと常に同じ名前になり分かりにくいため。
+  let dirId = null; // 所有権確認用のランダムID。dirHandle内の目印ファイルの中身と一致した時だけ「自分が作ったフォルダ」と信用する。
   let totalBytes = null; // IndexedDB側の合計使用量(状態表示用)。未計測はnull、evictIfNeeded実行時に必ず最新化される。
 
   function reqToPromise(req) {
@@ -1713,10 +1714,11 @@ const LocalCache = (() => {
     if (dbPromise) return dbPromise;
     dbPromise = new Promise((resolve, reject) => {
       if (typeof indexedDB === 'undefined') { reject(new Error('no indexedDB')); return; }
-      const req = indexedDB.open(DB_NAME, 1);
+      const req = indexedDB.open(DB_NAME, 2); // v1->v2: dirindexストア追加(既存ユーザーもupgradeneededで作成される)
       req.onupgradeneeded = () => {
         if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE);
         if (!req.result.objectStoreNames.contains(META)) req.result.createObjectStore(META);
+        if (!req.result.objectStoreNames.contains(DIRIDX)) req.result.createObjectStore(DIRIDX);
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -1738,40 +1740,151 @@ const LocalCache = (() => {
     const cleaned = String(name || '').replace(/[\/\\:*?"<>|]/g, '_').trim().replace(/[. ]+$/, '');
     return cleaned.slice(0, 100) || UNSORTED_BOARD;
   }
+
+  /* ---- 所有権の確認: 「名前が一致する」だけでは信用しない ----
+   * MiruMoodが専用フォルダを作った瞬間に、ランダムなIDを目印ファイルへ書き込んでおき、
+   * こちらが記憶しているIDと、実際にフォルダの中から読んだIDが完全一致した時だけ
+   * 「これは間違いなく自分が作ったフォルダだ」と判断する。名前が同じなだけの無関係な
+   * フォルダや、過去バージョンの古い参照を、誤って自分のものだと誤認しないようにするため。
+   * (実際に、名前だけを見て判定していた結果、無関係なフォルダの中身を消してしまう
+   *  事故が起きたことがあるため、この確認を通らない限り一切の読み書き・削除を行わない。) */
+  const MARKER_FILE = '.mirumood-cache-marker';
+  function newId() {
+    try { return crypto.randomUUID(); } catch { return 'id-' + Date.now() + '-' + Math.random().toString(36).slice(2); }
+  }
+  async function ensureMarker(handle) { // 既存の目印があればそのIDを尊重し、無ければ今この瞬間に新しく発行して書き込む
+    try {
+      const fh = await handle.getFileHandle(MARKER_FILE, { create: false });
+      const data = JSON.parse(await (await fh.getFile()).text());
+      if (data && data.app === 'MiruMood' && data.id) return data.id;
+    } catch {}
+    const id = newId();
+    try {
+      const fh = await handle.getFileHandle(MARKER_FILE, { create: true });
+      const w = await fh.createWritable();
+      await w.write(JSON.stringify({ app: 'MiruMood', purpose: 'cache-folder-marker', id }));
+      await w.close();
+    } catch {} // 書けなくても致命的ではない(次回の確認で不一致となり、より安全側に倒れるだけ)
+    return id;
+  }
+  // handleが、expectedIdという所有権IDを持つ、本当にMiruMoodが作ったフォルダそのものかを確認する。
+  // 名前が一致するだけでは信用せず、実際にマーカーファイルの中身まで読んで一致を確認する。
+  async function verifyDirOwnership(handle, expectedId) {
+    if (!handle || handle.name !== CACHE_SUBFOLDER_NAME || !expectedId) return false;
+    try {
+      if (await handle.queryPermission({ mode: 'readwrite' }) !== 'granted') return false;
+      const fh = await handle.getFileHandle(MARKER_FILE, { create: false });
+      const data = JSON.parse(await (await fh.getFile()).text());
+      return !!(data && data.app === 'MiruMood' && data.id === expectedId);
+    } catch { return false; }
+  }
+  let verifiedHandle = null; // 直近に確認が取れたdirHandleのインスタンス。同じなら毎回ファイルを読み直さない(高速化)。
+  async function getVerifiedDir() { // 「現在の」dirHandleに対する、キャッシュ付きの確認
+    if (!dirHandle) return null;
+    if (verifiedHandle === dirHandle) return dirHandle; // 今回のセッションで既に確認済み
+    const ok = await verifyDirOwnership(dirHandle, dirId);
+    if (!ok) return null;
+    verifiedHandle = dirHandle;
+    return dirHandle;
+  }
+
+  /* ---- 「何を書いたか」の記録(台帳)は、確認済みの「MiruMood Cache」フォルダの中に置く。
+   * これはフォルダの中身を無条件に信用しているわけではない: 大元のフォルダ自体が
+   * 目印(UUID)によって間違いなく自分が作ったものだと確認できて初めて、その中に置く台帳を
+   * 信用する、という順序になっている。この順序さえ守れば、台帳をフォルダの中(=共有領域)に
+   * 置いても安全で、しかも複数のブラウザ(Chrome/Edge等)が同じ実フォルダを指すよう設定
+   * さえすれば、キャッシュ本体だけでなく「何を消してよいか」の記録まで共有できる
+   * (IndexedDB側だけに台帳を持たせると、ブラウザごとに孤立してしまい共有できないため)。 ----*/
+  const BOARD_INDEX_FILE = '.mirumood-files-index.json'; // ボードフォルダごとに「自分が書いたファイル」の一覧を記録
+  async function readBoardIndex(boardDir) {
+    try {
+      const fh = await boardDir.getFileHandle(BOARD_INDEX_FILE, { create: false });
+      const data = JSON.parse(await (await fh.getFile()).text());
+      return Array.isArray(data.files) ? data.files : [];
+    } catch { return []; }
+  }
+  async function addToBoardIndex(boardDir, key) {
+    try {
+      const current = await readBoardIndex(boardDir);
+      if (current.includes(key)) return;
+      current.push(key);
+      const fh = await boardDir.getFileHandle(BOARD_INDEX_FILE, { create: true });
+      const w = await fh.createWritable();
+      await w.write(JSON.stringify({ files: current }));
+      await w.close();
+    } catch {} // 記録に失敗しても、書き込んだ画像自体は使えるので致命的ではない(将来の削除対象から漏れるだけ)
+  }
+
   async function boardDirHandle(account, board, create) {
     // 「MiruMood Cache」直下にアカウントごとのフォルダ、その中にボードごとのフォルダ、という2段構成。
     // 複数のGoogleアカウントを行き来する場合、違うアカウントに同名のボードがあっても
     // ローカルキャッシュ上で混ざらないようにするため(内容が混ざる心配は無いが、フォルダを見た時に
     // どちらのアカウントのものか分からなくなる・「このボードだけ消す」が両方消してしまう、を防ぐ)。
-    if (!dirHandle) return null;
+    const root = await getVerifiedDir();
+    if (!root) return null;
     try {
-      const ad = await dirHandle.getDirectoryHandle(sanitizeFolderName(account || UNKNOWN_ACCOUNT), { create });
+      const ad = await root.getDirectoryHandle(sanitizeFolderName(account || UNKNOWN_ACCOUNT), { create });
       return await ad.getDirectoryHandle(sanitizeFolderName(board), { create });
     } catch { return null; } // create:falseで存在しない場合はここに来る(=そのボードはまだキャッシュされていない)
   }
 
   async function dirGet(key, board, account) {
-    if (!dirHandle) return null;
     try {
-      if (await dirHandle.queryPermission({ mode: 'readwrite' }) !== 'granted') return null;
       const bd = await boardDirHandle(account, board, false);
       if (!bd) return null;
       const fh = await bd.getFileHandle(safeFileName(key), { create: false });
       return await fh.getFile();
-    } catch { return null; } // 未生成/権限失効/フォルダが移動された等、理由を問わず「キャッシュなし」扱いにする
+    } catch { return null; } // 未生成/権限失効/確認失敗等、理由を問わず「キャッシュなし」扱いにする
   }
   async function dirPut(key, blob, board, account) {
-    if (!dirHandle) return false;
     try {
-      if (await dirHandle.queryPermission({ mode: 'readwrite' }) !== 'granted') return false;
       const bd = await boardDirHandle(account, board, true);
       if (!bd) return false;
       const fh = await bd.getFileHandle(safeFileName(key), { create: true });
       const w = await fh.createWritable();
       await w.write(blob);
       await w.close();
+      await addToBoardIndex(bd, key); // 共有フォルダ内の台帳を更新する(他のブラウザからも同じ記録が読める)
       return true;
     } catch { return false; } // 書き込めなくても致命的ではない(IndexedDB側へフォールバックする)
+  }
+
+  // 1つのボード分について、台帳(そのボードフォルダ内の記録)にあるファイルだけを消す。
+  // 台帳に無いファイル(ユーザーが手動で置いた別データ等)は絶対に消さない。全部消せて
+  // 本当に空になった時だけ、フォルダの殻ごと消す。何か残っていればフォルダごと残す。
+  async function clearTrackedBoard(root, account, board) {
+    const accSan = sanitizeFolderName(account || UNKNOWN_ACCOUNT), boardSan = sanitizeFolderName(board);
+    try {
+      const ad = await root.getDirectoryHandle(accSan, { create: false }).catch(() => null);
+      if (!ad) return;
+      const bd = await ad.getDirectoryHandle(boardSan, { create: false }).catch(() => null);
+      if (bd) {
+        const files = await readBoardIndex(bd);
+        for (const key of files) await bd.removeEntry(safeFileName(key)).catch(() => {});
+        await bd.removeEntry(BOARD_INDEX_FILE).catch(() => {});
+        let boardHasContent = false;
+        for await (const _ of bd.keys()) { boardHasContent = true; break; }
+        if (!boardHasContent) await ad.removeEntry(boardSan).catch(() => {});
+      }
+      let accHasContent = false;
+      for await (const _ of ad.keys()) { accHasContent = true; break; }
+      if (!accHasContent) await root.removeEntry(accSan).catch(() => {});
+    } catch {}
+  }
+  // MiruMood Cacheフォルダ全体について、実際に存在するアカウント/ボードのサブフォルダを
+  // 辿りながら、上と同じ「台帳にあるファイルだけ消す」を全ボードに対して行う。
+  // (辿るのはあくまで「どこを見ればよいか」の発見のためで、消してよいかどうかの判断は
+  //  引き続き各ボード自身の台帳だけを根拠にする。)
+  async function clearAllManagedContent(root) {
+    try {
+      for await (const [accName, accHandle] of root.entries()) {
+        if (accHandle.kind !== 'directory') continue; // マーカーファイル等、ディレクトリでない物には触れない
+        for await (const [boardName, boardHandle] of accHandle.entries()) {
+          if (boardHandle.kind !== 'directory') continue;
+          await clearTrackedBoard(root, accName, boardName);
+        }
+      }
+    } catch {}
   }
 
   async function clearIndexedDbBlobs() { // ブラウザ保存側の中身を空にする(外部フォルダへ切り替えた後、もう使われないので)
@@ -1786,14 +1899,7 @@ const LocalCache = (() => {
       mem.clear();
     } catch {} // 消せなくても致命的ではない(単に古いデータが残るだけ)
   }
-  async function clearDirContents(handle) { // 外部フォルダの中身を空にする(別のフォルダへ切り替えた後、もう使われないので)
-    try {
-      if (await handle.queryPermission({ mode: 'readwrite' }) !== 'granted') return; // 権限が無ければ無理に消そうとしない
-      // 直下の子はボードごとのサブフォルダ(中身入り)なので、recursive:trueを付けないと
-      // 「空でないディレクトリは消せない」エラーになり、静かに失敗して何も消えなくなってしまう。
-      for await (const name of handle.keys()) { await handle.removeEntry(name, { recursive: true }).catch(() => {}); }
-    } catch {}
-  }
+
   async function chooseFolder() {
     if (!dirSupported()) return { ok: false, reason: 'unsupported' };
     try {
@@ -1801,41 +1907,77 @@ const LocalCache = (() => {
       // 選んだフォルダの直下に直接書き込むと、他のファイルに混ざって「謎のデータ」に見えてしまうため、
       // 専用のサブフォルダを作り(既にあれば作らずそのまま使う)、その中にしか書き込まない。
       const cacheDir = await picked.getDirectoryHandle(CACHE_SUBFOLDER_NAME, { create: true });
-      const previousDir = dirHandle; // 切り替え前に使っていたサブフォルダ(無ければnull=それまではブラウザ保存だった)
+      const id = await ensureMarker(cacheDir); // 所有権の証明となるIDを確認・発行する
+      const previousDir = dirHandle; // 切り替え前に使っていたフォルダ(無ければnull=それまではブラウザ保存だった)
+      const previousDirId = dirId; // 切り替え前の所有権ID。dirIdはこの後上書きされるので、先に控えておく。
+      const previousLabel = dirLabel;
       const sameAsBefore = previousDir ? await previousDir.isSameEntry(cacheDir).catch(() => false) : false;
       dirHandle = cacheDir;
+      dirId = id;
+      verifiedHandle = cacheDir; // 今まさに確認・発行したばかりなので、このセッションでは確認済み扱いにしてよい
       dirLabel = `${picked.name}/${CACHE_SUBFOLDER_NAME}`;
       try {
         const os = await store(META, 'readwrite');
         const req1 = os.put(cacheDir, DIR_KEY); req1.onerror = () => {};
         const req2 = os.put(dirLabel, DIR_LABEL_KEY); req2.onerror = () => {};
+        const req3 = os.put(id, DIR_ID_KEY); req3.onerror = () => {};
       } catch {} // 保存(次回起動時の復元)に失敗しても、今回のセッションでは使えるので致命的ではない
-      // 切り替え前の保存先はもう参照されなくなるだけで自動では空にならないため、ここで明示的に空にする。
-      // キャッシュは失っても次回アクセス時にDriveから再取得されるだけなので、消しても実害はない。
-      // ただし「同じフォルダを選び直しただけ(権限の再確認など)」の場合は当然消してはいけないので、
-      // isSameEntryで別のフォルダだと確認できた時だけ実行する。
-      if (!sameAsBefore) { if (previousDir) await clearDirContents(previousDir); else await clearIndexedDbBlobs(); }
-      return { ok: true, name: dirLabel };
+      // 切り替え前の場所は、以下の2重の安全策を通った場合だけ片付ける:
+      //  ① 同じフォルダを選び直しただけ(権限の再確認等)ではないこと(isSameEntryで確認済み)
+      //  ② 切り替え前のフォルダが、本当に(このIDで)MiruMood自身が作ったものだと確認できること
+      // その上で消すのは「自分が書いたと記録している個々のファイル」だけで、記録に無いもの
+      // (ユーザーが手動で置いた別データ等)には一切触れない。全部消せて空になったボード/
+      // アカウントフォルダだけがフォルダごと消え、何か残っていればフォルダごと残る。
+      if (!sameAsBefore) {
+        if (previousDir) {
+          if (await verifyDirOwnership(previousDir, previousDirId)) await clearAllManagedContent(previousDir);
+        } else {
+          // 一方、IndexedDB側は他のアプリやユーザーのファイルとは無関係な、このアプリ専用の
+          // サンドボックスされたデータベースなので、誤って無関係なものを消す心配が無い。
+          await clearIndexedDbBlobs();
+        }
+      }
+      return { ok: true, name: dirLabel, previousLabel: previousLabel || null };
     } catch { return { ok: false, reason: 'cancelled' }; } // ダイアログをキャンセルした場合など
   }
   async function clearFolder() {
-    const previousDir = dirHandle;
     dirHandle = null;
     dirLabel = null;
+    dirId = null;
+    verifiedHandle = null;
     try { const os = await store(META, 'readwrite'); os.delete(DIR_KEY); } catch {}
     try { const os = await store(META, 'readwrite'); os.delete(DIR_LABEL_KEY); } catch {}
-    if (previousDir) await clearDirContents(previousDir); // ブラウザ保存に戻すので、外部フォルダ側は空にしておく
+    try { const os = await store(META, 'readwrite'); os.delete(DIR_ID_KEY); } catch {}
+    // 以前の外部フォルダには一切触れない(自動削除はしない。理由はchooseFolder側のコメントと同じ)
   }
   async function restoreFolder() { // アプリ起動時に一度呼ぶ: 前回選んだフォルダを覚えていれば復元する
     try {
       const os = await store(META, 'readonly');
       const h = await reqToPromise(os.get(DIR_KEY));
-      if (h) dirHandle = h; // 権限が切れていてもハンドル自体は保持し、実際の使用時にqueryPermissionで都度判定する
+      // 最初の安全確認: 名前が「MiruMood Cache」であることを確認する(権限が無くても読める、軽い確認)。
+      // これは過去のバージョン(専用サブフォルダ・ID確認の仕組みを入れる前)で選んだフォルダが
+      // そのまま残っていた場合、それはユーザーが直接選んだ任意のフォルダ(専用フォルダではない)
+      // であり、MiruMood専用のものとして扱ってはいけないため。名前が一致しない場合は
+      // 信用せず、設定ごと破棄してブラウザ保存に安全側でフォールバックする。
+      // (IDの一致まで含めた本当の確認は、実際に読み書きが発生するgetVerifiedDir()の中で行う。
+      //  起動直後はまだ権限の再確認ができていないことが多く、ここでファイルを読もうとすると
+      //  正当な設定まで誤って破棄してしまいかねないため、ここでは軽い確認に留めている。)
+      if (h && h.name === CACHE_SUBFOLDER_NAME) {
+        dirHandle = h; // 権限やID確認は実際の使用時にgetVerifiedDir()が都度行う
+      } else if (h) {
+        try { const os2 = await store(META, 'readwrite'); os2.delete(DIR_KEY); os2.delete(DIR_LABEL_KEY); os2.delete(DIR_ID_KEY); } catch {}
+        return;
+      }
     } catch {}
     try {
       const os = await store(META, 'readonly');
       const lbl = await reqToPromise(os.get(DIR_LABEL_KEY));
       if (lbl) dirLabel = lbl;
+    } catch {}
+    try {
+      const os = await store(META, 'readonly');
+      const id = await reqToPromise(os.get(DIR_ID_KEY));
+      if (id) dirId = id;
     } catch {}
   }
   function folderLabel() {
@@ -1884,14 +2026,8 @@ const LocalCache = (() => {
   async function clearBoardCache(board, account) {
     const name = sanitizeFolderName(board);
     const acc = sanitizeFolderName(account || UNKNOWN_ACCOUNT);
-    if (dirHandle) {
-      try {
-        if (await dirHandle.queryPermission({ mode: 'readwrite' }) === 'granted') {
-          const ad = await dirHandle.getDirectoryHandle(acc, { create: false }).catch(() => null);
-          if (ad) await ad.removeEntry(name, { recursive: true }).catch(() => {});
-        }
-      } catch {}
-    }
+    const root = await getVerifiedDir(); // IDまで一致した、確実にMiruMood自身が作ったフォルダの時だけ先へ進む
+    if (root) await clearTrackedBoard(root, account, board); // ボード自身の台帳(フォルダ内の記録)にあるファイルだけを消す
     try {
       const os = await store(STORE, 'readwrite');
       const toDelete = [];
@@ -1944,8 +2080,8 @@ const LocalCache = (() => {
   // 状態表示用: 現在どちらの保存先を使っていて、どれだけ使っているかを返す。
   // 外部フォルダ使用時は上限を設けていないため合計サイズは計測しない(bytes:null)。
   async function getUsage() {
-    const dirOk = dirHandle && await dirHandle.queryPermission({ mode: 'readwrite' }).catch(() => 'denied') === 'granted';
-    if (dirOk) return { backend: 'dir', label: dirLabel || dirHandle.name, bytes: null };
+    const verified = await getVerifiedDir();
+    if (verified) return { backend: 'dir', label: dirLabel || dirHandle.name, bytes: null };
     if (totalBytes === null) { try { await evictIfNeeded(); } catch {} } // 未計測ならこの呼び出しで一度スキャンさせる(閾値未満なら削除は起きない)
     return { backend: 'indexeddb', label: 'Browser storage', bytes: totalBytes || 0 };
   }
@@ -1976,8 +2112,11 @@ async function driveDownloadBlob(fileId, opts) {
 // board.jsonにもDriveにも書き込まない(他のPCではパス自体に意味がないため)。
 async function chooseCacheFolder() {
   const res = await LocalCache.chooseFolder();
-  if (res.ok) toast(`Cache folder set: ${res.name}`);
-  else if (res.reason !== 'cancelled') toast('Could not set the cache folder');
+  if (res.ok) {
+    toast(res.previousLabel
+      ? `Cache folder set: ${res.name} (cache data cleaned up at previous location "${res.previousLabel}" — any other files there were left untouched)`
+      : `Cache folder set: ${res.name}`);
+  } else if (res.reason !== 'cancelled') toast('Could not set the cache folder');
   updateCacheState();
 }
 // 今開いているボードのローカルキャッシュだけを消す(外部フォルダならそのボード専用サブフォルダごと、
@@ -2204,6 +2343,19 @@ async function deleteBoardFromDrive() {
     toast('Failed to list boards');
   }
 }
+// 画面を空の新規ボードとして仕切り直す(ボードを消した時・閉じた時、共通で使う)
+function resetToEmptyBoard() {
+  currentDriveFolderId = null; currentDriveManifestId = null; currentBoardName = 'board';
+  store.clear(); clearBmpCache();
+  items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
+  driveDirty = false; updateDriveState(); paint();
+}
+// タブを閉じる以外に「今のボードを閉じる」手段が無かったため追加。未保存の変更がある場合だけ確認を挟む。
+function closeBoard() {
+  if (driveDirty && !confirm(`"${currentBoardName}" has unsaved changes.\nClose it anyway? Unsaved changes will be lost.`)) return;
+  resetToEmptyBoard();
+  toast('Board closed');
+}
 async function confirmDeleteBoard(f, modal) {
   if (!confirm(`Move "${f.name}" to Drive's trash?\nYou can restore it later from Drive's own trash if needed.`)) return;
   modal.style.display = 'none';
@@ -2211,12 +2363,7 @@ async function confirmDeleteBoard(f, modal) {
     progress('Deleting board', 0);
     await driveTrashFile(f.id);
     await LocalCache.clearBoardCache(f.name, driveUserEmail); // ローカルキャッシュも合わせて片付ける(Driveの複製なので消しても実害はない)
-    if (currentDriveFolderId === f.id) { // 今まさに開いていたボードを消した場合は、空の新規ボードとして仕切り直す
-      currentDriveFolderId = null; currentDriveManifestId = null; currentBoardName = 'board';
-      store.clear(); clearBmpCache();
-      items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
-      driveDirty = false; updateDriveState(); paint();
-    }
+    if (currentDriveFolderId === f.id) resetToEmptyBoard(); // 今まさに開いていたボードを消した場合は、空の新規ボードとして仕切り直す
     progressDone();
     updateCacheState();
     toast(`Moved "${f.name}" to Drive's trash`);
@@ -2621,6 +2768,7 @@ function openMenu(px, py) {
     null,
     ['Save board', 'Ctrl+S', saveBoard],
     ['Open board…', 'Ctrl+O', () => fJson.click()],
+    ['Close board', '', closeBoard],
     ['Export PNG', '', exportPNG],
     null,
     ...(gisReady
