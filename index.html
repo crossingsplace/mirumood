@@ -1803,6 +1803,7 @@ const LocalCache = (() => {
    * さえすれば、キャッシュ本体だけでなく「何を消してよいか」の記録まで共有できる
    * (IndexedDB側だけに台帳を持たせると、ブラウザごとに孤立してしまい共有できないため)。 ----*/
   const BOARD_INDEX_FILE = '.mirumood-files-index.json'; // ボードフォルダごとに「自分が書いたファイル」の一覧を記録
+  const BOARD_NAME_HINT_FILE = 'board-name.txt'; // フォルダ名がID化される代わりに、中に表示名を残しておく人間可読の目印
   async function readBoardIndex(boardDir) {
     try {
       const fh = await boardDir.getFileHandle(BOARD_INDEX_FILE, { create: false });
@@ -1824,15 +1825,31 @@ const LocalCache = (() => {
 
   async function boardDirHandle(account, board, create) {
     // 「MiruMood Cache」直下にアカウントごとのフォルダ、その中にボードごとのフォルダ、という2段構成。
-    // 複数のGoogleアカウントを行き来する場合、違うアカウントに同名のボードがあっても
-    // ローカルキャッシュ上で混ざらないようにするため(内容が混ざる心配は無いが、フォルダを見た時に
-    // どちらのアカウントのものか分からなくなる・「このボードだけ消す」が両方消してしまう、を防ぐ)。
+    // ここでのboardはボードの「表示名」ではなく、Drive側のフォルダID(名前を変更しても変わらない、
+    // 内部的な識別子)を使う。これにより、ボード名を変更してもローカルキャッシュの場所自体は
+    // 一切変わらないので、名前変更のたびに何ギガものデータを移し替える必要が無くなる。
+    // (フォルダ名が意味の無いID文字列になる代わり、setBoardNameHint()で中に人間可読の
+    //  目印ファイルを置いておくので、エクスプローラーで覗いても迷わないようにしてある。)
     const root = await getVerifiedDir();
     if (!root) return null;
     try {
       const ad = await root.getDirectoryHandle(sanitizeFolderName(account || UNKNOWN_ACCOUNT), { create });
       return await ad.getDirectoryHandle(sanitizeFolderName(board), { create });
     } catch { return null; } // create:falseで存在しない場合はここに来る(=そのボードはまだキャッシュされていない)
+  }
+  // ボードフォルダ(IDで名付けられている)の中に、今の表示名を書いた小さなテキストファイルを
+  // 置いておく。フォルダ名自体はIDなので意味を持たないが、これがあれば人間がエクスプローラーで
+  // 覗いた時に「これはどのボードか」がすぐ分かる。呼ぶたびに中身を今の表示名で上書きするだけで、
+  // 実データ(画像)には一切触れない、軽い操作。
+  async function setBoardNameHint(board, account, displayName) {
+    try {
+      const bd = await boardDirHandle(account, board, true);
+      if (!bd) return;
+      const fh = await bd.getFileHandle(BOARD_NAME_HINT_FILE, { create: true });
+      const w = await fh.createWritable();
+      await w.write(displayName || '');
+      await w.close();
+    } catch {} // 書けなくても致命的ではない(単に目印が無いだけで、キャッシュ自体は問題なく機能する)
   }
 
   async function dirGet(key, board, account) {
@@ -2132,7 +2149,7 @@ const LocalCache = (() => {
 
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} // 追い出されにくくする(結果は問わないベストエフォート)
 
-  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache };
+  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache, setBoardNameHint };
 })();
 /* ==================== /LOCAL-CACHE ==================== */
 
@@ -2165,11 +2182,55 @@ async function chooseCacheFolder() {
   }
   updateCacheState();
 }
+// ボード名を変更する。既にDriveに保存済みなら、実際にDrive側のフォルダ名も変更する
+// (フォルダIDそのものは変わらないので、以後の保存・削除等は引き続き同じフォルダを指す)。
+// ローカルキャッシュはこのフォルダID自体をフォルダ名として使っているため、表示名がいくら
+// 変わってもキャッシュの場所は一切動かない。何ギガあっても、コピーはおろか、何の処理も
+// 発生しない(移す必要そのものが無い)。フォルダ名がID(意味の無い文字列)になる代わりに、
+// 中に今の表示名を書いたヒントファイル(board-name.txt)を置いておき、人間がエクスプローラー
+// で覗いても迷わないようにする。
+async function renameBoard() {
+  const oldName = currentBoardName;
+  const input = prompt('New name for this board', oldName);
+  if (input === null) return;
+  const newName = input.trim();
+  if (!newName || newName === oldName) return;
+
+  if (currentDriveFolderId) {
+    try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
+    try {
+      const rootId = await ensureRootFolder();
+      const existing = await driveFindFolder(newName, rootId);
+      if (existing && existing !== currentDriveFolderId) { toast(`A board named "${newName}" already exists`); return; }
+      const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${currentDriveFolderId}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName })
+      });
+      if (!res.ok) throw new Error('rename failed');
+    } catch {
+      toast('Failed to rename the board on Drive');
+      return;
+    }
+  }
+
+  currentBoardName = newName;
+  driveDirty = true;
+  updateDriveState();
+
+  // ローカルキャッシュの場所自体は変わらないので、ここではヒントファイルの中身を更新するだけ。
+  if (currentDriveFolderId) LocalCache.setBoardNameHint(currentDriveFolderId, driveUserEmail, newName).catch(() => {});
+  updateCacheState();
+
+  toast(`Renamed to "${newName}"`);
+}
 // 今開いているボードのローカルキャッシュだけを消す(外部フォルダならそのボード専用サブフォルダごと、
 // ブラウザ保存ならタグの一致する分だけ)。Driveの複製が無くなるだけなので、次に開けば再取得されるだけで実害はない。
+// キャッシュはDriveのフォルダID(名前を変更しても変わらない識別子)で管理しているので、ここも
+// それを使う。まだDriveに保存していないボードにはそもそもキャッシュが存在しないので、その場合は何もしない。
 async function clearCurrentBoardCache() {
+  if (!currentDriveFolderId) { toast('This board has not been saved to Drive yet'); return; }
   if (!confirm(`Clear the local cache for "${currentBoardName}"?\nImages will simply be re-downloaded from Drive next time this board is opened.`)) return;
-  await LocalCache.clearBoardCache(currentBoardName, driveUserEmail);
+  await LocalCache.clearBoardCache(currentDriveFolderId, driveUserEmail);
   toast(`Cleared local cache for "${currentBoardName}"`);
   updateCacheState();
 }
@@ -2304,6 +2365,7 @@ async function saveBoardToDrive(forceNewName) {
   driveSaveInProgress = true;
   try {
     const folderId = await ensureBoardFolder(currentBoardName);
+    LocalCache.setBoardNameHint(folderId, driveUserEmail, currentBoardName).catch(() => {}); // 人間可読の目印を最新化しておく
     const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
     let done = 0;
     let embedBudgetLeft = THUMB_EMBED_BUDGET;
@@ -2320,7 +2382,7 @@ async function saveBoardToDrive(forceNewName) {
       if (!rec.driveId) {
         const blob = await getBlob(rec.original);
         rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
-        LocalCache.put(rec.driveId, blob, currentBoardName, driveUserEmail).catch(() => {});
+        LocalCache.put(rec.driveId, blob, folderId, driveUserEmail).catch(() => {});
       }
       if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
         // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
@@ -2336,7 +2398,7 @@ async function saveBoardToDrive(forceNewName) {
         if (!rec.thumbDriveId) {
           tblob = await getBlob(rec.thumb);
           rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
-          LocalCache.put(rec.thumbDriveId, tblob, currentBoardName, driveUserEmail).catch(() => {});
+          LocalCache.put(rec.thumbDriveId, tblob, folderId, driveUserEmail).catch(() => {});
         }
         if (embedBudgetLeft > 0) { // 予算が残っていればboard.jsonに直接埋め込む
           tblob = tblob || await getBlob(rec.thumb);
@@ -2350,7 +2412,7 @@ async function saveBoardToDrive(forceNewName) {
       if (rec.fullOriginal && !rec.fullDriveId) { // 保持している無劣化の原本もアップロードする
         const fblob = await getBlob(rec.fullOriginal);
         rec.fullDriveId = await driveUploadFile(`${id}_full.${rec.fullExt}`, fblob, fblob.type || 'application/octet-stream', folderId);
-        LocalCache.put(rec.fullDriveId, fblob, currentBoardName, driveUserEmail).catch(() => {});
+        LocalCache.put(rec.fullDriveId, fblob, folderId, driveUserEmail).catch(() => {});
       }
       done++;
       progress('Saving to Drive', done / used.length);
@@ -2432,7 +2494,7 @@ async function confirmDeleteBoard(f, modal) {
   try {
     progress('Deleting board', 0);
     await driveTrashFile(f.id);
-    await LocalCache.clearBoardCache(f.name, driveUserEmail); // ローカルキャッシュも合わせて片付ける(Driveの複製なので消しても実害はない)
+    await LocalCache.clearBoardCache(f.id, driveUserEmail); // ローカルキャッシュも合わせて片付ける(Driveの複製なので消しても実害はない)
     if (currentDriveFolderId === f.id) resetToEmptyBoard(); // 今まさに開いていたボードを消した場合は、空の新規ボードとして仕切り直す
     progressDone();
     updateCacheState();
@@ -2549,6 +2611,7 @@ function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
   closeNoteEditor(false); cropState = null;
   currentDriveFolderId = folderId; currentDriveManifestId = manifestId;
   currentBoardName = folderName || currentBoardName;
+  LocalCache.setBoardNameHint(folderId, driveUserEmail, currentBoardName).catch(() => {}); // 他のPCで名前が変わっていた場合も追従させる
   store.clear(); clearBmpCache();
   items = []; sel.clear(); undoStack.length = 0; redoStack.length = 0;
   for (const im of manifest.images) {
@@ -2556,10 +2619,10 @@ function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
       w: im.w, h: im.h, ext: im.ext,
       driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
       fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
-      original: () => driveDownloadBlob(im.driveId, { board: folderName, account: driveUserEmail }),
+      original: () => driveDownloadBlob(im.driveId, { board: folderId, account: driveUserEmail }),
       thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
-           : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId, { board: folderName, account: driveUserEmail }) : null),
-      fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId, { board: folderName, account: driveUserEmail }) : null
+           : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId, { board: folderId, account: driveUserEmail }) : null),
+      fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId, { board: folderId, account: driveUserEmail }) : null
     });
     const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
     if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
@@ -2581,6 +2644,7 @@ async function loadLooseImagesIntoBoard(files, folderId, folderName) {
   currentDriveFolderId = folderId;
   currentDriveManifestId = null; // このフォルダにはまだboard.jsonがない(初回のDrive保存時に作られる)
   currentBoardName = folderName || 'board';
+  LocalCache.setBoardNameHint(folderId, driveUserEmail, currentBoardName).catch(() => {});
   setCanvasBg(CANVAS_PRESETS[0].bg);
   jpegOptimize = false; keepOriginalOnOptimize = false; jpegPromptDismissed = false; updateJpegBtn();
 
@@ -2595,7 +2659,7 @@ async function loadLooseImagesIntoBoard(files, folderId, folderName) {
     store.set(id, {
       w: w0, h: h0, ext,
       driveId: f.id, thumbDriveId: null, fullDriveId: null, fullExt: null,
-      original: () => driveDownloadBlob(f.id, { board: folderName, account: driveUserEmail }),
+      original: () => driveDownloadBlob(f.id, { board: folderId, account: driveUserEmail }),
       thumb: null // サムネイル未生成: 初回のDrive保存時に自動生成される
     });
     const k = Math.min(1, 480 / Math.max(w0, h0));
@@ -2868,6 +2932,7 @@ function openMenu(px, py) {
     ['Save to Drive as…', '', () => saveBoardToDrive(true)],
     ['Open from Drive', '', openBoardFromDrive],
     ['Delete a board…', '', deleteBoardFromDrive],
+    ['Rename board…', '', renameBoard],
     ['Show this board in Drive', '', revealDriveFolder],
     null,
     ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
