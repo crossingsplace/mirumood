@@ -1957,7 +1957,14 @@ const LocalCache = (() => {
         }
       }
       return { ok: true, name: dirLabel, previousLabel: previousLabel || null };
-    } catch { return { ok: false, reason: 'cancelled' }; } // ダイアログをキャンセルした場合など
+    } catch (err) {
+      // ダイアログを閉じた/キャンセルした場合はAbortErrorとして区別する。それ以外(権限拒否など
+      // 本当のエラー)は、原因が画面に一切出ないと不具合の切り分けができなくなるため、
+      // コンソールに詳細を残しつつ、reasonにエラー名を入れて呼び出し元が案内できるようにする。
+      if (err && err.name === 'AbortError') return { ok: false, reason: 'cancelled' };
+      console.warn('MiruMood cache folder selection failed:', err);
+      return { ok: false, reason: 'error', message: err && (err.message || err.name) };
+    }
   }
   async function clearFolder() {
     dirHandle = null;
@@ -2135,7 +2142,9 @@ async function chooseCacheFolder() {
     toast(res.previousLabel
       ? `Cache folder set: ${res.name} (cache data cleaned up at previous location "${res.previousLabel}" — any other files there were left untouched)`
       : `Cache folder set: ${res.name}`);
-  } else if (res.reason !== 'cancelled') toast('Could not set the cache folder');
+  } else if (res.reason !== 'cancelled') {
+    toast(res.message ? `Could not set the cache folder: ${res.message}` : 'Could not set the cache folder');
+  }
   updateCacheState();
 }
 // 今開いているボードのローカルキャッシュだけを消す(外部フォルダならそのボード専用サブフォルダごと、
