@@ -2768,7 +2768,6 @@ function openMenu(px, py) {
     null,
     ['Save board', 'Ctrl+S', saveBoard],
     ['Open board…', 'Ctrl+O', () => fJson.click()],
-    ['Close board', '', closeBoard],
     ['Export PNG', '', exportPNG],
     null,
     ...(gisReady
@@ -2784,6 +2783,7 @@ function openMenu(px, py) {
     [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
+    ['Close board', '', closeBoard],
   ];
   menu.innerHTML = '';
   for (const r of rows) {
