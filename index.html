@@ -1917,9 +1917,8 @@ const LocalCache = (() => {
       // 「MiruMood Cache」フォルダを直接指定した時、MiruMood Cache/MiruMood Cacheのような
       // 入れ子ができてしまうのを防ぐ(Steamがライブラリフォルダを再認識するのと同じ考え方)。
       // 名前が一致するだけでなく、実際に自分の目印ファイルがあることまで確認してから採用する。
-      const existingMarkerId = await readMarkerId(picked); // 診断用ログ: この結果を見ればどこで判定が狂っているか分かる
+      const existingMarkerId = await readMarkerId(picked);
       const pickedIsAlreadyOurs = picked.name === CACHE_SUBFOLDER_NAME && !!existingMarkerId;
-      console.log('[MiruMood cache diag] picked.name =', JSON.stringify(picked.name), '/ expected =', JSON.stringify(CACHE_SUBFOLDER_NAME), '/ existingMarkerId =', existingMarkerId, '/ pickedIsAlreadyOurs =', pickedIsAlreadyOurs);
       let cacheDir;
       if (pickedIsAlreadyOurs) {
         cacheDir = picked;
@@ -1956,11 +1955,13 @@ const LocalCache = (() => {
       if (!sameAsBefore) {
         if (previousDir) {
           if (await verifyDirOwnership(previousDir, previousDirId)) await clearAllManagedContent(previousDir);
-        } else {
-          // 一方、IndexedDB側は他のアプリやユーザーのファイルとは無関係な、このアプリ専用の
-          // サンドボックスされたデータベースなので、誤って無関係なものを消す心配が無い。
-          await clearIndexedDbBlobs();
         }
+        // IndexedDB側は他のアプリやユーザーのファイルとは無関係な、このアプリ専用のサンドボックス
+        // されたデータベースなので、誤って無関係なものを消す心配が無い。外部フォルダへ切り替えた
+        // 以上は毎回(初めてかどうかに関わらず)空にしておく。放置すると、古い残骸がIndexedDB側に
+        // 残ったまま「盾」になり、Driveへの再取得(≒外部フォルダへの書き込み)が発生しなくなる
+        // 不具合につながるため。
+        await clearIndexedDbBlobs();
       }
       return { ok: true, name: dirLabel, previousLabel: previousLabel || null };
     } catch (err) {
@@ -2020,8 +2021,15 @@ const LocalCache = (() => {
   /* ---------- IndexedDB側(既定のフォールバック) ---------- */
   async function get(key, board, account) {
     if (mem.has(key)) return mem.get(key);
-    const fromDir = await dirGet(key, board, account);
-    if (fromDir) { mem.set(key, fromDir); return fromDir; }
+    const verifiedRoot = await getVerifiedDir();
+    if (verifiedRoot) {
+      // 外部フォルダが有効な間は、IndexedDB側は一切見ない。もし見てしまうと、外部フォルダを
+      // 設定する前からIndexedDB側に残っていた古いキャッシュが「盾」になって、Driveへの
+      // 再取得(≒外部フォルダへの書き込み)が永久に発生しなくなる、という不具合が起きるため。
+      const fromDir = await dirGet(key, board, account);
+      if (fromDir) { mem.set(key, fromDir); return fromDir; }
+      return null;
+    }
     try {
       const os = await store(STORE, 'readonly');
       const rec = await reqToPromise(os.get(key));
