@@ -1917,7 +1917,9 @@ const LocalCache = (() => {
       // 「MiruMood Cache」フォルダを直接指定した時、MiruMood Cache/MiruMood Cacheのような
       // 入れ子ができてしまうのを防ぐ(Steamがライブラリフォルダを再認識するのと同じ考え方)。
       // 名前が一致するだけでなく、実際に自分の目印ファイルがあることまで確認してから採用する。
-      const pickedIsAlreadyOurs = picked.name === CACHE_SUBFOLDER_NAME && !!(await readMarkerId(picked));
+      const existingMarkerId = await readMarkerId(picked); // 診断用ログ: この結果を見ればどこで判定が狂っているか分かる
+      const pickedIsAlreadyOurs = picked.name === CACHE_SUBFOLDER_NAME && !!existingMarkerId;
+      console.log('[MiruMood cache diag] picked.name =', JSON.stringify(picked.name), '/ expected =', JSON.stringify(CACHE_SUBFOLDER_NAME), '/ existingMarkerId =', existingMarkerId, '/ pickedIsAlreadyOurs =', pickedIsAlreadyOurs);
       let cacheDir;
       if (pickedIsAlreadyOurs) {
         cacheDir = picked;
@@ -1934,7 +1936,11 @@ const LocalCache = (() => {
       dirHandle = cacheDir;
       dirId = id;
       verifiedHandle = cacheDir; // 今まさに確認・発行したばかりなので、このセッションでは確認済み扱いにしてよい
-      dirLabel = pickedIsAlreadyOurs ? picked.name : `${picked.name}/${CACHE_SUBFOLDER_NAME}`;
+      // ドライブ直下(例: V:\そのもの)を選んだ場合、Chromeがそのフォルダの名前を空文字として
+      // 返すことがある。その場合「/MiruMood Cache」のような中途半端な表示になってしまうため、
+      // 名前が取れない時は「MiruMood Cache」単体の表示にする。
+      const pickedLabel = picked.name || null;
+      dirLabel = pickedIsAlreadyOurs ? picked.name : (pickedLabel ? `${pickedLabel}/${CACHE_SUBFOLDER_NAME}` : CACHE_SUBFOLDER_NAME);
       try {
         const os = await store(META, 'readwrite');
         const req1 = os.put(cacheDir, DIR_KEY); req1.onerror = () => {};
