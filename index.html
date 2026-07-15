@@ -26,13 +26,13 @@
   #driveState.dirty{color:var(--accent)}
   #cacheState{padding:5px 6px;font-size:11px;color:var(--dim);white-space:nowrap;align-self:center;cursor:pointer}
   #cacheState:hover{color:var(--text)}
-  #menu{position:fixed;display:none;min-width:180px;padding:4px;z-index:30;
+  #menu, .submenu{position:fixed;display:none;min-width:180px;padding:4px;z-index:30;
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:8px}
-  #menu button{all:unset;display:flex;justify-content:space-between;gap:16px;cursor:pointer;
+  #menu button, .submenu button{all:unset;display:flex;justify-content:space-between;gap:16px;cursor:pointer;
     width:calc(100% - 18px);padding:5px 9px;border-radius:5px;font-size:12px}
-  #menu button:hover{background:#ffffff14}
-  #menu button .k{color:var(--dim);font-family:ui-monospace,monospace;font-size:11px}
-  #menu hr{border:none;border-top:1px solid var(--line);margin:4px 2px}
+  #menu button:hover, .submenu button:hover{background:#ffffff14}
+  #menu button .k, .submenu button .k{color:var(--dim);font-family:ui-monospace,monospace;font-size:11px}
+  #menu hr, .submenu hr{border:none;border-top:1px solid var(--line);margin:4px 2px}
   #help{position:fixed;inset:0;display:none;place-items:center;background:#000a;z-index:40}
   #help .box{background:#1d1f24;border:1px solid var(--line);border-radius:12px;padding:24px 28px;max-height:80vh;overflow:auto;min-width:440px}
   #help h2{margin:0 0 4px;font-size:15px;color:var(--accent);font-weight:600}
@@ -127,11 +127,10 @@
     <tr><td>Right-click (2+ selected)</td><td>Match width / Match height — resize to the average, aspect ratio kept</td></tr>
     <tr><td>Right-click (note selected)</td><td>Bold / Font size — quick text styling</td></tr>
     <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>Undo / Redo</td></tr>
-    <tr><td>Ctrl+S / Ctrl+O</td><td>Save / open board (.mrmd — bundles images, supports lazy loading)</td></tr>
+    <tr><td>Ctrl+S / Ctrl+O</td><td>Save to / open from local file (.mrmd — bundles images, supports lazy loading)</td></tr>
     <tr><td class="grp" colspan="2">Google Drive</td></tr>
     <tr><td>Sign in</td><td>Connect your Google account / click again to sign out</td></tr>
     <tr><td>Save to Drive / Open from Drive</td><td>Save the board to Google Drive / open one from Drive</td></tr>
-    <tr><td>Open Drive folder</td><td>Open a plain Drive folder of images directly as a new board (no board.json needed)</td></tr>
     <tr><td>Show in Drive</td><td>Open this board's Drive folder in a new tab (only if it's saved to Drive)</td></tr>
     <tr><td>Toolbar status</td><td>Shows "board name ✓ saved" or "● unsaved changes"</td></tr>
   </table>
@@ -2169,6 +2168,7 @@ async function chooseCacheFolder() {
 // 今開いているボードのローカルキャッシュだけを消す(外部フォルダならそのボード専用サブフォルダごと、
 // ブラウザ保存ならタグの一致する分だけ)。Driveの複製が無くなるだけなので、次に開けば再取得されるだけで実害はない。
 async function clearCurrentBoardCache() {
+  if (!confirm(`Clear the local cache for "${currentBoardName}"?\nImages will simply be re-downloaded from Drive next time this board is opened.`)) return;
   await LocalCache.clearBoardCache(currentBoardName, driveUserEmail);
   toast(`Cleared local cache for "${currentBoardName}"`);
   updateCacheState();
@@ -2798,7 +2798,32 @@ document.getElementById('ntbSizeDown').addEventListener('click', () => {
 });
 
 const menu = document.getElementById('menu');
-function hideMenu() { menu.style.display = 'none'; }
+let submenuEl = null;
+function closeSubmenu() { if (submenuEl) { submenuEl.remove(); submenuEl = null; } }
+function hideMenu() { menu.style.display = 'none'; closeSubmenu(); }
+// 横に出るカスケード式サブメニュー。呼び出し元の項目(anchorBtn)の右側に出す。
+// 画面右端に収まらなければ左側に、下端に収まらなければ上へ詰めて表示する。
+function openSubmenu(anchorBtn, childRows) {
+  closeSubmenu();
+  const sub = document.createElement('div');
+  sub.className = 'submenu';
+  for (const cr of childRows) {
+    if (!cr) { sub.appendChild(document.createElement('hr')); continue; }
+    const b = document.createElement('button');
+    b.innerHTML = `<span>${cr[0]}</span><span class="k">${cr[1]}</span>`;
+    b.onclick = (e) => { e.stopPropagation(); hideMenu(); cr[2](); };
+    sub.appendChild(b);
+  }
+  document.body.appendChild(sub);
+  sub.style.display = 'block';
+  const r = anchorBtn.getBoundingClientRect();
+  let left = r.right - 2;
+  if (left + sub.offsetWidth > innerWidth - 8) left = Math.max(8, r.left - sub.offsetWidth + 2);
+  let top = Math.min(r.top, innerHeight - sub.offsetHeight - 8);
+  sub.style.left = left + 'px';
+  sub.style.top = top + 'px';
+  submenuEl = sub;
+}
 function openMenu(px, py) {
   const wx = s2wX(px), wy = s2wY(py);
   const hit = itemAt(wx, wy);
@@ -2832,7 +2857,7 @@ function openMenu(px, py) {
     ['Add note', 'N', () => addNote(wx, wy)],
     ['Paste', 'Ctrl+V', () => toast('Paste with Ctrl+V')],
     [`Toggle grid (${['off', 'on', 'snap'][gridMode]})`, 'S', cycleGrid],
-    [`Canvas color (${(CANVAS_PRESETS.find(p => p.bg === currentCanvasBg) || {}).name || '?'})`, '', cycleCanvasBg],
+    ['Canvas color', '', CANVAS_PRESETS.map(p => [`${p.bg === currentCanvasBg ? '✓ ' : ''}${p.name}`, '', () => { setCanvasBg(p.bg); toast('Canvas: ' + p.name); }])],
     [`JPG optimization (${!jpegOptimize ? 'Off' : (keepOriginalOnOptimize ? 'On+PNG' : 'On')})`, '', cycleJpegOptimize],
     ['Fit all', 'F', fitAll],
     null,
@@ -2843,26 +2868,33 @@ function openMenu(px, py) {
     ['Save to Drive as…', '', () => saveBoardToDrive(true)],
     ['Open from Drive', '', openBoardFromDrive],
     ['Delete a board…', '', deleteBoardFromDrive],
-    ['Open Drive folder…', '', openDriveFolder],
     ['Show this board in Drive', '', revealDriveFolder],
     null,
     ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
     [`Cache all images in "${currentBoardName}"`, '', cacheAllBoardImages],
     [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
     null,
-    ['Save board', 'Ctrl+S', saveBoard],
-    ['Open board…', 'Ctrl+O', () => fJson.click()],
+    ['Save to local file', 'Ctrl+S', saveBoard],
+    ['Open from local file…', 'Ctrl+O', () => fJson.click()],
     ['Export PNG', '', exportPNG],
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
     ['Close board', '', closeBoard],
   ];
   menu.innerHTML = '';
+  closeSubmenu();
   for (const r of rows) {
     if (!r) { menu.appendChild(document.createElement('hr')); continue; }
     const b = document.createElement('button');
-    b.innerHTML = `<span>${r[0]}</span><span class="k">${r[1]}</span>`;
-    b.onclick = () => { hideMenu(); r[2](); };
+    const isSubmenu = Array.isArray(r[2]);
+    b.innerHTML = `<span>${r[0]}</span><span class="k">${isSubmenu ? '▸' : r[1]}</span>`;
+    if (isSubmenu) {
+      b.onmouseenter = () => openSubmenu(b, r[2]);
+      b.onclick = (e) => { e.stopPropagation(); openSubmenu(b, r[2]); };
+    } else {
+      b.onmouseenter = () => closeSubmenu(); // 他の項目にカーソルが移ったら、開いていたサブメニューは閉じる
+      b.onclick = () => { hideMenu(); r[2](); };
+    }
     menu.appendChild(b);
   }
   menu.style.display = 'block';
