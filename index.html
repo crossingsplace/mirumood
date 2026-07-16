@@ -1935,7 +1935,7 @@ const LocalCache = (() => {
   async function setBoardNameHint(board, account, displayName) {
     try {
       const bd = await boardDirHandle(account, board, true);
-      if (!bd) return;
+      if (!bd) { console.warn('[MiruMood] setBoardNameHint: boardDirHandle unavailable (verification failed or no external folder configured)', board); return; }
       const newFileName = `${sanitizeFolderName(displayName)}.txt`;
 
       let oldFileName = null;
@@ -1956,7 +1956,8 @@ const LocalCache = (() => {
       const pw = await pfh2.createWritable();
       await pw.write(newFileName);
       await pw.close();
-    } catch {} // 書けなくても致命的ではない(単に目印が無いだけで、キャッシュ自体は問題なく機能する)
+      console.log('[MiruMood] setBoardNameHint: wrote', newFileName, 'for board', board);
+    } catch (err) { console.warn('[MiruMood] setBoardNameHint threw', board, err); } // 書けなくても致命的ではない(単に目印が無いだけで、キャッシュ自体は問題なく機能する)
   }
 
   async function dirGet(key, board, account) {
