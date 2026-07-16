@@ -1932,6 +1932,7 @@ const LocalCache = (() => {
   // 使ったかを小さな固定名のポインタファイルに記録しておき、古い名前のファイルだけを正確に
   // (推測や全消しではなく)片付ける。実データ(画像)には一切触れない、軽い操作。
   const HINT_POINTER_FILE = '.mirumood-hint-name';
+  const LEGACY_HINT_FILE = 'board-name.txt'; // 旧バージョン(ファイル名を動的にする前)が使っていた固定名。素性が確実に分かっているので、見つけたら片付ける。
   async function setBoardNameHint(board, account, displayName) {
     try {
       const bd = await boardDirHandle(account, board, true);
@@ -1945,6 +1946,9 @@ const LocalCache = (() => {
       } catch {}
       if (oldFileName && oldFileName !== newFileName) {
         await bd.removeEntry(oldFileName).catch(() => {}); // 前回使っていた名前のファイルだけを正確に消す
+      }
+      if (LEGACY_HINT_FILE !== newFileName) {
+        await bd.removeEntry(LEGACY_HINT_FILE).catch(() => {}); // 存在しなければ静かに失敗するだけなので、無条件で試してよい
       }
 
       const fh = await bd.getFileHandle(newFileName, { create: true });
