@@ -42,13 +42,19 @@
   #help td:first-child{font-family:ui-monospace,monospace;color:var(--accent);white-space:nowrap;padding-right:18px}
   #help .grp{padding-top:12px;color:var(--dim);font-size:11px;letter-spacing:.08em}
   #boardPicker{position:fixed;inset:0;display:none;place-items:center;background:#000a;z-index:40}
-  #boardPicker .box{background:#1d1f24;border:1px solid var(--line);border-radius:12px;padding:24px 28px;max-height:70vh;overflow:auto;min-width:320px;max-width:480px}
+  #boardPicker .box{background:#1d1f24;border:1px solid var(--line);border-radius:12px;padding:24px 28px;max-height:70vh;overflow:auto;min-width:320px;max-width:640px}
   #boardPicker h2{margin:0 0 4px;font-size:15px;color:var(--accent);font-weight:600}
   #boardPicker p.sub{margin:0 0 14px;color:var(--dim);font-size:12px}
   #boardPickerItems{display:flex;flex-direction:column;gap:2px}
   #boardPickerItems button{all:unset;cursor:pointer;padding:8px 10px;border-radius:6px;font-size:13px;color:var(--text)}
   #boardPickerItems button:hover{background:#ffffff14}
   #boardPickerItems .empty{padding:8px 10px;color:var(--dim);font-size:12px}
+  #boardPickerItems .board-row{display:flex;align-items:center;gap:4px}
+  #boardPickerItems .board-row .board-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #boardPickerItems .board-row .board-actions{display:flex;gap:2px;flex-shrink:0}
+  #boardPickerItems .board-row .board-actions button{font-size:11px;color:var(--dim);padding:6px 8px}
+  #boardPickerItems .board-row .board-actions button:hover{color:var(--text)}
+  #boardPickerItems .board-row .board-actions button.danger:hover{color:#ff6b6b}
   #hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--dim);text-align:center;z-index:5}
   #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
   #toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;
@@ -2299,13 +2305,36 @@ async function chooseCacheFolder() {
   }
   updateCacheState();
 }
-// ボード名を変更する。既にDriveに保存済みなら、実際にDrive側のフォルダ名も変更する
-// (フォルダIDそのものは変わらないので、以後の保存・削除等は引き続き同じフォルダを指す)。
-// ローカルキャッシュはこのフォルダID自体をフォルダ名として使っているため、表示名がいくら
-// 変わってもキャッシュの場所は一切動かない。何ギガあっても、コピーはおろか、何の処理も
-// 発生しない(移す必要そのものが無い)。フォルダ名がID(意味の無い文字列)になる代わりに、
-// 中に今の表示名を書いたヒントファイル(board-name.txt)を置いておき、人間がエクスプローラー
-// で覗いても迷わないようにする。
+// ボード名を変更する共通の実処理。Drive側のフォルダ名を実際に変更し(フォルダIDそのものは
+// 変わらないので、以後の保存・削除等は引き続き同じフォルダを指す)、ローカルキャッシュ側は
+// ヒントファイルの中身だけを更新する(キャッシュの場所自体はフォルダIDのままなので、
+// 何ギガあっても移す必要は一切無い)。今開いているボードをリネームした場合は、画面上の
+// 表示(タイトル等)も合わせて更新する。成功したらtrueを返す。
+async function renameBoardById(folderId, oldName, newName) {
+  try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return false; }
+  try {
+    const rootId = await ensureRootFolder();
+    const existing = await driveFindFolder(newName, rootId);
+    if (existing && existing !== folderId) { toast(`A board named "${newName}" already exists`); return false; }
+    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${folderId}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newName })
+    });
+    if (!res.ok) throw new Error('rename failed');
+  } catch {
+    toast('Failed to rename the board on Drive');
+    return false;
+  }
+  LocalCache.setBoardNameHint(folderId, driveUserEmail, newName).catch(() => {});
+  if (currentDriveFolderId === folderId) {
+    currentBoardName = newName;
+    driveDirty = true;
+    updateDriveState();
+    updateCacheState();
+  }
+  return true;
+}
+// 今開いているボードをリネームする(右クリックメニューから)
 async function renameBoard() {
   const oldName = currentBoardName;
   const input = prompt('New name for this board', oldName);
@@ -2313,32 +2342,25 @@ async function renameBoard() {
   const newName = input.trim();
   if (!newName || newName === oldName) return;
 
-  if (currentDriveFolderId) {
-    try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
-    try {
-      const rootId = await ensureRootFolder();
-      const existing = await driveFindFolder(newName, rootId);
-      if (existing && existing !== currentDriveFolderId) { toast(`A board named "${newName}" already exists`); return; }
-      const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${currentDriveFolderId}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newName })
-      });
-      if (!res.ok) throw new Error('rename failed');
-    } catch {
-      toast('Failed to rename the board on Drive');
-      return;
-    }
+  if (!currentDriveFolderId) {
+    // まだDriveに保存していないボードは、Drive側に何も無いのでローカルの名前だけ変える
+    currentBoardName = newName;
+    driveDirty = true;
+    updateDriveState();
+    toast(`Renamed to "${newName}"`);
+    return;
   }
-
-  currentBoardName = newName;
-  driveDirty = true;
-  updateDriveState();
-
-  // ローカルキャッシュの場所自体は変わらないので、ここではヒントファイルの中身を更新するだけ。
-  if (currentDriveFolderId) LocalCache.setBoardNameHint(currentDriveFolderId, driveUserEmail, newName).catch(() => {});
-  updateCacheState();
-
-  toast(`Renamed to "${newName}"`);
+  const ok = await renameBoardById(currentDriveFolderId, oldName, newName);
+  if (ok) toast(`Renamed to "${newName}"`);
+}
+// Browse boards一覧から選んだボードをリネームする(今開いているボードとは限らない)
+async function renameBoardFromList(f) {
+  const input = prompt('New name for this board', f.name);
+  if (input === null) return;
+  const newName = input.trim();
+  if (!newName || newName === f.name) return;
+  const ok = await renameBoardById(f.id, f.name, newName);
+  if (ok) { toast(`Renamed to "${newName}"`); refreshBoardBrowser(); }
 }
 // 今開いているボードのローカルキャッシュだけを消す(外部フォルダならそのボード専用サブフォルダごと、
 // ブラウザ保存ならタグの一致する分だけ)。Driveの複製が無くなるだけなので、次に開けば再取得されるだけで実害はない。
@@ -2412,9 +2434,12 @@ async function maybeNotifyCacheThreshold() {
   toast('Local cache is getting large — right-click → "Local image cache" to choose where it\'s stored');
 }
 // 今開いているボードの画像が実際に入っているDriveフォルダを、新しいタブでそのまま開く。
+function openDriveFolderInBrowser(folderId) {
+  window.open(`https://drive.google.com/drive/folders/${folderId}`, '_blank', 'noopener');
+}
 function revealDriveFolder() {
   if (!currentDriveFolderId) { toast("This board isn't saved to Drive yet"); return; }
-  window.open(`https://drive.google.com/drive/folders/${currentDriveFolderId}`, '_blank', 'noopener');
+  openDriveFolderInBrowser(currentDriveFolderId);
 }
 async function driveGetParent(fileId) {
   const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=parents`);
@@ -2574,59 +2599,50 @@ async function saveBoardToDrive(forceNewName) {
 // MiruMoodフォルダ直下のボード一覧を取得し、自前のリストUIでワンクリックで開けるようにする。
 // (Google Pickerだとフォルダのダブルクリックが常に「中へ移動」になり、
 //  board.jsonのようなフォルダでない中身は行き止まりで見えなくなるため、Pickerを使わない)
+// Drive上のボード(MiruMoodフォルダ直下のフォルダ)一覧を取得する共通処理。
+// Browse boards、および一覧の再表示(リネーム・削除後の更新)の両方から使う。
+async function fetchBoardList() {
+  const rootId = await ensureRootFolder();
+  const q = encodeURIComponent(`'${rootId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
+  const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
+  const data = await res.json();
+  return data.files || [];
+}
+// シンプルに「開くだけ」の一覧。Browse boards(Rename/Clear cache/Deleteも出来る、より高機能な方)
+// とは別に、素早く開きたいだけの時のための、元々あった軽い経路として残してある。
 async function openBoardFromDrive() {
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
   try {
     progress('Loading boards', 0);
-    const rootId = await ensureRootFolder();
-    const q = encodeURIComponent(`'${rootId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
-    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
-    const data = await res.json();
+    const folders = await fetchBoardList();
     progressDone();
-    showBoardListModal(data.files || [], 'open');
+    showBoardListModal(folders, true);
   } catch {
     progressDone();
     toast('Failed to list boards');
   }
 }
-// 一覧から選んでゴミ箱に移動する(完全削除ではない。Drive側のゴミ箱からいつでも復元できる)。
-// 1回のダイアログでは1枚ずつ選ぶ形にしてある: 消した瞬間に一覧を再取得し直す複雑さを避けつつ、
-// 続けてもう1つ消したい場合はメニューから同じ操作をもう一度呼べば新しい一覧が出る。
-async function deleteBoardFromDrive() {
+// ボード一覧を1箇所にまとめた入り口。ここから、ボードごとにOpen/Rename/Clear cache/Deleteを選べる
+// (以前は「Delete a board…」「Clear local cache…」がそれぞれ別々の一覧を出す作りだったが、
+//  同じことをする一覧が複数あるのは紛らわしいため、こちらに統合した)。
+async function browseBoards() {
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
   try {
     progress('Loading boards', 0);
-    const rootId = await ensureRootFolder();
-    const q = encodeURIComponent(`'${rootId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
-    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
-    const data = await res.json();
+    const folders = await fetchBoardList();
     progressDone();
-    showBoardListModal(data.files || [], 'delete');
+    showBoardListModal(folders);
   } catch {
     progressDone();
     toast('Failed to list boards');
   }
 }
-// 「今開いているボード」に限らず、一覧から選んでローカルキャッシュだけを片付けられるようにする。
-// 一覧自体はDrive側のボード名を頼りに出す(ローカルキャッシュはIDで管理しているので、選んだ後は
-// f.idを使って正しいフォルダを片付ける)。
-async function clearCacheFromDrive() {
-  try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
-  if (!driveUserEmail) await fetchDriveUserInfo();
-  try {
-    progress('Loading boards', 0);
-    const rootId = await ensureRootFolder();
-    const q = encodeURIComponent(`'${rootId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
-    const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
-    const data = await res.json();
-    progressDone();
-    showBoardListModal(data.files || [], 'clear-cache');
-  } catch {
-    progressDone();
-    toast('Failed to list boards');
-  }
+// リネーム・削除の後、モーダルを閉じずに一覧だけ最新の状態に取り直して出し直す
+// (連続して複数のボードを操作したい場合に、毎回一覧を開き直さずに済むようにするため)。
+async function refreshBoardBrowser() {
+  try { showBoardListModal(await fetchBoardList()); } catch {} // 再取得に失敗しても、今の表示をそのまま残せば実害はない
 }
 // 画面を空の新規ボードとして仕切り直す(ボードを消した時・閉じた時、共通で使う)
 function resetToEmptyBoard() {
@@ -2641,9 +2657,8 @@ function closeBoard() {
   resetToEmptyBoard();
   toast('Board closed');
 }
-async function confirmDeleteBoard(f, modal) {
+async function confirmDeleteBoard(f) {
   if (!confirm(`Move "${f.name}" to Drive's trash?\nYou can restore it later from Drive's own trash if needed.`)) return;
-  modal.style.display = 'none';
   try {
     progress('Deleting board', 0);
     await driveTrashFile(f.id);
@@ -2652,37 +2667,69 @@ async function confirmDeleteBoard(f, modal) {
     progressDone();
     updateCacheState();
     toast(`Moved "${f.name}" to Drive's trash`);
+    refreshBoardBrowser(); // 一覧はモーダルを閉じずにその場で更新する(続けて他のボードも操作できるように)
   } catch {
     progressDone();
     toast('Failed to delete the board');
   }
 }
-async function confirmClearCacheFor(f, modal) {
+async function confirmClearCacheFor(f) {
   if (!confirm(`Clear the local cache for "${f.name}"?\nImages will simply be re-downloaded from Drive next time this board is opened.`)) return;
-  modal.style.display = 'none';
   await LocalCache.clearBoardCache(f.id, driveUserEmail);
   if (currentDriveFolderId === f.id) updateCacheState(); // 今開いてるボードだった場合は状態表示も更新する
   toast(`Cleared local cache for "${f.name}"`);
 }
-function showBoardListModal(folders, mode) {
-  mode = mode || 'open';
+// ボード一覧を表示する。通常(simple未指定)は、各行にボード名(クリックで開く)と、
+// Rename/Clear cache/Deleteの操作ボタンをまとめて持つ(Browse boards用)。
+// simple=trueの時は、ボード名をクリックして開くだけのシンプルな一覧にする
+// (Open from Drive用。素早く開きたいだけの時のための、元々あった軽い経路)。
+function showBoardListModal(folders, simple) {
   const modal = document.getElementById('boardPicker');
   const list = document.getElementById('boardPickerItems');
   const h2 = modal.querySelector('h2'), sub = modal.querySelector('p.sub');
-  if (mode === 'delete') { h2.textContent = 'Delete a board'; sub.textContent = "Click a board to move it to Drive's trash"; }
-  else if (mode === 'clear-cache') { h2.textContent = 'Clear local cache'; sub.textContent = 'Click a board to clear its local cache on this device'; }
-  else { h2.textContent = 'Open a board'; sub.textContent = 'Click a board to open it'; }
+  if (simple) { h2.textContent = 'Open a board'; sub.textContent = 'Click a board to open it'; }
+  else { h2.textContent = 'Browse boards'; sub.textContent = 'Click a board to open it, or use the buttons to rename, clear its cache, or delete it'; }
   list.innerHTML = '';
   if (!folders.length) {
     list.innerHTML = '<div class="empty">No boards saved to Drive yet</div>';
-  } else {
+  } else if (simple) {
     for (const f of folders) {
       const b = document.createElement('button');
       b.textContent = f.name;
-      b.onclick = mode === 'delete' ? () => confirmDeleteBoard(f, modal)
-        : mode === 'clear-cache' ? () => confirmClearCacheFor(f, modal)
-        : () => { modal.style.display = 'none'; openDriveFolderById(f.id, f.name); };
+      b.onclick = () => { modal.style.display = 'none'; openDriveFolderById(f.id, f.name); };
       list.appendChild(b);
+    }
+  } else {
+    for (const f of folders) {
+      const row = document.createElement('div');
+      row.className = 'board-row';
+
+      const nameBtn = document.createElement('button');
+      nameBtn.className = 'board-name';
+      nameBtn.textContent = f.name;
+      nameBtn.title = 'Open this board';
+      nameBtn.onclick = () => { modal.style.display = 'none'; openDriveFolderById(f.id, f.name); };
+      row.appendChild(nameBtn);
+
+      const actions = document.createElement('div');
+      actions.className = 'board-actions';
+      const renameBtn = document.createElement('button');
+      renameBtn.textContent = 'Rename';
+      renameBtn.onclick = (e) => { e.stopPropagation(); renameBoardFromList(f); };
+      const showInDriveBtn = document.createElement('button');
+      showInDriveBtn.textContent = 'Show in Drive';
+      showInDriveBtn.onclick = (e) => { e.stopPropagation(); openDriveFolderInBrowser(f.id); };
+      const cacheBtn = document.createElement('button');
+      cacheBtn.textContent = 'Clear cache';
+      cacheBtn.onclick = (e) => { e.stopPropagation(); confirmClearCacheFor(f); };
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'danger';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.onclick = (e) => { e.stopPropagation(); confirmDeleteBoard(f); };
+      actions.append(renameBtn, showInDriveBtn, cacheBtn, deleteBtn);
+      row.appendChild(actions);
+
+      list.appendChild(row);
     }
   }
   modal.style.display = 'grid';
@@ -3006,7 +3053,7 @@ document.getElementById('bar').addEventListener('click', e => {
   ({ open: () => fImg.click(), note: () => addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)),
      grid: cycleGrid, canvasbg: cycleCanvasBg, jpeg: cycleJpegOptimize, arrange, fit: fitAll, save: saveBoard,
      load: () => fJson.click(), png: exportPNG,
-     'drive-save': saveBoardToDrive, 'drive-open': openBoardFromDrive, 'drive-folder': openDriveFolder, 'drive-reveal': revealDriveFolder, 'cache-folder': chooseCacheFolder,
+     'drive-save': saveBoardToDrive, 'drive-open': browseBoards, 'drive-folder': openDriveFolder, 'drive-reveal': revealDriveFolder, 'cache-folder': chooseCacheFolder,
      help: () => helpBox.style.display = 'grid' })[act]();
 });
 helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
@@ -3085,7 +3132,6 @@ function openMenu(px, py) {
     ['Paste', 'Ctrl+V', () => toast('Paste with Ctrl+V')],
     [`Toggle grid (${['off', 'on', 'snap'][gridMode]})`, 'S', cycleGrid],
     ['Canvas color', '', CANVAS_PRESETS.map(p => [`${p.bg === currentCanvasBg ? '✓ ' : ''}${p.name}`, '', () => { setCanvasBg(p.bg); toast('Canvas: ' + p.name); }])],
-    [`JPG optimization (${!jpegOptimize ? 'Off' : (keepOriginalOnOptimize ? 'On+PNG' : 'On')})`, '', cycleJpegOptimize],
     ['Fit all', 'F', fitAll],
     null,
     ...(gisReady
@@ -3100,16 +3146,14 @@ function openMenu(px, py) {
       ['Open from Drive', '', openBoardFromDrive],
       ['Open from local file…', 'Ctrl+O', () => fJson.click()],
     ]],
-    ['Delete a board…', '', deleteBoardFromDrive],
-    ['Rename board…', '', renameBoard],
-    ['Show this board in Drive', '', revealDriveFolder],
+    ['Browse boards…', '', browseBoards],
     null,
     [`Cache (${LocalCache.dirSupported() ? (LocalCache.folderLabel() || 'browser storage') : 'browser storage'})`, '', [
       ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
       [`Cache all images in "${currentBoardName}"`, '', cacheAllBoardImages],
       [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
-      ['Clear local cache…', '', clearCacheFromDrive],
     ]],
+    [`JPG optimization (${!jpegOptimize ? 'Off' : (keepOriginalOnOptimize ? 'On+PNG' : 'On')})`, '', cycleJpegOptimize],
     ['Export PNG', '', exportPNG],
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
