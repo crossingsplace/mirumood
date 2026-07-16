@@ -49,12 +49,15 @@
   #boardPickerItems button{all:unset;cursor:pointer;padding:8px 10px;border-radius:6px;font-size:13px;color:var(--text)}
   #boardPickerItems button:hover{background:#ffffff14}
   #boardPickerItems .empty{padding:8px 10px;color:var(--dim);font-size:12px}
+  #boardPickerItems .board-entry{border-radius:6px;padding-bottom:2px}
+  #boardPickerItems .board-entry:hover{background:#ffffff0a}
   #boardPickerItems .board-row{display:flex;align-items:center;gap:4px}
   #boardPickerItems .board-row .board-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #boardPickerItems .board-row .board-actions{display:flex;gap:2px;flex-shrink:0}
   #boardPickerItems .board-row .board-actions button{font-size:11px;color:var(--dim);padding:6px 8px}
   #boardPickerItems .board-row .board-actions button:hover{color:var(--text)}
   #boardPickerItems .board-row .board-actions button.danger:hover{color:#ff6b6b}
+  #boardPickerItems .board-meta{padding:0 10px 6px;font-size:11px;color:var(--dim)}
   #hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--dim);text-align:center;z-index:5}
   #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
   #toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;
@@ -2186,6 +2189,40 @@ const LocalCache = (() => {
     } catch {} // 保存に失敗しても致命的ではない(次回また普通にDriveから取ってくるだけ)
   }
 
+  // 指定アカウントについて、ローカルに何かキャッシュされているボードID(=Driveのフォルダ ID)の
+  // 一覧をまとめて返す。Browse boardsの一覧で「このボードはキャッシュ済みか」を表示する時に、
+  // ボードの数だけ何度も確認しに行かずに済むよう、1回の走査でまとめて調べる。
+  async function getCachedBoardIds(account) {
+    const acc = sanitizeFolderName(account || UNKNOWN_ACCOUNT);
+    const root = await getVerifiedDir();
+    if (root) {
+      try {
+        const accDir = await root.getDirectoryHandle(acc, { create: false }).catch(() => null);
+        if (!accDir) return new Set();
+        const ids = new Set();
+        for await (const [name, handle] of accDir.entries()) {
+          if (handle.kind === 'directory') ids.add(name); // 各サブフォルダ名がそのままボードID
+        }
+        return ids;
+      } catch { return new Set(); }
+    }
+    try {
+      const os = await store(STORE, 'readonly');
+      const ids = new Set();
+      await new Promise((resolve, reject) => {
+        const cur = os.openCursor();
+        cur.onsuccess = () => {
+          const c = cur.result;
+          if (!c) { resolve(); return; }
+          if ((c.value.account || UNKNOWN_ACCOUNT) === acc) ids.add(c.value.board || UNSORTED_BOARD);
+          c.continue();
+        };
+        cur.onerror = () => reject(cur.error);
+      });
+      return ids;
+    } catch { return new Set(); }
+  }
+
   // 特定のアカウントの、特定のボードのキャッシュだけを消す(外部フォルダならそのサブフォルダごと、
   // IndexedDBならタグの一致するレコードだけ)。消してもDriveの複製が無くなるだけなので実害はない。
   async function clearBoardCache(board, account) {
@@ -2253,7 +2290,7 @@ const LocalCache = (() => {
 
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} // 追い出されにくくする(結果は問わないベストエフォート)
 
-  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache, setBoardNameHint };
+  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache, setBoardNameHint, getCachedBoardIds };
 })();
 /* ==================== /LOCAL-CACHE ==================== */
 
@@ -2581,6 +2618,15 @@ async function saveBoardToDrive(forceNewName) {
       if (done % 5 === 0 || done === used.length) await writeManifestCheckpoint(folderId, used, embeds);
     }
     driveDirty = false;
+    // JPG最適化の状態を、フォルダ自体のプロパティとして書いておく。こうしておくと、
+    // Browse boardsの一覧を出す時に、board.jsonを1つずつ取りに行かなくても、
+    // フォルダ一覧を取得する1回の問い合わせだけでまとめて分かるようになる。
+    try {
+      await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${folderId}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appProperties: { jpegOptimize: jpegOptimize ? '1' : '0' } })
+      });
+    } catch {} // 書けなくても致命的ではない(一覧側でこの表示だけ「不明」扱いになるだけ)
     progressDone();
     updateStatus();
     toast(`Saved "${currentBoardName}" to Drive`);
@@ -2604,7 +2650,7 @@ async function saveBoardToDrive(forceNewName) {
 async function fetchBoardList() {
   const rootId = await ensureRootFolder();
   const q = encodeURIComponent(`'${rootId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`);
-  const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&orderBy=name&pageSize=1000`);
+  const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,appProperties)&orderBy=name&pageSize=1000`);
   const data = await res.json();
   return data.files || [];
 }
@@ -2631,9 +2677,9 @@ async function browseBoards() {
   if (!driveUserEmail) await fetchDriveUserInfo();
   try {
     progress('Loading boards', 0);
-    const folders = await fetchBoardList();
+    const [folders, cachedIds] = await Promise.all([fetchBoardList(), LocalCache.getCachedBoardIds(driveUserEmail)]);
     progressDone();
-    showBoardListModal(folders);
+    showBoardListModal(folders, false, cachedIds);
   } catch {
     progressDone();
     toast('Failed to list boards');
@@ -2642,7 +2688,10 @@ async function browseBoards() {
 // リネーム・削除の後、モーダルを閉じずに一覧だけ最新の状態に取り直して出し直す
 // (連続して複数のボードを操作したい場合に、毎回一覧を開き直さずに済むようにするため)。
 async function refreshBoardBrowser() {
-  try { showBoardListModal(await fetchBoardList()); } catch {} // 再取得に失敗しても、今の表示をそのまま残せば実害はない
+  try {
+    const [folders, cachedIds] = await Promise.all([fetchBoardList(), LocalCache.getCachedBoardIds(driveUserEmail)]);
+    showBoardListModal(folders, false, cachedIds);
+  } catch {} // 再取得に失敗しても、今の表示をそのまま残せば実害はない
 }
 // 画面を空の新規ボードとして仕切り直す(ボードを消した時・閉じた時、共通で使う)
 function resetToEmptyBoard() {
@@ -2683,7 +2732,7 @@ async function confirmClearCacheFor(f) {
 // Rename/Clear cache/Deleteの操作ボタンをまとめて持つ(Browse boards用)。
 // simple=trueの時は、ボード名をクリックして開くだけのシンプルな一覧にする
 // (Open from Drive用。素早く開きたいだけの時のための、元々あった軽い経路)。
-function showBoardListModal(folders, simple) {
+function showBoardListModal(folders, simple, cachedIds) {
   const modal = document.getElementById('boardPicker');
   const list = document.getElementById('boardPickerItems');
   const h2 = modal.querySelector('h2'), sub = modal.querySelector('p.sub');
@@ -2701,6 +2750,9 @@ function showBoardListModal(folders, simple) {
     }
   } else {
     for (const f of folders) {
+      const entry = document.createElement('div');
+      entry.className = 'board-entry';
+
       const row = document.createElement('div');
       row.className = 'board-row';
 
@@ -2728,8 +2780,21 @@ function showBoardListModal(folders, simple) {
       deleteBtn.onclick = (e) => { e.stopPropagation(); confirmDeleteBoard(f); };
       actions.append(renameBtn, showInDriveBtn, cacheBtn, deleteBtn);
       row.appendChild(actions);
+      entry.appendChild(row);
 
-      list.appendChild(row);
+      // このボードが、今この端末にローカルキャッシュされているか(cachedIds、こちらの端末の
+      // 情報のみを見るので即座に分かる)、JPG最適化が有効かどうか(フォルダのプロパティとして
+      // 保存してあるので、board.jsonを個別に取りに行かなくてもこの一覧取得だけで分かる)を
+      // 小さく添えておく。古い/一度も保存されていないボードはJPGの状態が分からないため「—」にする。
+      const meta = document.createElement('div');
+      meta.className = 'board-meta';
+      const cached = cachedIds && cachedIds.has(f.id);
+      const jpgProp = f.appProperties && f.appProperties.jpegOptimize;
+      const jpgLabel = jpgProp === '1' ? 'JPG optimization: On' : jpgProp === '0' ? 'JPG optimization: Off' : 'JPG optimization: —';
+      meta.textContent = `${cached ? 'Cached on this device' : 'Not cached on this device'} · ${jpgLabel}`;
+      entry.appendChild(meta);
+
+      list.appendChild(entry);
     }
   }
   modal.style.display = 'grid';
