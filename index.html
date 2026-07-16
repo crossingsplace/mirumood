@@ -363,13 +363,10 @@ function getOriginalBlob(imgId, rec) {
 }
 
 async function decodeLod(imgId, lod) {
-  console.log('[MiruMood trace] decodeLod start', imgId, lod);
   const rec = store.get(imgId);
   if (!rec) return null;
   if (lod === LOD_THUMB && rec.thumb) return createImageBitmap(await getBlob(rec.thumb));
-  console.log('[MiruMood trace] fetching original', imgId, lod);
   const blob = await getOriginalBlob(imgId, rec);
-  console.log('[MiruMood trace] got original', imgId, lod, blob && blob.size);
   // サムネイルが無い画像は、原本をダウンロードできたこの機会に、その場で軽量なサムネイルを
   // 作ってrec.thumbに覚えておく。こうしておかないと、縮小表示を求められるたびに毎回
   // フル解像度の原本を丸ごと落とし直すことになり、重くなる・失敗しやすくなる原因になっていた。
@@ -1781,14 +1778,30 @@ const LocalCache = (() => {
     if (dbPromise) return dbPromise;
     dbPromise = new Promise((resolve, reject) => {
       if (typeof indexedDB === 'undefined') { reject(new Error('no indexedDB')); return; }
+      let settled = false;
+      const finish = (fn, val) => { if (settled) return; settled = true; clearTimeout(timer); fn(val); };
+      // 他のタブが古いバージョンのままこちらをブロックしてくる場合(例えば、更新前の古い
+      // コードのまま開きっぱなしのタブ)、何もしなければここで永久に固まってしまう。
+      // 一定時間で諦めて、ブラウザ保存無しの状態ででも動けるようにする
+      // (真っ白のまま固まり続けるよりずっとまし)。
+      const timer = setTimeout(() => finish(reject, new Error('IndexedDB blocked by another tab')), 8000);
       const req = indexedDB.open(DB_NAME, 2); // v1->v2: dirindexストア追加(既存ユーザーもupgradeneededで作成される)
       req.onupgradeneeded = () => {
         if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE);
         if (!req.result.objectStoreNames.contains(META)) req.result.createObjectStore(META);
         if (!req.result.objectStoreNames.contains(DIRIDX)) req.result.createObjectStore(DIRIDX);
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onblocked = () => console.warn('[MiruMood] IndexedDB open blocked by another tab — close other MiruMood tabs to resolve');
+      req.onsuccess = () => {
+        const db = req.result;
+        // 逆に、こちらが接続を握ったままだと、後から開かれた別のタブが新しいバージョンを
+        // 要求してきた時に、今度はそちらを永久にブロックしてしまう。良い作法として、
+        // こちらから自発的に閉じてあげる(次にこのタブで使う時は、openDb()をもう一度
+        // 呼べば自然に再接続される)。
+        db.onversionchange = () => { db.close(); dbPromise = null; };
+        finish(resolve, db);
+      };
+      req.onerror = () => finish(reject, req.error);
     });
     return dbPromise;
   }
@@ -1847,25 +1860,17 @@ const LocalCache = (() => {
   async function verifyDirOwnership(handle, expectedId) {
     if (!handle || handle.name !== CACHE_SUBFOLDER_NAME || !expectedId) return false;
     try {
-      console.log('[MiruMood trace] queryPermission start');
-      const perm = await handle.queryPermission({ mode: 'readwrite' });
-      console.log('[MiruMood trace] queryPermission done', perm);
-      if (perm !== 'granted') return false;
-      console.log('[MiruMood trace] getFileHandle(marker) start');
+      if (await handle.queryPermission({ mode: 'readwrite' }) !== 'granted') return false;
       const fh = await handle.getFileHandle(MARKER_FILE, { create: false });
-      console.log('[MiruMood trace] getFileHandle(marker) done');
       const data = JSON.parse(await (await fh.getFile()).text());
-      console.log('[MiruMood trace] marker read done', data && data.id);
       return !!(data && data.app === 'MiruMood' && data.id === expectedId);
-    } catch (err) { console.log('[MiruMood trace] verifyDirOwnership threw', err); return false; }
+    } catch { return false; }
   }
   let verifiedHandle = null; // 直近に確認が取れたdirHandleのインスタンス。同じなら毎回ファイルを読み直さない(高速化)。
   async function getVerifiedDir() { // 「現在の」dirHandleに対する、キャッシュ付きの確認
     if (!dirHandle) return null;
     if (verifiedHandle === dirHandle) return dirHandle; // 今回のセッションで既に確認済み
-    console.log('[MiruMood trace] getVerifiedDir: not yet verified this session, checking now');
     const ok = await verifyDirOwnership(dirHandle, dirId);
-    console.log('[MiruMood trace] getVerifiedDir: verify result', ok);
     if (!ok) return null;
     verifiedHandle = dirHandle;
     return dirHandle;
@@ -2135,15 +2140,12 @@ const LocalCache = (() => {
   /* ---------- IndexedDB側(既定のフォールバック) ---------- */
   async function get(key, board, account) {
     if (mem.has(key)) return mem.get(key);
-    console.log('[MiruMood trace] get(): calling getVerifiedDir for', key);
     const verifiedRoot = await getVerifiedDir();
-    console.log('[MiruMood trace] get(): getVerifiedDir returned for', key, !!verifiedRoot);
     if (verifiedRoot) {
       // 外部フォルダが有効な間は、IndexedDB側は一切見ない。もし見てしまうと、外部フォルダを
       // 設定する前からIndexedDB側に残っていた古いキャッシュが「盾」になって、Driveへの
       // 再取得(≒外部フォルダへの書き込み)が永久に発生しなくなる、という不具合が起きるため。
       const fromDir = await dirGet(key, board, account);
-      console.log('[MiruMood trace] get(): dirGet returned for', key, !!fromDir);
       if (fromDir) { mem.set(key, fromDir); return fromDir; }
       return null;
     }
@@ -2257,14 +2259,10 @@ async function driveDownloadBlob(fileId, opts) {
   const account = opts && opts.account; // アカウントごとにキャッシュを分けるためのタグ(未指定なら「Unknown Account」扱い)
   const onBytes = opts && opts.onBytes; // (受信済みバイト数, 合計バイト数|null) => void。指定時のみストリーム読みして本物の進捗を出す。
   if (!noCache) {
-    console.log('[MiruMood trace] checking cache for', fileId);
     const cached = await LocalCache.get(fileId, board, account);
-    console.log('[MiruMood trace] cache check done for', fileId, 'hit:', !!cached);
     if (cached) { if (onBytes) onBytes(cached.size, cached.size); return cached; } // 既にキャッシュ済みなら即100%として報告する
   }
-  console.log('[MiruMood trace] fetching from Drive', fileId);
   const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
-  console.log('[MiruMood trace] fetch responded', fileId, res.status);
   if (!res.ok) throw new Error('download failed');
   let blob;
   if (onBytes && res.body) {
