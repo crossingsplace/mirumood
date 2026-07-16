@@ -1847,17 +1847,25 @@ const LocalCache = (() => {
   async function verifyDirOwnership(handle, expectedId) {
     if (!handle || handle.name !== CACHE_SUBFOLDER_NAME || !expectedId) return false;
     try {
-      if (await handle.queryPermission({ mode: 'readwrite' }) !== 'granted') return false;
+      console.log('[MiruMood trace] queryPermission start');
+      const perm = await handle.queryPermission({ mode: 'readwrite' });
+      console.log('[MiruMood trace] queryPermission done', perm);
+      if (perm !== 'granted') return false;
+      console.log('[MiruMood trace] getFileHandle(marker) start');
       const fh = await handle.getFileHandle(MARKER_FILE, { create: false });
+      console.log('[MiruMood trace] getFileHandle(marker) done');
       const data = JSON.parse(await (await fh.getFile()).text());
+      console.log('[MiruMood trace] marker read done', data && data.id);
       return !!(data && data.app === 'MiruMood' && data.id === expectedId);
-    } catch { return false; }
+    } catch (err) { console.log('[MiruMood trace] verifyDirOwnership threw', err); return false; }
   }
   let verifiedHandle = null; // 直近に確認が取れたdirHandleのインスタンス。同じなら毎回ファイルを読み直さない(高速化)。
   async function getVerifiedDir() { // 「現在の」dirHandleに対する、キャッシュ付きの確認
     if (!dirHandle) return null;
     if (verifiedHandle === dirHandle) return dirHandle; // 今回のセッションで既に確認済み
+    console.log('[MiruMood trace] getVerifiedDir: not yet verified this session, checking now');
     const ok = await verifyDirOwnership(dirHandle, dirId);
+    console.log('[MiruMood trace] getVerifiedDir: verify result', ok);
     if (!ok) return null;
     verifiedHandle = dirHandle;
     return dirHandle;
@@ -2127,12 +2135,15 @@ const LocalCache = (() => {
   /* ---------- IndexedDB側(既定のフォールバック) ---------- */
   async function get(key, board, account) {
     if (mem.has(key)) return mem.get(key);
+    console.log('[MiruMood trace] get(): calling getVerifiedDir for', key);
     const verifiedRoot = await getVerifiedDir();
+    console.log('[MiruMood trace] get(): getVerifiedDir returned for', key, !!verifiedRoot);
     if (verifiedRoot) {
       // 外部フォルダが有効な間は、IndexedDB側は一切見ない。もし見てしまうと、外部フォルダを
       // 設定する前からIndexedDB側に残っていた古いキャッシュが「盾」になって、Driveへの
       // 再取得(≒外部フォルダへの書き込み)が永久に発生しなくなる、という不具合が起きるため。
       const fromDir = await dirGet(key, board, account);
+      console.log('[MiruMood trace] get(): dirGet returned for', key, !!fromDir);
       if (fromDir) { mem.set(key, fromDir); return fromDir; }
       return null;
     }
