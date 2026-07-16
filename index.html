@@ -363,10 +363,13 @@ function getOriginalBlob(imgId, rec) {
 }
 
 async function decodeLod(imgId, lod) {
+  console.log('[MiruMood trace] decodeLod start', imgId, lod);
   const rec = store.get(imgId);
   if (!rec) return null;
   if (lod === LOD_THUMB && rec.thumb) return createImageBitmap(await getBlob(rec.thumb));
+  console.log('[MiruMood trace] fetching original', imgId, lod);
   const blob = await getOriginalBlob(imgId, rec);
+  console.log('[MiruMood trace] got original', imgId, lod, blob && blob.size);
   // サムネイルが無い画像は、原本をダウンロードできたこの機会に、その場で軽量なサムネイルを
   // 作ってrec.thumbに覚えておく。こうしておかないと、縮小表示を求められるたびに毎回
   // フル解像度の原本を丸ごと落とし直すことになり、重くなる・失敗しやすくなる原因になっていた。
@@ -2243,10 +2246,14 @@ async function driveDownloadBlob(fileId, opts) {
   const account = opts && opts.account; // アカウントごとにキャッシュを分けるためのタグ(未指定なら「Unknown Account」扱い)
   const onBytes = opts && opts.onBytes; // (受信済みバイト数, 合計バイト数|null) => void。指定時のみストリーム読みして本物の進捗を出す。
   if (!noCache) {
+    console.log('[MiruMood trace] checking cache for', fileId);
     const cached = await LocalCache.get(fileId, board, account);
+    console.log('[MiruMood trace] cache check done for', fileId, 'hit:', !!cached);
     if (cached) { if (onBytes) onBytes(cached.size, cached.size); return cached; } // 既にキャッシュ済みなら即100%として報告する
   }
+  console.log('[MiruMood trace] fetching from Drive', fileId);
   const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+  console.log('[MiruMood trace] fetch responded', fileId, res.status);
   if (!res.ok) throw new Error('download failed');
   let blob;
   if (onBytes && res.body) {
