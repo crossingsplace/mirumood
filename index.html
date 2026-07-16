@@ -2479,11 +2479,13 @@ async function cacheAllBoardImages() {
 // 一目で分かるようにするための表示(クリックでchooseCacheFolderと同じ動作、ただし権限の
 // 再確認が必要な状態の時はそちらを先に案内する)。
 let cacheNeedsReconnect = false; // updateCacheState()のたびに追従させる、直近の状態のキャッシュ
+let cacheReconnectFailed = false; // 直前の再接続の試みが失敗したかどうか。失敗していたら次のクリックはフォルダ選び直しに回す。
 async function updateCacheState() {
   const el = document.getElementById('cacheState');
-  if (!el || !LocalCache.dirSupported()) { if (el) el.textContent = ''; cacheNeedsReconnect = false; return; }
+  if (!el || !LocalCache.dirSupported()) { if (el) el.textContent = ''; cacheNeedsReconnect = false; cacheReconnectFailed = false; return; }
   const u = await LocalCache.getUsage();
   cacheNeedsReconnect = u.backend === 'dir-needs-permission';
+  if (!cacheNeedsReconnect) cacheReconnectFailed = false; // 再接続不要な状態に戻っていれば、失敗の記録もリセットする
   if (u.backend === 'dir') el.textContent = `Cache: ${u.label}`;
   else if (u.backend === 'dir-needs-permission') el.textContent = `Cache: ${u.label} (tap to reconnect)`;
   else el.textContent = `Cache: ${(u.bytes / (1024 ** 3)).toFixed(1)} GB`;
@@ -2492,14 +2494,18 @@ async function updateCacheState() {
 // Access APIの権限確認ダイアログは、直接のユーザー操作の中からでないと出せないため、
 // 途中に一つでも別の非同期処理を挟むと、ブラウザに「ユーザー操作から離れた」と判断されて
 // 失敗することがある(以前のGoogleサインインのポップアップと同じ理由)。
+// また、復元されたフォルダの参照は、ブラウザ側の判断でrequestPermission()による再確認
+// 自体がうまくいかないことがある。その場合、同じ再接続を何度も試みさせるのではなく、
+// 一度失敗したら次のクリックでは素直にフォルダ選び直し(chooseCacheFolder)に回す。
 function handleCacheStateClick() {
-  if (cacheNeedsReconnect) {
+  if (cacheNeedsReconnect && !cacheReconnectFailed) {
     LocalCache.reconnect().then(ok => {
-      if (ok) { toast('Reconnected to local cache folder'); updateCacheState(); }
-      else toast('Could not reconnect — please choose the cache folder again');
+      if (ok) { cacheReconnectFailed = false; toast('Reconnected to local cache folder'); updateCacheState(); }
+      else { cacheReconnectFailed = true; toast('Could not reconnect — click again to choose the cache folder'); }
     });
     return;
   }
+  cacheReconnectFailed = false;
   chooseCacheFolder();
 }
 const CACHE_NUDGE_THRESHOLD = 2 * 1024 * 1024 * 1024; // このサイズを超えたら一度だけ外部フォルダを勧める
