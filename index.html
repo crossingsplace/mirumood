@@ -53,6 +53,8 @@
   #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
   #toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);box-shadow:0 4px 16px #0006;opacity:0;transition:opacity .25s;pointer-events:none;z-index:50;font-size:13px}
+  #toastBar{display:none;width:220px;height:4px;margin-top:6px;border-radius:2px;background:#ffffff1a;overflow:hidden}
+  #toastBar i{display:block;height:100%;width:0%;background:var(--accent);border-radius:2px;transition:width .15s linear}
   #status{position:fixed;bottom:10px;right:12px;color:var(--dim);font-family:ui-monospace,monospace;font-size:11px;z-index:5}
   #noteToolbar{position:fixed;display:none;align-items:center;gap:2px;padding:4px;transform:translateX(-50%);
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:8px;
@@ -151,7 +153,7 @@
 
 <div id="drop">Drop to add</div>
 <textarea id="noteEdit" spellcheck="false"></textarea>
-<div id="toast"></div>
+<div id="toast"><span id="toastText"></span><div id="toastBar"><i></i></div></div>
 <div id="status"></div>
 <div id="noteToolbar">
   <button id="ntbBold" title="Bold">B</button>
@@ -296,7 +298,7 @@ async function zipOpen(file) {
  * =================================================================== */
 const store = new Map();
 let imgSeq = 1;
-const getBlob = ref => typeof ref === 'function' ? ref() : Promise.resolve(ref);
+const getBlob = (ref, onBytes) => typeof ref === 'function' ? ref(onBytes) : Promise.resolve(ref);
 
 const LOD_THUMB = 256, LOD_MID = 1024, LOD_FULL = 0;
 const bmpCache = new Map();
@@ -318,6 +320,15 @@ function bestAvailable(imgId, want) {
   return null;
 }
 
+const decodeRetryCount = new Map(); // key(imgId:lod) -> これまでの失敗回数。無限リトライで負荷をかけ続けないための上限管理。
+function scheduleDecodeRetry(imgId, lod) {
+  const key = imgId + ':' + lod;
+  const n = (decodeRetryCount.get(key) || 0) + 1;
+  if (n > 5) return; // これ以上は諦める(サインインタイムアウト等、最悪ケースの20秒待ちも複数回カバーできる回数)
+  decodeRetryCount.set(key, n);
+  const delay = Math.min(30000, 2000 * 2 ** (n - 1)); // 2s, 4s, 8s, 16s, 30s と間隔を空けながら再挑戦する
+  setTimeout(() => requestDecode(imgId, lod), delay);
+}
 function requestDecode(imgId, lod) {
   const key = imgId + ':' + lod;
   if (bmpCache.has(key) || pendingDecodes.has(key)) return;
@@ -325,12 +336,18 @@ function requestDecode(imgId, lod) {
   decodeLod(imgId, lod).then(bmp => {
     pendingDecodes.delete(key);
     if (!bmp) return;
+    decodeRetryCount.delete(key); // 成功したので、以前の失敗回数はリセットしておく
     const bytes = bmp.width * bmp.height * 4;
     bmpCache.set(key, { bmp, bytes, t: ++clock });
     cacheBytes += bytes;
     evict();
     paint(); updateStatus();
-  }).catch(() => pendingDecodes.delete(key));
+  }).catch(() => {
+    pendingDecodes.delete(key);
+    // 失敗しても諦めず、少し間隔を空けてから自動で再挑戦する。手動でズームし直さないと
+    // 画像が戻ってこない、という不具合(特にサインイン待ちが絡み時間差で失敗するケース)への対策。
+    scheduleDecodeRetry(imgId, lod);
+  });
 }
 
 async function decodeLod(imgId, lod) {
@@ -338,6 +355,18 @@ async function decodeLod(imgId, lod) {
   if (!rec) return null;
   if (lod === LOD_THUMB && rec.thumb) return createImageBitmap(await getBlob(rec.thumb));
   const blob = await getBlob(rec.original);
+  // サムネイルが無い画像は、原本をダウンロードできたこの機会に、その場で軽量なサムネイルを
+  // 作ってrec.thumbに覚えておく。こうしておかないと、縮小表示を求められるたびに毎回
+  // フル解像度の原本を丸ごと落とし直すことになり、重くなる・失敗しやすくなる原因になっていた。
+  // (Driveへの正式なサムネイル保存─次回のセッションや他のPCにも効くもの─は、
+  //  引き続き「Save to Drive」の時に行われる。ここでの生成はあくまで今回のセッション用。)
+  if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
+    try {
+      const obmp = await createImageBitmap(blob);
+      rec.thumb = await blobToThumb(obmp);
+      obmp.close();
+    } catch {} // 生成に失敗しても致命的ではない(単に次回もフル解像度から作り直すだけ)
+  }
   if (lod === LOD_FULL || Math.max(rec.w, rec.h) <= lod) return createImageBitmap(blob);
   const k = lod / Math.max(rec.w, rec.h);
   return createImageBitmap(blob, {
@@ -556,6 +585,11 @@ function drawItem(g, it, live) {
     // クロップ時は表示部分が原寸の一部なので、必要解像度を割り増しする
     const need = Math.max(it.w / (c ? c.w : 1), it.h / (c ? c.h : 1)) * view.s * dpr();
     const lod = lodForSize(need);
+    // 目標解像度がサムネイルより高い場合、それを待つ間の「つなぎ」として、まずサムネイルだけでも
+    // 並行して要求しておく。サムネイルは軽くて速いので、本命(中解像度・原寸)がまだ読み込み中でも
+    // 何かしら表示できる状態にすぐ持っていける。特に別のPCで開き直した直後など、何も手元に
+    // 無い状態から始まる時に効果が大きい(サムネイルを「使う」のではなく「経由する」設計にする)。
+    if (lod !== LOD_THUMB) requestDecode(it.imgId, LOD_THUMB);
     requestDecode(it.imgId, lod);       // 目標解像度を非同期で用意
     bmp = bestAvailable(it.imgId, lod); // 今あるベストで描く（プログレッシブ）
   }
@@ -1381,6 +1415,15 @@ function fitAll() {
   const [x0, y0, x1, y1] = boardBBox();
   fitToRect(x0, y0, x1 - x0, y1 - y0);
 }
+// ボードを開いた直後、画像の表示が遅れて見える(手動でズームすると急に出てくる)ことがあったための
+// 対策。原因は「開いた瞬間の1回だけの再評価で、一部の画像のデコード要求が漏れる」ことだと考えられる
+// (ズーム操作自体が強制的にrender()を再実行させるため、そこで初めて拾われていた)。
+// 手動ズームと同じ効果を自動で数回分与えることで、同じように解消させる。無駄が出ても
+// requestDecode自体は「既に要求済み/キャッシュ済みなら何もしない」ので、余計な負荷にはならない。
+function kickstartRendering() {
+  paint();
+  [150, 500, 1500].forEach(ms => setTimeout(paint, ms));
+}
 /* PureRefの"Normalize"に相当: 選択した複数アイテムの幅または高さを、
  * 選択範囲の平均値に揃える。各アイテム自身の縦横比とその中心位置は保つ
  * (レイアウトを崩さずサイズだけ均一にする、というPureRefと同じ考え方)。 */
@@ -1813,7 +1856,6 @@ const LocalCache = (() => {
    * さえすれば、キャッシュ本体だけでなく「何を消してよいか」の記録まで共有できる
    * (IndexedDB側だけに台帳を持たせると、ブラウザごとに孤立してしまい共有できないため)。 ----*/
   const BOARD_INDEX_FILE = '.mirumood-files-index.json'; // ボードフォルダごとに「自分が書いたファイル」の一覧を記録
-  const BOARD_NAME_HINT_FILE = 'board-name.txt'; // フォルダ名がID化される代わりに、中に表示名を残しておく人間可読の目印
   async function readBoardIndex(boardDir) {
     try {
       const fh = await boardDir.getFileHandle(BOARD_INDEX_FILE, { create: false });
@@ -1847,18 +1889,36 @@ const LocalCache = (() => {
       return await ad.getDirectoryHandle(sanitizeFolderName(board), { create });
     } catch { return null; } // create:falseで存在しない場合はここに来る(=そのボードはまだキャッシュされていない)
   }
-  // ボードフォルダ(IDで名付けられている)の中に、今の表示名を書いた小さなテキストファイルを
-  // 置いておく。フォルダ名自体はIDなので意味を持たないが、これがあれば人間がエクスプローラーで
-  // 覗いた時に「これはどのボードか」がすぐ分かる。呼ぶたびに中身を今の表示名で上書きするだけで、
-  // 実データ(画像)には一切触れない、軽い操作。
+  // ボードフォルダ(IDで名付けられている)の中に、今の表示名を「ファイル名そのもの」に埋め込んだ
+  // 小さなテキストファイルを置いておく。フォルダを開くだけで(ファイルを開かなくても)一覧に
+  // ボード名が見えるようにするため。表示名が変わるたびにファイル名も変わるので、前回どの名前を
+  // 使ったかを小さな固定名のポインタファイルに記録しておき、古い名前のファイルだけを正確に
+  // (推測や全消しではなく)片付ける。実データ(画像)には一切触れない、軽い操作。
+  const HINT_POINTER_FILE = '.mirumood-hint-name';
   async function setBoardNameHint(board, account, displayName) {
     try {
       const bd = await boardDirHandle(account, board, true);
       if (!bd) return;
-      const fh = await bd.getFileHandle(BOARD_NAME_HINT_FILE, { create: true });
+      const newFileName = `${sanitizeFolderName(displayName)}.txt`;
+
+      let oldFileName = null;
+      try {
+        const pfh = await bd.getFileHandle(HINT_POINTER_FILE, { create: false });
+        oldFileName = (await (await pfh.getFile()).text()).trim() || null;
+      } catch {}
+      if (oldFileName && oldFileName !== newFileName) {
+        await bd.removeEntry(oldFileName).catch(() => {}); // 前回使っていた名前のファイルだけを正確に消す
+      }
+
+      const fh = await bd.getFileHandle(newFileName, { create: true });
       const w = await fh.createWritable();
       await w.write(displayName || '');
       await w.close();
+
+      const pfh2 = await bd.getFileHandle(HINT_POINTER_FILE, { create: true });
+      const pw = await pfh2.createWritable();
+      await pw.write(newFileName);
+      await pw.close();
     } catch {} // 書けなくても致命的ではない(単に目印が無いだけで、キャッシュ自体は問題なく機能する)
   }
 
@@ -2169,13 +2229,32 @@ async function driveDownloadBlob(fileId, opts) {
   const noCache = opts && opts.noCache;
   const board = opts && opts.board; // ボードごとにキャッシュを分けるためのタグ(未指定なら「Unsorted」扱い)
   const account = opts && opts.account; // アカウントごとにキャッシュを分けるためのタグ(未指定なら「Unknown Account」扱い)
+  const onBytes = opts && opts.onBytes; // (受信済みバイト数, 合計バイト数|null) => void。指定時のみストリーム読みして本物の進捗を出す。
   if (!noCache) {
     const cached = await LocalCache.get(fileId, board, account);
-    if (cached) return cached;
+    if (cached) { if (onBytes) onBytes(cached.size, cached.size); return cached; } // 既にキャッシュ済みなら即100%として報告する
   }
   const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
   if (!res.ok) throw new Error('download failed');
-  const blob = await res.blob();
+  let blob;
+  if (onBytes && res.body) {
+    // Content-Lengthと、ここまで読んだバイト数を突き合わせて、本物のダウンロード進捗を出す。
+    // (合計サイズをサーバーが返さない場合はtotalがnullになるので、呼び出し側で不明表示に倒す。)
+    const total = Number(res.headers.get('content-length')) || null;
+    const reader = res.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      onBytes(received, total);
+    }
+    blob = new Blob(chunks, { type: res.headers.get('content-type') || 'application/octet-stream' });
+  } else {
+    blob = await res.blob();
+  }
   if (!noCache) LocalCache.put(fileId, blob, board, account).catch(() => {}); // 保存は非同期・失敗しても無視(表示自体はブロックしない)
   return blob;
 }
@@ -2252,13 +2331,20 @@ async function clearCurrentBoardCache() {
 async function cacheAllBoardImages() {
   const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
   if (!used.length) { toast('No images in this board'); return; }
-  let done = 0;
-  progress('Caching images', 0);
+  let imagesDone = 0;
+  const label = () => `Caching images (${Math.min(imagesDone + 1, used.length)}/${used.length})`;
+  progress(label(), 0);
   for (const id of used) {
     const rec = store.get(id);
     if (rec) {
       try {
-        await getBlob(rec.original);
+        // ダウンロード中の受信バイト数を、その場でそのまま進捗に反映する(本物のバイト単位の進捗)。
+        // 合計サイズが分からない応答だった場合はこの画像の分だけ進捗が動かないが、
+        // 完了した瞬間にimagesDoneが進むので、止まったままにはならない。
+        await getBlob(rec.original, (received, total) => {
+          const frac = total ? received / total : 0;
+          progress(label(), (imagesDone + frac) / used.length);
+        });
         if (rec.thumb) await getBlob(rec.thumb);
       } catch {
         // サインインが切れている場合、残り全部も同じ理由(タイムアウトするまで)で失敗し続けるだけ
@@ -2270,8 +2356,8 @@ async function cacheAllBoardImages() {
         }
       }
     }
-    done++;
-    progress('Caching images', done / used.length);
+    imagesDone++;
+    progress(label(), imagesDone / used.length);
   }
   progressDone();
   updateCacheState();
@@ -2634,6 +2720,7 @@ async function openDriveFolderById(folderId, folderName) {
       progressDone();
       updateDriveState();
       fitAll();
+      kickstartRendering();
       toast(`Loaded from Drive (${items.length} images)`);
       updateCacheState();
       maybeNotifyCacheThreshold();
@@ -2645,6 +2732,7 @@ async function openDriveFolderById(folderId, folderName) {
     progressDone();
     updateDriveState();
     fitAll();
+    kickstartRendering();
     toast(`Loaded ${files.length} images from Drive folder — Save to Drive to keep this layout`);
     updateCacheState();
     maybeNotifyCacheThreshold();
@@ -2666,10 +2754,10 @@ function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
       w: im.w, h: im.h, ext: im.ext,
       driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
       fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
-      original: () => driveDownloadBlob(im.driveId, { board: folderId, account: driveUserEmail }),
+      original: (onBytes) => driveDownloadBlob(im.driveId, { board: folderId, account: driveUserEmail, onBytes }),
       thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
-           : (im.thumbDriveId ? () => driveDownloadBlob(im.thumbDriveId, { board: folderId, account: driveUserEmail }) : null),
-      fullOriginal: im.fullDriveId ? () => driveDownloadBlob(im.fullDriveId, { board: folderId, account: driveUserEmail }) : null
+           : (im.thumbDriveId ? (onBytes) => driveDownloadBlob(im.thumbDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null),
+      fullOriginal: im.fullDriveId ? (onBytes) => driveDownloadBlob(im.fullDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null
     });
     const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
     if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
@@ -2706,7 +2794,7 @@ async function loadLooseImagesIntoBoard(files, folderId, folderName) {
     store.set(id, {
       w: w0, h: h0, ext,
       driveId: f.id, thumbDriveId: null, fullDriveId: null, fullExt: null,
-      original: () => driveDownloadBlob(f.id, { board: folderId, account: driveUserEmail }),
+      original: (onBytes) => driveDownloadBlob(f.id, { board: folderId, account: driveUserEmail, onBytes }),
       thumb: null // サムネイル未生成: 初回のDrive保存時に自動生成される
     });
     const k = Math.min(1, 480 / Math.max(w0, h0));
@@ -3028,22 +3116,28 @@ function keyAction(k) {
 let toastTimer = 0, progressing = false;
 function toast(msg) {
   if (progressing) return;
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.style.opacity = 1;
+  const t = document.getElementById('toast'), bar = document.getElementById('toastBar');
+  document.getElementById('toastText').textContent = msg;
+  bar.style.display = 'none'; // 通常のトーストではバーは出さない
+  t.style.opacity = 1;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.style.opacity = 0, 2200);
 }
 function progress(label, p) {
   progressing = true;
-  const t = document.getElementById('toast');
-  t.textContent = `${label}… ${Math.round(p * 100)}%`;
+  const t = document.getElementById('toast'), bar = document.getElementById('toastBar');
+  document.getElementById('toastText').textContent = `${label}… ${Math.round(p * 100)}%`;
+  bar.style.display = 'block';
+  bar.querySelector('i').style.width = `${Math.max(0, Math.min(100, p * 100))}%`;
   t.style.opacity = 1;
   clearTimeout(toastTimer);
 }
 function progressDone() {
   progressing = false;
-  const t = document.getElementById('toast');
+  const t = document.getElementById('toast'), bar = document.getElementById('toastBar');
   t.style.opacity = 0;
+  bar.style.display = 'none';
+  bar.querySelector('i').style.width = '0%'; // 次回開始時にいきなり満タンから始まって見えないようリセットしておく
 }
 
 addEventListener('resize', paint);
