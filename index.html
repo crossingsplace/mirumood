@@ -2146,6 +2146,29 @@ const LocalCache = (() => {
     if (!dirSupported()) return null; // メニュー項目自体を出さない合図
     return dirHandle ? (dirLabel || dirHandle.name) : null;
   }
+  // フォルダを覚えてはいるが、権限がまだ確認できていない(ブラウザが再確認を求めている)状態かどうか。
+  // ハード再読み込みを繰り返すと、ブラウザ側の判断でこの状態になることがある。
+  async function needsReconnect() {
+    if (!dirHandle || dirHandle.name !== CACHE_SUBFOLDER_NAME) return false;
+    if (verifiedHandle === dirHandle) return false; // 既に確認済みなら当然不要
+    try { return (await dirHandle.queryPermission({ mode: 'readwrite' })) !== 'granted'; } catch { return false; }
+  }
+  // ユーザーの直接のクリック操作から呼ばれる前提で、権限を取り直す。
+  // (File System Access APIの権限確認ダイアログは、直接のユーザー操作の中からでないと出せないため、
+  //  裏側の処理から勝手に呼んでも失敗する。ボタンのクリックハンドラ等から呼ぶこと。)
+  async function reconnect() {
+    if (!dirHandle) return false;
+    verifiedHandle = null; // 権限を取り直しに行く時点で、古い「確認済み」の記録は必ず無効化しておく。
+    // これを先にやらないと、拒否された場合に古い確認結果がキャッシュされたまま残ってしまい、
+    // 実際には使えないのに「使える」と誤判定し続けてしまう。
+    try {
+      const perm = await dirHandle.requestPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') return false;
+      const ok = await verifyDirOwnership(dirHandle, dirId);
+      if (ok) verifiedHandle = dirHandle;
+      return ok;
+    } catch { return false; }
+  }
 
   /* ---------- IndexedDB側(既定のフォールバック) ---------- */
   async function get(key, board, account) {
@@ -2285,13 +2308,14 @@ const LocalCache = (() => {
   async function getUsage() {
     const verified = await getVerifiedDir();
     if (verified) return { backend: 'dir', label: dirLabel || dirHandle.name, bytes: null };
+    if (await needsReconnect()) return { backend: 'dir-needs-permission', label: dirLabel || dirHandle.name, bytes: null };
     if (totalBytes === null) { try { await evictIfNeeded(); } catch {} } // 未計測ならこの呼び出しで一度スキャンさせる(閾値未満なら削除は起きない)
     return { backend: 'indexeddb', label: 'Browser storage', bytes: totalBytes || 0 };
   }
 
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} // 追い出されにくくする(結果は問わないベストエフォート)
 
-  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache, setBoardNameHint, getCachedBoardIds };
+  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache, setBoardNameHint, getCachedBoardIds, needsReconnect, reconnect };
 })();
 /* ==================== /LOCAL-CACHE ==================== */
 
@@ -2452,12 +2476,31 @@ async function cacheAllBoardImages() {
   toast(`Cached ${used.length} image(s) for "${currentBoardName}"`);
 }
 // 画面上部に常時「今どこにキャッシュしているか」を出す。右クリックメニューを開かなくても
-// 一目で分かるようにするための表示(クリックでchooseCacheFolderと同じ動作)。
+// 一目で分かるようにするための表示(クリックでchooseCacheFolderと同じ動作、ただし権限の
+// 再確認が必要な状態の時はそちらを先に案内する)。
+let cacheNeedsReconnect = false; // updateCacheState()のたびに追従させる、直近の状態のキャッシュ
 async function updateCacheState() {
   const el = document.getElementById('cacheState');
-  if (!el || !LocalCache.dirSupported()) { if (el) el.textContent = ''; return; } // 未対応ブラウザでは何も出さない
+  if (!el || !LocalCache.dirSupported()) { if (el) el.textContent = ''; cacheNeedsReconnect = false; return; }
   const u = await LocalCache.getUsage();
-  el.textContent = u.backend === 'dir' ? `Cache: ${u.label}` : `Cache: ${(u.bytes / (1024 ** 3)).toFixed(1)} GB`;
+  cacheNeedsReconnect = u.backend === 'dir-needs-permission';
+  if (u.backend === 'dir') el.textContent = `Cache: ${u.label}`;
+  else if (u.backend === 'dir-needs-permission') el.textContent = `Cache: ${u.label} (tap to reconnect)`;
+  else el.textContent = `Cache: ${(u.bytes / (1024 ** 3)).toFixed(1)} GB`;
+}
+// クリックした瞬間(=ユーザー操作の直後)に、間に他のawaitを挟まず直接呼ぶこと。File System
+// Access APIの権限確認ダイアログは、直接のユーザー操作の中からでないと出せないため、
+// 途中に一つでも別の非同期処理を挟むと、ブラウザに「ユーザー操作から離れた」と判断されて
+// 失敗することがある(以前のGoogleサインインのポップアップと同じ理由)。
+function handleCacheStateClick() {
+  if (cacheNeedsReconnect) {
+    LocalCache.reconnect().then(ok => {
+      if (ok) { toast('Reconnected to local cache folder'); updateCacheState(); }
+      else toast('Could not reconnect — please choose the cache folder again');
+    });
+    return;
+  }
+  chooseCacheFolder();
 }
 const CACHE_NUDGE_THRESHOLD = 2 * 1024 * 1024 * 1024; // このサイズを超えたら一度だけ外部フォルダを勧める
 const CACHE_NUDGE_KEY = 'mirumood-cache-nudge-shown';
@@ -3119,7 +3162,7 @@ document.getElementById('bar').addEventListener('click', e => {
   ({ open: () => fImg.click(), note: () => addNote(s2wX(innerWidth / 2), s2wY(innerHeight / 2)),
      grid: cycleGrid, canvasbg: cycleCanvasBg, jpeg: cycleJpegOptimize, arrange, fit: fitAll, save: saveBoard,
      load: () => fJson.click(), png: exportPNG,
-     'drive-save': saveBoardToDrive, 'drive-open': browseBoards, 'drive-folder': openDriveFolder, 'drive-reveal': revealDriveFolder, 'cache-folder': chooseCacheFolder,
+     'drive-save': saveBoardToDrive, 'drive-open': browseBoards, 'drive-folder': openDriveFolder, 'drive-reveal': revealDriveFolder, 'cache-folder': handleCacheStateClick,
      help: () => helpBox.style.display = 'grid' })[act]();
 });
 helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
@@ -3214,8 +3257,8 @@ function openMenu(px, py) {
     ]],
     ['Browse boards…', '', browseBoards],
     null,
-    [`Cache (${LocalCache.dirSupported() ? (LocalCache.folderLabel() || 'browser storage') : 'browser storage'})`, '', [
-      ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'})`, '', chooseCacheFolder]] : []),
+    [`Cache (${LocalCache.dirSupported() ? (LocalCache.folderLabel() || 'browser storage') : 'browser storage'}${cacheNeedsReconnect ? ' — tap to reconnect' : ''})`, '', [
+      ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'}${cacheNeedsReconnect ? ' — tap to reconnect' : ''})`, '', handleCacheStateClick]] : []),
       [`Cache all images in "${currentBoardName}"`, '', cacheAllBoardImages],
       [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
     ]],
