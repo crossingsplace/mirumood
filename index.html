@@ -637,7 +637,10 @@ function render() {
   const d = dpr(), W = cv.width = innerWidth * d, H = cv.height = innerHeight * d;
   frameUsed = new Set();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg');
+  // 以前はgetComputedStyleで毎フレーム--bgを引き直していたが、その値は常にcurrentCanvasBgと
+  // 同じであり(setCanvasBgが両方を同時に更新するため)、パン/ズーム/ドラッグのたびに走る
+  // render()の中で毎回スタイル再計算を強制していた。JS変数を直接使えば同じ結果になる。
+  ctx.fillStyle = currentCanvasBg;
   ctx.fillRect(0, 0, W, H);
 
   if (gridMode > 0 && view.s > .25) { // ドットグリッド(背景の明暗に応じて見やすい色に切り替える)
@@ -920,6 +923,10 @@ function cycleCanvasBg() {
   toast('Canvas: ' + next.name);
 }
 const HANDLE = 6, ROT_OFF = 26;
+// --selはCSS側で固定された選択色で、実行中に動的に変わることはない。以前はdrawSelection/
+// drawGroupHandles(選択中は毎フレーム呼ばれる)のたびにgetComputedStyleで引き直しており、
+// ドラッグ中に無駄なスタイル再計算を繰り返していた。最初に一度だけ読んで定数にしておく。
+const SEL_COLOR = getComputedStyle(document.documentElement).getPropertyValue('--sel').trim() || '#5ab0ff';
 function handlePts(it) {
   const cs = corners(it).map(p => [w2sX(p[0]), w2sY(p[1])]);
   const [tx, ty] = worldOf(it, 0, -it.h / 2);
@@ -931,7 +938,7 @@ function handlePts(it) {
 function drawSelection(it) {
   const single = sel.size === 1;
   const { cs, rot, top } = handlePts(it);
-  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--sel');
+  ctx.strokeStyle = SEL_COLOR;
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   cs.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
@@ -955,7 +962,7 @@ function selectionWorldBBox() {
 function drawGroupHandles() {
   const bb = selectionWorldBBox();
   const cs = [[bb.x0, bb.y0], [bb.x1, bb.y0], [bb.x1, bb.y1], [bb.x0, bb.y1]].map(p => [w2sX(p[0]), w2sY(p[1])]);
-  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--sel');
+  ctx.strokeStyle = SEL_COLOR;
   ctx.lineWidth = 1.5;
   ctx.setLineDash([5, 4]);
   ctx.beginPath();
@@ -976,15 +983,25 @@ function updateStatus() {
 // ならない控えめな表示で出す。画面表示用のデコードだけでなく、画面外の裏での先読みが
 // 取得した分もここに含めて数える(originalLoadedIdsは両方の経路で共通して記録されるため)。
 // 全部読み込み終わったら自動的に消える。
+//
+// updateStatus()経由でrender()のたびに(=パン/ズーム/ドラッグのたびに毎フレーム)呼ばれるが、
+// 進捗表示は1フレーム単位の精度は不要なので、items全体を舐めてSetを作り直す集計処理は
+// 一定間隔でのみ行い、その間はキャッシュした値をそのまま使い回す(大きいボードをドラッグ中に
+// 毎フレームこの集計が走って重くなっていたのを避けるため)。
+const LOAD_PROGRESS_RECOMPUTE_MS = 300;
+let loadProgressCache = { used: [], loaded: 0, ts: -Infinity, itemsLen: -1 };
 function updateLoadProgress() {
   const el = document.getElementById('loadProgress');
   if (!el) return;
-  const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
-  if (!used.length) { el.style.display = 'none'; return; }
-  let loaded = 0;
-  for (const id of used) {
-    if (originalLoadedIds.has(id)) loaded++;
+  const now = performance.now();
+  if (now - loadProgressCache.ts > LOAD_PROGRESS_RECOMPUTE_MS || loadProgressCache.itemsLen !== items.length) {
+    const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
+    let loaded = 0;
+    for (const id of used) if (originalLoadedIds.has(id)) loaded++;
+    loadProgressCache = { used, loaded, ts: now, itemsLen: items.length };
   }
+  const { used, loaded } = loadProgressCache;
+  if (!used.length) { el.style.display = 'none'; return; }
   if (loaded >= used.length) { el.style.display = 'none'; return; } // 全部読み込み終わったら消す
   el.textContent = `Loading full-res images… ${Math.round((loaded / used.length) * 100)}% (${loaded}/${used.length})`;
   el.style.display = 'block';
@@ -2080,14 +2097,31 @@ const LocalCache = (() => {
       return Array.isArray(data.files) ? data.files : [];
     } catch { return []; }
   }
-  async function addToBoardIndex(boardDir, key) {
+  // 台帳の中身をアカウント/ボード単位でセッション内メモリに覚えておき、
+  // 画像を1枚キャッシュするたびに台帳ファイルを読み直す(read+JSON.parse)のを避ける。
+  // (以前は保存中・キャッシュ中にN枚書き込むたびにN回ファイルを読み直しており、
+  //  台帳自体もN件分に育っていくため、実質O(N^2)のディスクI/Oになっていた。)
+  // 「消し忘れ」(=台帳に記録し損ねて後のClear cacheで消えず残る)はあっても実害がない
+  // (誤って別のものを消すわけではない)設計なので、この程度のキャッシュで十分安全側に倒せる。
+  const boardIndexMem = new Map(); // "account/board" -> Set<key>(台帳に記録済みと分かっているキー)
+  function boardIndexMemKey(account, board) { return `${sanitizeFolderName(account || UNKNOWN_ACCOUNT)}/${sanitizeFolderName(board)}`; }
+  async function loadBoardIndexSet(boardDir, memKey) {
+    let set = boardIndexMem.get(memKey);
+    if (!set) {
+      set = new Set(await readBoardIndex(boardDir)); // このメモリキャッシュに載せる最初の1回だけディスクを読む
+      boardIndexMem.set(memKey, set);
+    }
+    return set;
+  }
+  async function addToBoardIndex(boardDir, key, account, board) {
     try {
-      const current = await readBoardIndex(boardDir);
-      if (current.includes(key)) return;
-      current.push(key);
+      const memKey = boardIndexMemKey(account, board);
+      const set = await loadBoardIndexSet(boardDir, memKey);
+      if (set.has(key)) return; // 既に台帳にある(と分かっている)ので、ディスクへは触らない
+      set.add(key);
       const fh = await boardDir.getFileHandle(BOARD_INDEX_FILE, { create: true });
       const w = await fh.createWritable();
-      await w.write(JSON.stringify({ files: current }));
+      await w.write(JSON.stringify({ files: [...set] }));
       await w.close();
     } catch {} // 記録に失敗しても、書き込んだ画像自体は使えるので致命的ではない(将来の削除対象から漏れるだけ)
   }
@@ -2160,7 +2194,7 @@ const LocalCache = (() => {
       const w = await fh.createWritable();
       await w.write(blob);
       await w.close();
-      await addToBoardIndex(bd, key); // 共有フォルダ内の台帳を更新する(他のブラウザからも同じ記録が読める)
+      await addToBoardIndex(bd, key, account, board); // 共有フォルダ内の台帳を更新する(他のブラウザからも同じ記録が読める)
       return true;
     } catch { return false; } // 書き込めなくても致命的ではない(IndexedDB側へフォールバックする)
   }
@@ -2178,6 +2212,7 @@ const LocalCache = (() => {
         const files = await readBoardIndex(bd);
         for (const key of files) await bd.removeEntry(safeFileName(key)).catch(() => {});
         await bd.removeEntry(BOARD_INDEX_FILE).catch(() => {});
+        boardIndexMem.delete(boardIndexMemKey(account, board)); // 台帳ファイル自体を消したので、メモリ側の「記録済み」キャッシュも合わせて忘れる
         let boardHasContent = false;
         for await (const _ of bd.keys()) { boardHasContent = true; break; }
         if (!boardHasContent) await ad.removeEntry(boardSan).catch(() => {});
@@ -2247,7 +2282,10 @@ const LocalCache = (() => {
       // 選び直した場合でも)。ここを条件付きにしていた結果、「同じフォルダを選び直した」と正しく
       // 判定されるケースでmemだけが古いまま残り続け、Driveへの再取得(≒外部フォルダへの実際の
       // 書き込み)が発生しないように見えてしまう問題があったため、無条件で空にすることにした。
+      // boardIndexMem(台帳のメモリキャッシュ)も同じ理由で無条件に空にする(別の実フォルダを
+      // 指すようになった以上、そちらの台帳の中身を確認し直さないと正しく積み増しできないため)。
       mem.clear();
+      boardIndexMem.clear();
       // ドライブ直下(例: V:\そのもの)を選んだ場合、Chromeがそのフォルダの名前を空文字として
       // 返すことがある。その場合「/MiruMood Cache」のような中途半端な表示になってしまうため、
       // 名前が取れない時は「MiruMood Cache」単体の表示にする。
@@ -2386,14 +2424,19 @@ const LocalCache = (() => {
   async function put(key, blob, board, account) {
     mem.set(key, blob);
     if (await dirPut(key, blob, board, account)) return; // 外部フォルダに書けたらそちらを正としてIndexedDBには二重保存しない
-    // blob.sizeが数値でない(想定外の値が渡された)場合、evictIfNeededの合計計算がNaN化して
-    // 予算判定が常に偽になり、キャッシュ全体を巻き込んで消してしまう事故を防ぐため0扱いにする。
+    // blob.sizeが数値でない(想定外の値が渡された)場合、合計計算がNaN化して予算判定が
+    // 常に偽になり、キャッシュ全体を巻き込んで消してしまう事故を防ぐため0扱いにする。
     const size = (typeof blob.size === 'number' && !Number.isNaN(blob.size)) ? blob.size : 0;
     try {
       const os = await store(STORE, 'readwrite');
-      // board名・account名を付けておき、後で「このアカウントのこのボードだけ消す」を可能にする
+      // driveIdは基本的に上書きされない(一度アップロードされたら不変)想定だが、万一同じキーへの
+      // 上書きが起きた場合にtotalBytesが二重加算されないよう、既存レコードのサイズだけ先に確認する
+      // (これは主キー1件のget、フルスキャンではないので軽い)。
+      const prev = await reqToPromise(os.get(key)).catch(() => null);
       os.put({ blob, size, t: ++clockSeq, board: sanitizeFolderName(board), account: sanitizeFolderName(account || UNKNOWN_ACCOUNT) }, key);
-      await evictIfNeeded();
+      if (totalBytes === null) totalBytes = (await scanTotalBytes()).reduce((s, e) => s + (e.size || 0), 0);
+      else totalBytes += size - (prev ? (prev.size || 0) : 0);
+      if (totalBytes > BYTE_BUDGET) await evictIfNeeded(); // 予算超過時だけ、削除のための全件スキャンを行う
     } catch {} // 保存に失敗しても致命的ではない(次回また普通にDriveから取ってくるだけ)
   }
 
@@ -2459,9 +2502,15 @@ const LocalCache = (() => {
     mem.clear();
   }
 
-  async function evictIfNeeded() {
+  // totalBytesの実測(全件カーソル集計)。以前はput()のたびに毎回これを行っていたが、
+  // 「画像の枚数程度」なのはボード単位の話であり、IndexedDB全体(複数ボードの累積、上限10GB)
+  // で見ると画像1枚キャッシュするたびに累積キャッシュ全体を舐め直すことになり、
+  // ボードを開く/保存するたびにN回のフルスキャンが走って重くなっていた。
+  // そのため実測が必要なのは「まだ一度も計測していない時」と「削除が必要な時」だけにし、
+  // 通常のput()では差分加算だけで済ませる(下のput()側を参照)。
+  async function scanTotalBytes() {
     const os = await store(STORE, 'readonly');
-    const all = []; // カーソルで全件集計(件数は画像の枚数程度なので重くならない)
+    const all = [];
     await new Promise((resolve, reject) => {
       const cur = os.openCursor();
       cur.onsuccess = () => {
@@ -2472,8 +2521,15 @@ const LocalCache = (() => {
       };
       cur.onerror = () => reject(cur.error);
     });
-    let total = all.reduce((s, e) => s + e.size, 0);
-    totalBytes = total; // このスキャンで正確な合計が取れているので状態表示用に覚えておく
+    return all;
+  }
+  async function evictIfNeeded() {
+    if (totalBytes === null) totalBytes = (await scanTotalBytes()).reduce((s, e) => s + (e.size || 0), 0);
+    if (totalBytes <= BYTE_BUDGET) return;
+    // 予算を超えた時だけ、削除対象を選ぶために全件を取得する(このスキャンは「消す時だけ」発生する)
+    const all = await scanTotalBytes();
+    let total = all.reduce((s, e) => s + (e.size || 0), 0);
+    totalBytes = total;
     if (total <= BYTE_BUDGET) return;
     all.sort((a, b) => a.t - b.t); // 最後に使われたのが古い順
     const target = BYTE_BUDGET * 0.85;
@@ -2482,7 +2538,7 @@ const LocalCache = (() => {
       if (total <= target) break;
       delOs.delete(e.key);
       mem.delete(e.key);
-      total -= e.size;
+      total -= (e.size || 0);
     }
     totalBytes = total; // 削除後の最新値に更新
   }
@@ -2832,24 +2888,20 @@ async function saveBoardToDrive(forceNewName) {
           LocalCache.put(rec.thumbDriveId, tblob, folderId, driveUserEmail).catch(() => {});
         }
         if (embedBudgetLeft > 0) { // 予算が残っていればboard.jsonに直接埋め込む
-          if (rec.thumbEmbedStr) {
-            // 既に埋め込み済みの文字列がそのまま使い回せる場合、デコードして戻し、また同じ
-            // 文字列に再エンコードし直す、という無駄な往復をしない(変更の無い画像であれば
-            // 結果は毎回同じになるだけなので、保存のたびにこれをやると大きいボードほど重くなる)。
-            const need = rec.thumbEmbedStr.length;
-            if (need <= embedBudgetLeft) {
-              embeds.set(id, rec.thumbEmbedStr);
-              embedBudgetLeft -= need;
-            }
-          } else {
+          // 一度でも埋め込んだ結果(base64文字列)があれば、それをそのまま使い回す。
+          // 以前はここで毎回rec.thumbをdecode(dataURItoBlob)→re-encode(blobToDataURI)
+          // していたため、画像を1枚も変更していない保存でも、ボード内の全画像分の
+          // デコード・エンコードが走り、画像数が多いボードほど体感できる遅さになっていた。
+          // 変更していない画像はfetchもエンコードも一切行わず、この文字列をそのまま使う。
+          // 新しく追加した画像(thumbEmbedStrをまだ持っていない)だけ、初回のみ計算する。
+          if (!rec.thumbEmbedStr) {
             tblob = tblob || await getBlob(rec.thumb);
-            const need = tblob.size * 1.37; // base64膨張分の見込み
-            if (need <= embedBudgetLeft) {
-              const dataUri = await blobToDataURI(tblob);
-              embeds.set(id, dataUri);
-              rec.thumbEmbedStr = dataUri; // 次回以降の保存のために覚えておく
-              embedBudgetLeft -= need;
-            }
+            rec.thumbEmbedStr = await blobToDataURI(tblob);
+          }
+          const need = rec.thumbEmbedStr.length; // 既に出来上がっている文字列の長さそのものを使う(推定不要)
+          if (need <= embedBudgetLeft) {
+            embeds.set(id, rec.thumbEmbedStr);
+            embedBudgetLeft -= need;
           }
         }
       }
@@ -3187,7 +3239,10 @@ function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
       w: im.w, h: im.h, ext: im.ext,
       driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
       fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
-      thumbEmbedStr: im.thumbEmbed || null, // 保存時に使い回すため、埋め込み済みの文字列そのものを覚えておく
+      // 既にboard.jsonに埋め込まれていたサムネイル文字列は、そのままrec上にも覚えておく。
+      // こうしておけば、次にこのボードを保存する時にdecode→re-encodeし直さずに済む
+      // (saveBoardToDrive側のembeds組み立てを参照)。
+      thumbEmbedStr: im.thumbEmbed || null,
       original: (onBytes) => driveDownloadBlob(im.driveId, { board: folderId, account: driveUserEmail, onBytes }),
       thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
            : (im.thumbDriveId ? (onBytes) => driveDownloadBlob(im.thumbDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null),
