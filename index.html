@@ -1480,7 +1480,23 @@ function itemsBBox(itemList) {
 async function renderMultiItemToPng(selItems) {
   const [x0, y0, x1, y1] = itemsBBox(selItems);
   const w = Math.max(1, x1 - x0), h = Math.max(1, y1 - y0);
-  const k = Math.min(1, 8192 / Math.max(w, h)); // 選択範囲が巨大でもキャンバスが大きくなりすぎないようにする
+  // ボード上の表示サイズだけを基準にすると、画像を小さく配置している場合に粗い出力になってしまう。
+  // 選択内の画像のうち「表示サイズに対して原寸が一番大きい」ものを基準に、その画像の解像度が
+  // 保たれる程度まで全体を拡大する(PureRefが「程よい大きさ」でコピーしてくれるのに近づける)。
+  // MiruMoodは画像追加時に一番長い辺を480に縮めて配置する仕様のため、何も手を加えていない画像でも
+  // 8倍前後の補正が普通に必要になる。そのため拡大率自体には上限を設けず、代わりに出力全体のサイズ
+  // (8192px)の方だけで安全を確保する。
+  let renderScale = 1;
+  for (const it of selItems) {
+    if (it.type === 'note') continue;
+    const rec = store.get(it.imgId);
+    if (!rec) continue;
+    const cr = it.crop;
+    const dispW = it.w / (cr ? cr.w : 1), dispH = it.h / (cr ? cr.h : 1);
+    if (dispW <= 0 || dispH <= 0) continue;
+    renderScale = Math.max(renderScale, rec.w / dispW, rec.h / dispH);
+  }
+  const k = Math.min(renderScale, 8192 / Math.max(w, h)); // 選択範囲全体の出力サイズが大きくなりすぎないよう、ここで安全を確保する
   const c = document.createElement('canvas');
   c.width = Math.max(1, Math.round(w * k));
   c.height = Math.max(1, Math.round(h * k));
