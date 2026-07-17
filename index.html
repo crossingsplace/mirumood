@@ -15,8 +15,11 @@
   #cv{position:fixed;inset:0;display:block;cursor:default;touch-action:none}
   #bar{position:fixed;top:10px;left:10px;display:flex;gap:2px;padding:4px;
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);
-    border-radius:8px;opacity:.35;transition:opacity .2s;z-index:10}
+    border-radius:8px;opacity:.65;transition:opacity .2s;z-index:10}
   #bar:hover{opacity:1}
+  #loadProgress{position:fixed;top:56px;left:14px;display:none;padding:3px 8px;font-size:11px;color:var(--dim);
+    background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:6px;
+    opacity:.65;pointer-events:none;z-index:9}
   #bar button{all:unset;cursor:pointer;padding:5px 9px;border-radius:5px;color:var(--text);font-size:12px}
   #driveAuthBtn{display:inline-flex;align-items:center;gap:7px;padding:5px 9px;color:var(--text);font-size:12px;cursor:default}
   #bar button:hover{background:#ffffff14}
@@ -97,6 +100,7 @@
   <span id="driveState"></span>
   <span id="cacheState" data-act="cache-folder" title="Click to change where the local image cache is stored"></span>
 </div>
+<div id="loadProgress"></div>
 
 <div id="menu"></div>
 
@@ -364,11 +368,42 @@ function requestDecode(imgId, lod) {
 // 同じ画像の原本を2箇所が同時に取りに行ってしまうことがある。無駄なだけでなく、
 // 挙動が不安定になる一因にもなり得るため、同じ画像に対しては取得中のPromiseを共有する。
 const inflightOriginal = new Map(); // imgId -> Promise<Blob>
+const originalLoadedIds = new Set(); // 原本データを取得できた画像ID(表示用のデコード・裏での先読み、どちらの経路でも記録する)
 function getOriginalBlob(imgId, rec) {
   if (inflightOriginal.has(imgId)) return inflightOriginal.get(imgId);
-  const p = getBlob(rec.original).finally(() => inflightOriginal.delete(imgId));
+  const p = getBlob(rec.original)
+    .then(blob => { originalLoadedIds.add(imgId); return blob; })
+    .finally(() => inflightOriginal.delete(imgId));
   inflightOriginal.set(imgId, p);
   return p;
+}
+
+// 画面に映っている画像は最優先で(render()から直接)取得されるが、それ以外(画面外)の画像は
+// 今まで一切取得されなかった。ブラウザの暇な時間(requestIdleCallback)を使って、優先度を
+// 落としつつ裏で少しずつ取得しておく。ビットマップとしてデコードしてbmpCacheに載せる
+// ところまではせず、原本データをキャッシュしておくだけに留める(メモリを圧迫しないため。
+// 実際にその画像が画面に映った瞬間、キャッシュ済みの原本からすぐデコードできるので体感は速い)。
+let bgPrefetchPending = false;
+function scheduleBackgroundPrefetch() {
+  if (bgPrefetchPending) return; // 既に次の実行が予約されているなら重複させない
+  bgPrefetchPending = true;
+  const run = async () => {
+    bgPrefetchPending = false;
+    if (!driveSignedIn()) return; // サインインできていない間は、同じ失敗を裏で無限に繰り返さないよう控える
+    const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
+    let foundWork = false;
+    for (const id of used) {
+      const rec = store.get(id);
+      if (!rec || !rec.driveId) continue;
+      if (originalLoadedIds.has(id)) continue; // 既に原本データを取得済み(表示用・先読み問わず)なら対象外
+      foundWork = true;
+      try { await getOriginalBlob(id, rec); updateStatus(); } catch {} // 進捗表示にも反映させる
+      break; // 1回のアイドル時間につき1枚だけ。まだ続きがあれば、また次のアイドル時に予約する。
+    }
+    if (foundWork) scheduleBackgroundPrefetch();
+  };
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 4000 });
+  else setTimeout(run, 2000); // 未対応ブラウザ向けの簡易フォールバック
 }
 
 async function decodeLod(imgId, lod) {
@@ -888,6 +923,24 @@ function updateStatus() {
     `${items.length} images ・ ${(cacheBytes / 1048576) | 0}MB decoded ・ ${Math.round(view.s * 100)}%`;
   updateDriveState();
   updateNoteToolbar();
+  updateLoadProgress();
+}
+// 素データ(サムネイルではなく原本)がボード全体でどれくらい取得できているかを、操作の邪魔に
+// ならない控えめな表示で出す。画面表示用のデコードだけでなく、画面外の裏での先読みが
+// 取得した分もここに含めて数える(originalLoadedIdsは両方の経路で共通して記録されるため)。
+// 全部読み込み終わったら自動的に消える。
+function updateLoadProgress() {
+  const el = document.getElementById('loadProgress');
+  if (!el) return;
+  const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
+  if (!used.length) { el.style.display = 'none'; return; }
+  let loaded = 0;
+  for (const id of used) {
+    if (originalLoadedIds.has(id)) loaded++;
+  }
+  if (loaded >= used.length) { el.style.display = 'none'; return; } // 全部読み込み終わったら消す
+  el.textContent = `Loading full-res images… ${Math.round((loaded / used.length) * 100)}% (${loaded}/${used.length})`;
+  el.style.display = 'block';
 }
 function updateNoteToolbar() {
   const bar = document.getElementById('noteToolbar');
@@ -1444,6 +1497,7 @@ function fitAll() {
 function kickstartRendering() {
   paint();
   [150, 500, 1500].forEach(ms => setTimeout(paint, ms));
+  scheduleBackgroundPrefetch(); // 画面に映っている分の初期表示が始まったら、画面外の分も裏で少しずつ先読みし始める
 }
 /* PureRefの"Normalize"に相当: 選択した複数アイテムの幅または高さを、
  * 選択範囲の平均値に揃える。各アイテム自身の縦横比とその中心位置は保つ
@@ -2915,6 +2969,7 @@ async function openDriveFolderById(folderId, folderName) {
       updateDriveState();
       fitAll();
       kickstartRendering();
+      updateStatus();
       toast(`Loaded from Drive (${items.length} images)`);
       updateCacheState();
       maybeNotifyCacheThreshold();
@@ -2927,6 +2982,7 @@ async function openDriveFolderById(folderId, folderName) {
     updateDriveState();
     fitAll();
     kickstartRendering();
+    updateStatus();
     toast(`Loaded ${files.length} images from Drive folder — Save to Drive to keep this layout`);
     updateCacheState();
     maybeNotifyCacheThreshold();
