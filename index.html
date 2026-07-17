@@ -2832,11 +2832,24 @@ async function saveBoardToDrive(forceNewName) {
           LocalCache.put(rec.thumbDriveId, tblob, folderId, driveUserEmail).catch(() => {});
         }
         if (embedBudgetLeft > 0) { // 予算が残っていればboard.jsonに直接埋め込む
-          tblob = tblob || await getBlob(rec.thumb);
-          const need = tblob.size * 1.37; // base64膨張分の見込み
-          if (need <= embedBudgetLeft) {
-            embeds.set(id, await blobToDataURI(tblob));
-            embedBudgetLeft -= need;
+          if (rec.thumbEmbedStr) {
+            // 既に埋め込み済みの文字列がそのまま使い回せる場合、デコードして戻し、また同じ
+            // 文字列に再エンコードし直す、という無駄な往復をしない(変更の無い画像であれば
+            // 結果は毎回同じになるだけなので、保存のたびにこれをやると大きいボードほど重くなる)。
+            const need = rec.thumbEmbedStr.length;
+            if (need <= embedBudgetLeft) {
+              embeds.set(id, rec.thumbEmbedStr);
+              embedBudgetLeft -= need;
+            }
+          } else {
+            tblob = tblob || await getBlob(rec.thumb);
+            const need = tblob.size * 1.37; // base64膨張分の見込み
+            if (need <= embedBudgetLeft) {
+              const dataUri = await blobToDataURI(tblob);
+              embeds.set(id, dataUri);
+              rec.thumbEmbedStr = dataUri; // 次回以降の保存のために覚えておく
+              embedBudgetLeft -= need;
+            }
           }
         }
       }
@@ -3174,6 +3187,7 @@ function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
       w: im.w, h: im.h, ext: im.ext,
       driveId: im.driveId, thumbDriveId: im.thumbDriveId || null,
       fullDriveId: im.fullDriveId || null, fullExt: im.fullExt || null,
+      thumbEmbedStr: im.thumbEmbed || null, // 保存時に使い回すため、埋め込み済みの文字列そのものを覚えておく
       original: (onBytes) => driveDownloadBlob(im.driveId, { board: folderId, account: driveUserEmail, onBytes }),
       thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
            : (im.thumbDriveId ? (onBytes) => driveDownloadBlob(im.thumbDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null),
