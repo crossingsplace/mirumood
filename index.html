@@ -2858,18 +2858,36 @@ async function saveBoardToDrive(forceNewName) {
     let embedBudgetLeft = THUMB_EMBED_BUDGET;
     const embeds = new Map(); // id -> data URI (予算内に収まったものだけ)
 
+    // 既にthumbEmbedStrを持っている(=前回以前の保存で埋め込み済みの)画像は、通信もdecode/encodeも
+    // 必要ないので、ループに入る前にこの場で同期的に埋めてしまう。こうしておくと、画像側が
+    // 何も変わっていないボードでは、この直後の最初の1回のチェックポイント書き込みの時点で
+    // 既に完全な内容になり、ループ中に「埋め直すためだけの」追加の書き込みが要らなくなる。
+    for (const id of used) {
+      const rec = store.get(id);
+      if (embedBudgetLeft <= 0) break;
+      if (!rec.thumbEmbedStr) continue;
+      const need = rec.thumbEmbedStr.length;
+      if (need > embedBudgetLeft) continue;
+      embeds.set(id, rec.thumbEmbedStr);
+      embedBudgetLeft -= need;
+    }
+
     // 画像のアップロードを始める前に、まずレイアウトだけでもboard.jsonとして書いておく。
     // この時点ではdriveIdが未確定の画像も多いが、それでも「board.jsonが存在する」ことが
     // 何より重要で、これだけで以後は中断されても画像フォルダ扱いへ転落しなくなる。
+    // (画像側が何も変わっていないボードの保存なら、上のループで埋め済みなので、
+    //  実質この1回の書き込みだけで保存が完了する。)
     await writeManifestCheckpoint(folderId, used, embeds);
 
     progress('Saving to Drive', 0);
+    let dirtySinceCheckpoint = false; // 前回のチェックポイント以降に、実際にDrive側の何かが変わったか
     for (const id of used) {
       const rec = store.get(id);
       if (!rec.driveId) {
         const blob = await getBlob(rec.original);
         rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
         LocalCache.put(rec.driveId, blob, folderId, driveUserEmail).catch(() => {});
+        dirtySinceCheckpoint = true;
       }
       if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
         // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
@@ -2886,14 +2904,11 @@ async function saveBoardToDrive(forceNewName) {
           tblob = await getBlob(rec.thumb);
           rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
           LocalCache.put(rec.thumbDriveId, tblob, folderId, driveUserEmail).catch(() => {});
+          dirtySinceCheckpoint = true;
         }
-        if (embedBudgetLeft > 0) { // 予算が残っていればboard.jsonに直接埋め込む
-          // 一度でも埋め込んだ結果(base64文字列)があれば、それをそのまま使い回す。
-          // 以前はここで毎回rec.thumbをdecode(dataURItoBlob)→re-encode(blobToDataURI)
-          // していたため、画像を1枚も変更していない保存でも、ボード内の全画像分の
-          // デコード・エンコードが走り、画像数が多いボードほど体感できる遅さになっていた。
-          // 変更していない画像はfetchもエンコードも一切行わず、この文字列をそのまま使う。
-          // 新しく追加した画像(thumbEmbedStrをまだ持っていない)だけ、初回のみ計算する。
+        // 既にループ前の一括処理でembeds済み(=変更なし)ならここでは何もしない。
+        // 新規追加画像など、まだ埋め込まれていないものだけ、ここで計算する。
+        if (embedBudgetLeft > 0 && !embeds.has(id)) {
           if (!rec.thumbEmbedStr) {
             tblob = tblob || await getBlob(rec.thumb);
             rec.thumbEmbedStr = await blobToDataURI(tblob);
@@ -2902,6 +2917,7 @@ async function saveBoardToDrive(forceNewName) {
           if (need <= embedBudgetLeft) {
             embeds.set(id, rec.thumbEmbedStr);
             embedBudgetLeft -= need;
+            dirtySinceCheckpoint = true;
           }
         }
       }
@@ -2909,13 +2925,19 @@ async function saveBoardToDrive(forceNewName) {
         const fblob = await getBlob(rec.fullOriginal);
         rec.fullDriveId = await driveUploadFile(`${id}_full.${rec.fullExt}`, fblob, fblob.type || 'application/octet-stream', folderId);
         LocalCache.put(rec.fullDriveId, fblob, folderId, driveUserEmail).catch(() => {});
+        dirtySinceCheckpoint = true;
       }
       done++;
       progress('Saving to Drive', done / used.length);
-      // 5枚ごと(+最後の1枚は端数でも必ず)にboard.jsonへ進捗を反映する。
-      // 毎回書くと画像の枚数だけDriveへの小さい書き込みが増えるため、頻度を落として
-      // それでも「直近4枚分の紐付け」以上は失われない程度の粒度に留めている。
-      if (done % 5 === 0 || done === used.length) await writeManifestCheckpoint(folderId, used, embeds);
+      // 5枚ごと(+最後の1枚は端数でも必ず)にboard.jsonへ進捗を反映する。ただし前回の
+      // チェックポイント以降に実際に何かアップロードされていない時は、書いても内容が
+      // 変わらない(=無駄なDriveへの書き込みになる)ので、その時はスキップする。
+      // (画像側が1枚も変わっていない保存では、ループ前のembeds一括処理とループ前の
+      //  1回の書き込みだけで既に完了しており、ここでの書き込みは1回も発生しない。)
+      if (dirtySinceCheckpoint && (done % 5 === 0 || done === used.length)) {
+        await writeManifestCheckpoint(folderId, used, embeds);
+        dirtySinceCheckpoint = false;
+      }
     }
     driveDirty = false;
     // JPG最適化の状態を、フォルダ自体のプロパティとして書いておく。こうしておくと、
