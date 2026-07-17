@@ -1466,51 +1466,114 @@ function duplicateSel() { // imgIdを共有するのでメモリは増えない
  * そのままペーストできるよう、OSクリップボードへPNGとして書き出す。
  * 画像は現在のクロップ/回転/反転/グレースケール/不透明度を焼き込んだ上で、
  * 元ファイルの解像度をそのまま使う(ボード上の表示サイズには縮小されない)。 */
+// 選択範囲(複数可)のバウンディングボックスを計算する。boardBBox()の「対象を選択アイテムに絞った版」。
+function itemsBBox(itemList) {
+  let x0 = 1e15, y0 = 1e15, x1 = -1e15, y1 = -1e15;
+  for (const it of itemList) for (const [px, py] of corners(it)) {
+    x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py);
+  }
+  return [x0, y0, x1, y1];
+}
+// 複数選択時: 選択した画像・メモをまとめて1枚に合成してPNG化する(PureRefの「選択範囲をコピーして
+// 他アプリに貼り付け」と同じ考え方)。背景はあえて塗らず透明のままにする。他アプリに貼り付けた時、
+// アイテム同士の隙間が透明に抜けて、ムードボードの一部を切り出したような見た目になるようにするため。
+async function renderMultiItemToPng(selItems) {
+  const [x0, y0, x1, y1] = itemsBBox(selItems);
+  const w = Math.max(1, x1 - x0), h = Math.max(1, y1 - y0);
+  const k = Math.min(1, 8192 / Math.max(w, h)); // 選択範囲が巨大でもキャンバスが大きくなりすぎないようにする
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w * k));
+  c.height = Math.max(1, Math.round(h * k));
+  const g = c.getContext('2d');
+  g.setTransform(k, 0, 0, k, -x0 * k, -y0 * k);
+  let done = 0;
+  for (const it of selItems) {
+    progress('Copying', done++ / selItems.length);
+    if (it.type === 'note') {
+      g.save();
+      g.translate(it.x, it.y); g.rotate(it.rot);
+      g.globalAlpha = it.opacity;
+      drawNote(g, it);
+      g.restore();
+      continue;
+    }
+    const rec = store.get(it.imgId);
+    if (!rec) continue;
+    const cr = it.crop;
+    const need = Math.max(it.w / (cr ? cr.w : 1), it.h / (cr ? cr.h : 1)) * k;
+    const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
+    let bmp;
+    if (need >= Math.max(rec.w, rec.h)) bmp = await createImageBitmap(blob);
+    else {
+      const r = need / Math.max(rec.w, rec.h);
+      bmp = await createImageBitmap(blob, {
+        resizeWidth: Math.max(1, Math.round(rec.w * r)),
+        resizeHeight: Math.max(1, Math.round(rec.h * r)),
+        resizeQuality: 'high'
+      });
+    }
+    g.save();
+    g.translate(it.x, it.y); g.rotate(it.rot);
+    g.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
+    g.globalAlpha = it.opacity;
+    g.filter = it.gray ? 'grayscale(1)' : 'none';
+    if (cr) g.drawImage(bmp, cr.x * bmp.width, cr.y * bmp.height, Math.max(1, cr.w * bmp.width), Math.max(1, cr.h * bmp.height), -it.w / 2, -it.h / 2, it.w, it.h);
+    else g.drawImage(bmp, -it.w / 2, -it.h / 2, it.w, it.h);
+    g.restore();
+    bmp.close();
+  }
+  return new Promise(res => c.toBlob(res, 'image/png'));
+}
 async function copySelectionToClipboard() {
-  if (sel.size !== 1) { toast('Select exactly one item to copy'); return; }
+  if (sel.size === 0) { toast('Select at least one item to copy'); return; }
   if (!('clipboard' in navigator) || typeof ClipboardItem === 'undefined') {
     toast('Copy is not supported in this browser'); return;
   }
-  const it = items.find(i => sel.has(i.id));
-  if (!it) return;
+  const selItems = items.filter(i => sel.has(i.id));
   try {
     progress('Copying', 0);
-    const c = document.createElement('canvas');
-    const g = c.getContext('2d');
-    if (it.type === 'note') {
-      const scale = 2; // テキストが潰れないよう高めの解像度で書き出す
-      c.width = Math.max(1, Math.round(it.w * scale));
-      c.height = Math.max(1, Math.round(it.h * scale));
-      g.scale(scale, scale);
-      g.translate(it.w / 2, it.h / 2);
-      g.globalAlpha = it.opacity;
-      drawNote(g, it);
+    let pngBlob;
+    if (selItems.length > 1) {
+      pngBlob = await renderMultiItemToPng(selItems); // 複数選択: まとめて1枚に合成する
     } else {
-      const rec = store.get(it.imgId);
-      if (!rec) throw new Error('image unavailable');
-      const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
-      const bmp = await createImageBitmap(blob);
-      const cr = it.crop;
-      const sx = cr ? cr.x * bmp.width : 0, sy = cr ? cr.y * bmp.height : 0;
-      const sw = cr ? Math.max(1, cr.w * bmp.width) : bmp.width, sh = cr ? Math.max(1, cr.h * bmp.height) : bmp.height;
-      const hw = sw / 2, hh = sh / 2, cos = Math.cos(it.rot), sin = Math.sin(it.rot);
-      const lc = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => [x * cos - y * sin, x * sin + y * cos]);
-      const xs = lc.map(p => p[0]), ys = lc.map(p => p[1]);
-      c.width = Math.max(1, Math.round(Math.max(...xs) - Math.min(...xs)));
-      c.height = Math.max(1, Math.round(Math.max(...ys) - Math.min(...ys)));
-      g.translate(c.width / 2, c.height / 2);
-      g.rotate(it.rot);
-      g.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
-      g.globalAlpha = it.opacity;
-      g.filter = it.gray ? 'grayscale(1)' : 'none';
-      g.drawImage(bmp, sx, sy, sw, sh, -sw / 2, -sh / 2, sw, sh);
-      bmp.close();
+      const it = selItems[0];
+      const c = document.createElement('canvas');
+      const g = c.getContext('2d');
+      if (it.type === 'note') {
+        const scale = 2; // テキストが潰れないよう高めの解像度で書き出す
+        c.width = Math.max(1, Math.round(it.w * scale));
+        c.height = Math.max(1, Math.round(it.h * scale));
+        g.scale(scale, scale);
+        g.translate(it.w / 2, it.h / 2);
+        g.globalAlpha = it.opacity;
+        drawNote(g, it);
+      } else {
+        const rec = store.get(it.imgId);
+        if (!rec) throw new Error('image unavailable');
+        const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
+        const bmp = await createImageBitmap(blob);
+        const cr = it.crop;
+        const sx = cr ? cr.x * bmp.width : 0, sy = cr ? cr.y * bmp.height : 0;
+        const sw = cr ? Math.max(1, cr.w * bmp.width) : bmp.width, sh = cr ? Math.max(1, cr.h * bmp.height) : bmp.height;
+        const hw = sw / 2, hh = sh / 2, cos = Math.cos(it.rot), sin = Math.sin(it.rot);
+        const lc = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => [x * cos - y * sin, x * sin + y * cos]);
+        const xs = lc.map(p => p[0]), ys = lc.map(p => p[1]);
+        c.width = Math.max(1, Math.round(Math.max(...xs) - Math.min(...xs)));
+        c.height = Math.max(1, Math.round(Math.max(...ys) - Math.min(...ys)));
+        g.translate(c.width / 2, c.height / 2);
+        g.rotate(it.rot);
+        g.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
+        g.globalAlpha = it.opacity;
+        g.filter = it.gray ? 'grayscale(1)' : 'none';
+        g.drawImage(bmp, sx, sy, sw, sh, -sw / 2, -sh / 2, sw, sh);
+        bmp.close();
+      }
+      pngBlob = await new Promise(res => c.toBlob(res, 'image/png'));
     }
-    const pngBlob = await new Promise(res => c.toBlob(res, 'image/png'));
     if (!pngBlob) throw new Error('failed to encode PNG');
     await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
     progressDone();
-    toast('Copied — paste it into another app with Ctrl+V');
+    toast(selItems.length > 1 ? `Copied ${selItems.length} items — paste into another app with Ctrl+V` : 'Copied — paste it into another app with Ctrl+V');
   } catch {
     progressDone();
     toast('Copy failed');
@@ -3468,7 +3531,7 @@ function openMenu(px, py) {
                       [`Bold (${selItems[0].bold ? 'On' : 'Off'})`, '', () => toggleNoteBold(selItems[0])],
                       [`Font size + (${selItems[0].fontSize || 18}px)`, '', () => adjustNoteFontSize(selItems[0], 2)],
                       ['Font size -', '', () => adjustNoteFontSize(selItems[0], -2)]] : []),
-    ...(singleImg || singleNote ? [['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard], null] : []),
+    ...(has ? [['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard], null] : []),
     ...(selItems.length >= 2 ? [['Match width', '', () => matchDimension('w')], ['Match height', '', () => matchDimension('h')], ['Auto arrange selection', 'A', arrange], null] : []),
     ['Duplicate', 'Ctrl+D', duplicateSel],
     ['Flip horizontal', 'H', () => keyAction('h')],
