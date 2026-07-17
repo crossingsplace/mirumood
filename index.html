@@ -60,6 +60,25 @@
   #boardPickerItems .board-row .board-actions button{font-size:11px;color:var(--dim);padding:6px 8px}
   #boardPickerItems .board-row .board-actions button:hover{color:var(--text)}
   #boardPickerItems .board-row .board-actions button.danger:hover{color:#ff6b6b}
+  #exportDialog{position:fixed;inset:0;display:none;place-items:center;background:#000a;z-index:40}
+  #exportDialog .box{background:#1d1f24;border:1px solid var(--line);border-radius:12px;padding:22px 26px;min-width:340px;max-width:420px}
+  #exportDialog .dlgHead{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  #exportDialog h2{margin:0;font-size:15px;color:var(--accent);font-weight:600}
+  #exportDialog .dlgX{all:unset;cursor:pointer;color:var(--dim);font-size:16px;padding:2px 6px;border-radius:4px}
+  #exportDialog .dlgX:hover{background:#ffffff14;color:var(--text)}
+  #exportDialog .dlgField{margin-bottom:14px}
+  #exportDialog .dlgField label{display:block;font-size:12px;color:var(--dim);margin-bottom:5px}
+  #exportDialog .dlgRow{display:flex;align-items:center;gap:8px}
+  #exportDialog .dlgLocLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--text);
+    background:#00000030;border:1px solid var(--line);border-radius:6px;padding:6px 9px}
+  #exportDialog .dlgBtn{all:unset;cursor:pointer;font-size:12px;color:var(--text);background:#ffffff10;padding:6px 12px;border-radius:6px;white-space:nowrap}
+  #exportDialog .dlgBtn:hover{background:#ffffff1c}
+  #exportDialog .dlgSelect, #exportDialog .dlgInput{width:100%;box-sizing:border-box;font-size:13px;color:var(--text);
+    background:#00000030;border:1px solid var(--line);border-radius:6px;padding:7px 9px}
+  #exportDialog .dlgPreview{margin-top:6px;font-size:11px;color:var(--dim);word-break:break-all}
+  #exportDialog .dlgActions{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
+  #exportDialog .dlgPrimary{all:unset;cursor:pointer;font-size:13px;color:#17181c;background:var(--accent);padding:8px 16px;border-radius:6px;font-weight:600}
+  #exportDialog .dlgPrimary:hover{opacity:.9}
   #boardPickerItems .board-meta{padding:0 10px 6px;font-size:11px;color:var(--dim)}
   #hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--dim);text-align:center;z-index:5}
   #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
@@ -103,6 +122,34 @@
 <div id="loadProgress"></div>
 
 <div id="menu"></div>
+
+<div id="exportDialog"><div class="box">
+  <div class="dlgHead"><h2>Export images</h2><button id="exportDialogX" class="dlgX">×</button></div>
+  <div class="dlgField">
+    <label>Save location</label>
+    <div class="dlgRow">
+      <span id="exportLocationLabel" class="dlgLocLabel">Not set</span>
+      <button id="exportPickFolder" class="dlgBtn">Choose…</button>
+    </div>
+  </div>
+  <div class="dlgField">
+    <label>Format</label>
+    <select id="exportFormat" class="dlgSelect">
+      <option value="original">Original</option>
+      <option value="png">PNG</option>
+      <option value="jpeg">JPEG</option>
+    </select>
+  </div>
+  <div class="dlgField">
+    <label>Naming</label>
+    <input id="exportNaming" class="dlgInput" type="text" placeholder="image" maxlength="80">
+    <div id="exportNamingPreview" class="dlgPreview"></div>
+  </div>
+  <div class="dlgActions">
+    <button id="exportDialogGo" class="dlgPrimary">Export</button>
+    <button id="exportDialogCancel" class="dlgBtn">Cancel</button>
+  </div>
+</div></div>
 
 <div id="help"><div class="box">
   <h2>MiruMood</h2><p class="sub">Reference &amp; mood board — press Esc to close</p>
@@ -2424,6 +2471,7 @@ async function chooseCacheFolder() {
     toast(res.message ? `Could not set the cache folder: ${res.message}` : 'Could not set the cache folder');
   }
   updateCacheState();
+  return res.ok;
 }
 // ボード名を変更する共通の実処理。Drive側のフォルダ名を実際に変更し(フォルダIDそのものは
 // 変わらないので、以後の保存・削除等は引き続き同じフォルダを指す)、ローカルキャッシュ側は
@@ -2954,6 +3002,47 @@ async function onDriveFolderOpenResult(data) {
   }
   openDriveFolderById(folderId, folderName);
 }
+const LARGE_BOARD_IMAGE_THRESHOLD = 15; // これ以上の画像数を「大きいボード」の目安にする
+// 大きいボードを開いた時、まだローカルにキャッシュされていなければ、その場で
+// バックグラウンドキャッシュを提案する。閲覧するだけでも表示した分は自然にキャッシュされて
+// いくが、ズームせず見ていない部分は残ったままになるため、後から「Cache all images」を
+// 押すとその分だけまとめて重くなる。それを避けるため、開いた直後にまとめて裏で走らせておく。
+async function maybeOfferBackgroundCache(folderId) {
+  const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
+  if (used.length < LARGE_BOARD_IMAGE_THRESHOLD) return; // 小さいボードではわざわざ聞かない
+  if (!LocalCache.dirSupported()) return; // 外部フォルダに未対応のブラウザでは、容量の限られるIndexedDBに大量キャッシュするのは勧めない
+
+  const usage = await LocalCache.getUsage().catch(() => null);
+  if (!usage) return;
+  if (usage.backend === 'dir-needs-permission') return; // 再接続が別途必要な状態。上部の表示で既に案内済みなので、ここでは重ねて聞かない。
+
+  if (usage.backend === 'indexeddb') {
+    // このPC(ブラウザ)では、まだ外部フォルダが一度も設定されていない状態。「見ているだけで
+    // 自然にキャッシュされる」がまだ成り立たない(IndexedDBに一時的に入るだけで、次にこの
+    // PCで開いた時に残っている保証が無い)ため、キャッシュを始める前に、まず保存先を
+    // 選んでもらうところから案内する。
+    setTimeout(async () => {
+      if (!confirm(`This board has ${used.length} images and may take a while to fully load.\nSet up a local cache folder on this device and cache it now? (Recommended for large boards.)`)) return;
+      const chosen = await chooseCacheFolder();
+      if (chosen) cacheAllBoardImages(); // フォルダを選べた場合だけ、続けてキャッシュを始める
+    }, 300);
+    return;
+  }
+
+  // ここに来るのは、このPCで外部フォルダが既に有効に設定されている場合のみ
+  let alreadyCached = false;
+  try {
+    const cachedIds = await LocalCache.getCachedBoardIds(driveUserEmail);
+    alreadyCached = cachedIds.has(folderId);
+  } catch { return; } // 判定できない場合は、余計なことをせず何もしない
+  if (alreadyCached) return; // 既にある程度キャッシュ済みなら、毎回聞いて煩わせない
+  // 開いた瞬間に確認ダイアログを出すと、画面がまだ何も見えていない状態で聞かれることになるため、
+  // 少し間を置いて、まず画面がある程度見える状態になってから尋ねる。
+  setTimeout(() => {
+    if (!confirm(`This board has ${used.length} images and may take a while to fully load.\nCache it locally in the background now? You can keep working while it downloads.`)) return;
+    cacheAllBoardImages(); // 完了を待たない。裏で走らせたまま、そのまま操作を続けられる。
+  }, 300);
+}
 // フォルダIDを指定して開く共通処理: 中にboard.jsonがあれば既存ボードとして、
 // なければ素の画像フォルダとして自動判定して開く。
 async function openDriveFolderById(folderId, folderName) {
@@ -2967,6 +3056,7 @@ async function openDriveFolderById(folderId, folderName) {
       loadManifestIntoBoard(manifest, folderId, manifestId, folderName);
       progressDone();
       updateDriveState();
+      maybeOfferBackgroundCache(folderId); // まだ何もキャッシュされていない状態のうちに判定しておく
       fitAll();
       kickstartRendering();
       updateStatus();
@@ -2980,6 +3070,7 @@ async function openDriveFolderById(folderId, folderName) {
     await loadLooseImagesIntoBoard(files, folderId, folderName);
     progressDone();
     updateDriveState();
+    maybeOfferBackgroundCache(folderId);
     fitAll();
     kickstartRendering();
     updateStatus();
@@ -3218,6 +3309,94 @@ async function exportPNG() {
   c.toBlob(b => { download('board.png', b); toast('Exported PNG'); }, 'image/png');
 }
 
+/* ---- 画像を個別にエクスポートする(PureRef風: 保存先フォルダ・形式・連番の名前を指定できる) ----
+ * クロップや親子関係は今のところ書き出しには反映しない(MiruMoodには本格的な実装が無いため)。 */
+function exportDirSupported() { return typeof window !== 'undefined' && 'showDirectoryPicker' in window; }
+function getExportTargetItems(mode) {
+  return items.filter(i => i.imgId && (mode === 'all' || sel.has(i.id)));
+}
+let exportTargetMode = 'selected';
+let exportPickedFolder = null; // 選んだ保存先(File System Access API対応時のみ)
+function openExportDialog(mode) {
+  const targetItems = getExportTargetItems(mode);
+  if (!targetItems.length) { toast(mode === 'selected' ? 'No images selected' : 'No images in this board'); return; }
+  exportTargetMode = mode;
+  exportPickedFolder = null;
+  document.getElementById('exportLocationLabel').textContent =
+    exportDirSupported() ? 'Not set' : 'Downloads folder (this browser can\'t choose a folder)';
+  document.getElementById('exportFormat').value = 'original';
+  document.getElementById('exportNaming').value = currentBoardName || 'image';
+  updateExportNamingPreview();
+  document.getElementById('exportDialog').style.display = 'grid';
+}
+function exportExt(fmt, rec) { return fmt === 'png' ? 'png' : fmt === 'jpeg' ? 'jpg' : (rec && rec.ext) || 'jpg'; }
+function updateExportNamingPreview() {
+  const targetItems = getExportTargetItems(exportTargetMode);
+  const base = document.getElementById('exportNaming').value.trim() || 'image';
+  const fmt = document.getElementById('exportFormat').value;
+  const extLabel = fmt === 'original' ? '(original format)' : exportExt(fmt);
+  const el = document.getElementById('exportNamingPreview');
+  if (targetItems.length <= 1) { el.textContent = `${base}.${extLabel}`; return; }
+  const pad = Math.max(3, String(targetItems.length).length);
+  el.textContent = `${base}_${'1'.padStart(pad, '0')}.${extLabel}  …  ${base}_${String(targetItems.length).padStart(pad, '0')}.${extLabel}`;
+}
+async function pickExportFolder() {
+  if (!exportDirSupported()) return;
+  try {
+    exportPickedFolder = await window.showDirectoryPicker({ mode: 'readwrite' });
+    document.getElementById('exportLocationLabel').textContent = exportPickedFolder.name;
+  } catch {} // キャンセルされた場合は何もしない(選択済みなら以前のままにする)
+}
+async function runExport() {
+  const targetItems = getExportTargetItems(exportTargetMode);
+  if (!targetItems.length) { toast('Nothing to export'); return; }
+  if (exportDirSupported() && !exportPickedFolder) { toast('Please choose a save location'); return; }
+  const base = document.getElementById('exportNaming').value.trim() || 'image';
+  const fmt = document.getElementById('exportFormat').value;
+  const pad = Math.max(3, String(targetItems.length).length);
+  document.getElementById('exportDialog').style.display = 'none';
+
+  progress('Exporting images', 0);
+  let done = 0, ok = 0;
+  for (const it of targetItems) {
+    try {
+      const rec = store.get(it.imgId);
+      if (rec) {
+        const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
+        let outBlob = blob, ext = exportExt(fmt, rec);
+        if (fmt !== 'original') {
+          const bmp = await createImageBitmap(blob);
+          const cv = document.createElement('canvas');
+          cv.width = bmp.width; cv.height = bmp.height;
+          cv.getContext('2d').drawImage(bmp, 0, 0);
+          bmp.close();
+          outBlob = await new Promise(res => cv.toBlob(res, fmt === 'png' ? 'image/png' : 'image/jpeg', 0.92));
+        }
+        const filename = targetItems.length <= 1 ? `${base}.${ext}` : `${base}_${String(done + 1).padStart(pad, '0')}.${ext}`;
+        if (exportPickedFolder) {
+          const fh = await exportPickedFolder.getFileHandle(filename, { create: true });
+          const w = await fh.createWritable();
+          await w.write(outBlob);
+          await w.close();
+        } else {
+          download(filename, outBlob); // File System Access API未対応のブラウザ向けフォールバック(1枚ずつダウンロード)
+        }
+        ok++;
+      }
+    } catch {} // 1枚失敗しても、残りは続けて処理する
+    done++;
+    progress(`Exporting images (${done}/${targetItems.length})`, done / targetItems.length);
+  }
+  progressDone();
+  toast(`Exported ${ok} image(s)`);
+}
+document.getElementById('exportPickFolder').onclick = pickExportFolder;
+document.getElementById('exportFormat').addEventListener('change', updateExportNamingPreview);
+document.getElementById('exportNaming').addEventListener('input', updateExportNamingPreview);
+document.getElementById('exportDialogGo').onclick = runExport;
+document.getElementById('exportDialogCancel').onclick = () => { document.getElementById('exportDialog').style.display = 'none'; };
+document.getElementById('exportDialogX').onclick = () => { document.getElementById('exportDialog').style.display = 'none'; };
+
 /* ============ UI: ツールバー / メニュー / 通知 ============ */
 const fImg = document.getElementById('fImg'), fJson = document.getElementById('fJson');
 const helpBox = document.getElementById('help');
@@ -3297,6 +3476,12 @@ function openMenu(px, py) {
     ['Grayscale', 'G', () => keyAction('g')],
     ['Reset rotation', 'R', () => keyAction('r')],
     null,
+    ['Export', '', [
+      ['Export selected images…', '', () => openExportDialog('selected')],
+      ['Export all images…', '', () => openExportDialog('all')],
+      ['Export canvas as PNG', '', exportPNG],
+    ]],
+    null,
     ['Bring to front', 'PgUp', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = items.filter(i => !sel.has(i.id)).concat(s); paint(); }],
     ['Send to back', 'PgDn', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }],
     null,
@@ -3329,7 +3514,11 @@ function openMenu(px, py) {
       [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
     ]],
     [`JPG optimization (${!jpegOptimize ? 'Off' : (keepOriginalOnOptimize ? 'On+PNG' : 'On')})`, '', cycleJpegOptimize],
-    ['Export PNG', '', exportPNG],
+    ['Export', '', [
+      ['Export canvas as PNG', '', exportPNG],
+      ['Export selected images…', '', () => openExportDialog('selected')],
+      ['Export all images…', '', () => openExportDialog('all')],
+    ]],
     null,
     ['Shortcuts', '?', () => helpBox.style.display = 'grid'],
     ['Close board', '', closeBoard],
