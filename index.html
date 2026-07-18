@@ -603,6 +603,11 @@ let items = [];               // {id, imgId, x, y, w, h, rot, flipH, flipV, gray
 let currentBoardName = 'board'; // 保存ファイル名（拡張子なし）
 let sel = new Set();
 let view = { ox: 0, oy: 0, s: 1 };
+// 手動ズーム(ホイール/ピンチ)で許される最小の縮小率。以前は0.02(2%)までしか縮小できず、
+// 中身が非常に大きいボードだと全体を見渡せないことがあった。0除算等の数値的な破綻を避ける
+// ための最低限の下限として、0より大きい値を残しつつ、実質的にほぼ制限なく縮小できるくらい
+// 小さくしてある。fitAll()自体はもともとこの下限に縛られていない(view.sを直接計算値にする)。
+const MIN_ZOOM = 0.0001;
 let nextId = 1;
 
 const undoStack = [], redoStack = [];
@@ -1076,7 +1081,7 @@ function movePinch() { // 2本指の中点を不動点として拡縮・移動
   const [a, b] = [...pointers.values()];
   const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
   const d = Math.max(10, Math.hypot(a.x - b.x, a.y - b.y));
-  view.s = Math.min(32, Math.max(.02, drag.s0 * d / drag.d0));
+  view.s = Math.min(32, Math.max(MIN_ZOOM, drag.s0 * d / drag.d0));
   view.ox = mx - drag.wx * view.s;
   view.oy = my - drag.wy * view.s;
   paint();
@@ -1357,7 +1362,9 @@ cv.addEventListener('wheel', e => {
     paint(); return;
   }
   const f = Math.pow(1.0015, -e.deltaY);
-  const ns = Math.min(32, Math.max(.02, view.s * f));
+  // 縮小の下限は、ごく巨大なボードでも手動ズームで全体を見渡せるよう、かなり緩めにしてある
+  // (0除算などの数値的な破綻を避けるための最低限の下限として0.0001は残す)。
+  const ns = Math.min(32, Math.max(MIN_ZOOM, view.s * f));
   const k = ns / view.s;
   view.ox = e.clientX - (e.clientX - view.ox) * k;
   view.oy = e.clientY - (e.clientY - view.oy) * k;
