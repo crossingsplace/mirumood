@@ -1930,7 +1930,24 @@ async function driveFindFileInFolder(name, folderId) {
   const data = await res.json();
   return data.files && data.files[0] ? data.files[0].id : null;
 }
-async function driveUploadFile(name, blob, mimeType, folderId, existingFileId) {
+// Google Drive APIのmultipartアップロードは5MBまでという制限があり、それを超えると失敗する。
+// サムネイルやboard.jsonなど小さいものは従来通りmultipart(1回のリクエストで済んで速い)、
+// それを超えるもの(高解像度の原本など、数GB〜10GB超も想定)はresumableアップロードに
+// 自動的に切り替える。呼び出し側(saveBoardToDriveなど)は今まで通りdriveUploadFile()を
+// 呼ぶだけでよく、どちらの方式を使うかはここで自動的に決まる。
+const MULTIPART_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
+const RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024; // 256KBの倍数(Google推奨)。大きいほど往復が減るが、失敗時にやり直す量が増える
+const RESUMABLE_MAX_CHUNK_RETRIES = 6; // 1チャンクあたり、network/5xx等での再試行回数
+const RESUMABLE_MAX_SESSION_RESTARTS = 2; // resumableセッション自体が無効になった(期限切れ等)場合、最初からやり直す回数
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function driveUploadFile(name, blob, mimeType, folderId, existingFileId, onProgress) {
+  if ((blob.size || 0) <= MULTIPART_UPLOAD_MAX_BYTES) {
+    return driveUploadMultipart(name, blob, mimeType, folderId, existingFileId);
+  }
+  return driveUploadResumable(name, blob, mimeType, folderId, existingFileId, onProgress);
+}
+async function driveUploadMultipart(name, blob, mimeType, folderId, existingFileId) {
   const metadata = existingFileId ? { name } : { name, parents: [folderId] };
   const form = new FormData();
   form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
@@ -1942,6 +1959,96 @@ async function driveUploadFile(name, blob, mimeType, folderId, existingFileId) {
   const data = await res.json();
   if (!data.id) throw new Error('upload failed');
   return data.id;
+}
+// resumableセッションを新規に開始し、そのセッションURL(Locationヘッダー)を返す。
+async function driveStartResumableSession(name, blob, mimeType, folderId, existingFileId) {
+  const metadata = existingFileId ? { name } : { name, parents: [folderId] };
+  const url = existingFileId
+    ? `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=resumable&fields=id`
+    : `https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id`;
+  const res = await driveApiFetch(url, {
+    method: existingFileId ? 'PATCH' : 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=UTF-8',
+      'X-Upload-Content-Type': mimeType || 'application/octet-stream',
+      'X-Upload-Content-Length': String(blob.size || 0),
+    },
+    body: JSON.stringify(metadata),
+  });
+  if (!res.ok) throw new Error(`resumable upload: failed to start session (${res.status})`);
+  const sessionUrl = res.headers.get('Location');
+  if (!sessionUrl) throw new Error('resumable upload: no session URL returned');
+  return sessionUrl;
+}
+// 「今どこまで届いているか」をDrive側に問い合わせる。中断からの再開に使う。
+// 戻り値: 完了していれば {done:true, id}、途中であれば {done:false, offset}。
+async function driveQueryResumableOffset(sessionUrl, size) {
+  const res = await driveApiFetch(sessionUrl, { method: 'PUT', headers: { 'Content-Range': `bytes */${size}` } });
+  if (res.status === 200 || res.status === 201) {
+    const data = await res.json();
+    return { done: true, id: data.id };
+  }
+  if (res.status === 308) {
+    const range = res.headers.get('Range'); // 例: "bytes=0-8388607"
+    return { done: false, offset: range ? parseInt(range.split('-')[1], 10) + 1 : 0 };
+  }
+  return { done: false, offset: 0, invalidSession: true }; // 404/410など: セッション自体が失効している
+}
+async function driveUploadResumable(name, blob, mimeType, folderId, existingFileId, onProgress) {
+  const size = blob.size || 0;
+  for (let sessionAttempt = 0; sessionAttempt <= RESUMABLE_MAX_SESSION_RESTARTS; sessionAttempt++) {
+    const sessionUrl = await driveStartResumableSession(name, blob, mimeType, folderId, existingFileId);
+    let offset = 0;
+    let chunkRetries = 0;
+    let sessionInvalid = false;
+    while (offset < size) {
+      const end = Math.min(offset + RESUMABLE_CHUNK_BYTES, size);
+      let res;
+      try {
+        res = await driveApiFetch(sessionUrl, {
+          method: 'PUT',
+          headers: { 'Content-Length': String(end - offset), 'Content-Range': `bytes ${offset}-${end - 1}/${size}` },
+          body: blob.slice(offset, end),
+        });
+      } catch { // ネットワーク断など。少し待って現在位置を聞き直してから再開する
+        chunkRetries++;
+        if (chunkRetries > RESUMABLE_MAX_CHUNK_RETRIES) { sessionInvalid = true; break; }
+        await sleep(1000 * chunkRetries);
+        const q = await driveQueryResumableOffset(sessionUrl, size);
+        if (q.invalidSession) { sessionInvalid = true; break; }
+        if (q.done) return q.id;
+        offset = q.offset;
+        continue;
+      }
+      if (res.status === 200 || res.status === 201) {
+        const data = await res.json();
+        if (!data.id) throw new Error('resumable upload: no file id in final response');
+        return data.id;
+      }
+      if (res.status === 308) { // このチャンクは受理された。次へ進む
+        chunkRetries = 0;
+        const range = res.headers.get('Range');
+        offset = range ? parseInt(range.split('-')[1], 10) + 1 : end;
+        if (onProgress) onProgress(offset / size);
+        continue;
+      }
+      // 4xx/5xxなど。少し待って現在位置を聞き直してから再開する(このチャンクを丸ごと送り直すとは限らない)
+      chunkRetries++;
+      if (chunkRetries > RESUMABLE_MAX_CHUNK_RETRIES) { sessionInvalid = true; break; }
+      await sleep(1000 * chunkRetries);
+      const q = await driveQueryResumableOffset(sessionUrl, size);
+      if (q.invalidSession) { sessionInvalid = true; break; }
+      if (q.done) return q.id;
+      offset = q.offset;
+    }
+    if (sessionInvalid) continue; // このセッションはやり直す(forループの次のsessionAttemptへ)
+    // ここに来るのはoffset>=sizeでwhileを自然に抜けたケース。本来は途中のPUTで200/201を
+    // 受け取って既にreturnしているはずだが、念のため最後にもう一度状態を確認してから終える。
+    const finalCheck = await driveQueryResumableOffset(sessionUrl, size);
+    if (finalCheck.done) return finalCheck.id;
+    // ここに来ることは基本無いはずだが、来た場合は次のsessionAttemptで最初からやり直す
+  }
+  throw new Error('resumable upload failed after retries');
 }
 /* ==================== LOCAL-CACHE (画像バイナリのローカル永続キャッシュ) ====================
  * 目的: Driveからダウンロードした画像バイナリをこの端末に保存しておき、
