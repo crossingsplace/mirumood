@@ -432,6 +432,13 @@ function getOriginalBlob(imgId, rec) {
 // 実際にその画像が画面に映った瞬間、キャッシュ済みの原本からすぐデコードできるので体感は速い)。
 const bgPrefetchFailCount = new Map(); // imgId -> 裏読みでの失敗回数
 const bgPrefetchGaveUp = new Set(); // 既定回数失敗して、裏読みを諦めた画像ID(削除済み・壊れたID等、恒久的に無理なもの)
+// 以前は1回のアイドル時間につき1枚だけ取りに行っていたが、画像が2000枚を超えるような
+// 大きいボードだと、それだけでは全体を裏で取り終えるまでが極端に遅かった(体感で
+// 止まっているように見える)。取得自体はネットワーク待ちが主でCPUをほぼ使わないため、
+// 数枚まとめて並行して取りに行っても表の描画を邪魔しにくい。同時に走らせる本数だけ
+// 絞ることで、表の読み込みや回線を圧迫しすぎないようにしつつ、まとまった速度を出す。
+const BG_PREFETCH_CONCURRENCY = 3; // 同時に走らせる裏読みの本数
+const BG_PREFETCH_BATCH = 6; // 1回のアイドル時間で着手を検討する枚数の上限
 let bgPrefetchPending = false;
 function scheduleBackgroundPrefetch() {
   if (bgPrefetchPending) return; // 既に次の実行が予約されているなら重複させない
@@ -440,31 +447,41 @@ function scheduleBackgroundPrefetch() {
     bgPrefetchPending = false;
     if (!driveSignedIn()) return; // サインインできていない間は、同じ失敗を裏で無限に繰り返さないよう控える
     const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
-    let target = null;
+    const targets = [];
     for (const id of used) {
       const rec = store.get(id);
       if (!rec || !rec.driveId) continue;
       if (originalLoadedIds.has(id)) continue; // 既に原本データを取得済み(表示用・先読み問わず)なら対象外
       if (bgPrefetchGaveUp.has(id)) continue; // 何度も失敗して諦めた画像は飛ばし、他の画像を優先する
-      target = id;
-      break;
+      targets.push(id);
+      if (targets.length >= BG_PREFETCH_BATCH) break;
     }
-    if (target) {
-      try {
-        await getOriginalBlob(target, store.get(target));
-        bgPrefetchFailCount.delete(target);
-        updateStatus(); // 進捗表示にも反映させる
-      } catch (err) {
-        console.warn('[MiruMood] background prefetch failed for', target, err);
-        const n = (bgPrefetchFailCount.get(target) || 0) + 1;
-        bgPrefetchFailCount.set(target, n);
-        // ここで諦めずに同じ画像だけをずっと狙い続けると、それより後ろの画像が一生
-        // 裏読みされなくなってしまう(実際に起きていた不具合)。既定回数で諦めて、
-        // 次のループでは他の画像に優先度を譲る。
-        if (n >= 5) { bgPrefetchGaveUp.add(target); console.warn('[MiruMood] giving up background prefetch for', target, 'after', n, 'failed attempts'); }
+    if (!targets.length) return; // もう対象が無いので、ここで自然に止まる(次にscheduleBackgroundPrefetch()が
+                                  // 呼ばれる=新しい画像が追加された時などに、また動き出す)
+
+    // 単純なワーカープール: BG_PREFETCH_CONCURRENCY本を並行して走らせ、1本が終わったら
+    // targetsの次の1枚に取り掛かる。1枚失敗しても、他の枚のワーカーは止まらずに進み続ける。
+    let cursor = 0;
+    async function worker() {
+      while (cursor < targets.length) {
+        const id = targets[cursor++];
+        try {
+          await getOriginalBlob(id, store.get(id));
+          bgPrefetchFailCount.delete(id);
+        } catch (err) {
+          console.warn('[MiruMood] background prefetch failed for', id, err);
+          const n = (bgPrefetchFailCount.get(id) || 0) + 1;
+          bgPrefetchFailCount.set(id, n);
+          // ここで諦めずに同じ画像だけをずっと狙い続けると、それより後ろの画像が一生
+          // 裏読みされなくなってしまう(実際に起きていた不具合)。既定回数で諦めて、
+          // 次のループでは他の画像に優先度を譲る。
+          if (n >= 5) { bgPrefetchGaveUp.add(id); console.warn('[MiruMood] giving up background prefetch for', id, 'after', n, 'failed attempts'); }
+        }
+        updateStatus(); // 1枚終わるたびに進捗表示にも反映させる
       }
     }
-    if (target) scheduleBackgroundPrefetch(); // まだ続きがあれば、また次のアイドル時に予約する
+    await Promise.all(Array.from({ length: Math.min(BG_PREFETCH_CONCURRENCY, targets.length) }, worker));
+    scheduleBackgroundPrefetch(); // まだ続きがあるかもしれないので、次のアイドル時にまた確認する
   };
   if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 4000 });
   else setTimeout(run, 2000); // 未対応ブラウザ向けの簡易フォールバック
@@ -1917,6 +1934,15 @@ async function driveApiFetch(url, options = {}) {
     driveAccessToken = null;
     await ensureDriveToken();
     headers.Authorization = 'Bearer ' + driveAccessToken;
+    res = await fetch(url, Object.assign({}, options, { headers }));
+  }
+  // 429(レート制限)・5xx(一時的なサーバー側の問題)は、大きいボードを開いた直後など
+  // 短時間に多数のリクエストが集中した時に起きやすい。ここで軽く数回再試行しておくと、
+  // 本来は取れるはずの画像が「取得失敗」として扱われ、上位側の再試行カウンタ(裏読みの
+  // 5回上限など)を無駄に消費してしまうのを防げる。ここでの再試行はあくまで軽い保険で、
+  // 本格的なバックオフ・打ち切り判断は呼び出し側(裏読み・resumableアップロード等)に任せる。
+  for (let attempt = 0; (res.status === 429 || res.status >= 500) && attempt < 3; attempt++) {
+    await new Promise(r => setTimeout(r, 500 * 2 ** attempt + Math.random() * 200));
     res = await fetch(url, Object.assign({}, options, { headers }));
   }
   return res;
