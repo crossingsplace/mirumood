@@ -430,6 +430,8 @@ function getOriginalBlob(imgId, rec) {
 // 落としつつ裏で少しずつ取得しておく。ビットマップとしてデコードしてbmpCacheに載せる
 // ところまではせず、原本データをキャッシュしておくだけに留める(メモリを圧迫しないため。
 // 実際にその画像が画面に映った瞬間、キャッシュ済みの原本からすぐデコードできるので体感は速い)。
+const bgPrefetchFailCount = new Map(); // imgId -> 裏読みでの失敗回数
+const bgPrefetchGaveUp = new Set(); // 既定回数失敗して、裏読みを諦めた画像ID(削除済み・壊れたID等、恒久的に無理なもの)
 let bgPrefetchPending = false;
 function scheduleBackgroundPrefetch() {
   if (bgPrefetchPending) return; // 既に次の実行が予約されているなら重複させない
@@ -438,16 +440,31 @@ function scheduleBackgroundPrefetch() {
     bgPrefetchPending = false;
     if (!driveSignedIn()) return; // サインインできていない間は、同じ失敗を裏で無限に繰り返さないよう控える
     const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
-    let foundWork = false;
+    let target = null;
     for (const id of used) {
       const rec = store.get(id);
       if (!rec || !rec.driveId) continue;
       if (originalLoadedIds.has(id)) continue; // 既に原本データを取得済み(表示用・先読み問わず)なら対象外
-      foundWork = true;
-      try { await getOriginalBlob(id, rec); updateStatus(); } catch {} // 進捗表示にも反映させる
-      break; // 1回のアイドル時間につき1枚だけ。まだ続きがあれば、また次のアイドル時に予約する。
+      if (bgPrefetchGaveUp.has(id)) continue; // 何度も失敗して諦めた画像は飛ばし、他の画像を優先する
+      target = id;
+      break;
     }
-    if (foundWork) scheduleBackgroundPrefetch();
+    if (target) {
+      try {
+        await getOriginalBlob(target, store.get(target));
+        bgPrefetchFailCount.delete(target);
+        updateStatus(); // 進捗表示にも反映させる
+      } catch (err) {
+        console.warn('[MiruMood] background prefetch failed for', target, err);
+        const n = (bgPrefetchFailCount.get(target) || 0) + 1;
+        bgPrefetchFailCount.set(target, n);
+        // ここで諦めずに同じ画像だけをずっと狙い続けると、それより後ろの画像が一生
+        // 裏読みされなくなってしまう(実際に起きていた不具合)。既定回数で諦めて、
+        // 次のループでは他の画像に優先度を譲る。
+        if (n >= 5) { bgPrefetchGaveUp.add(target); console.warn('[MiruMood] giving up background prefetch for', target, 'after', n, 'failed attempts'); }
+      }
+    }
+    if (target) scheduleBackgroundPrefetch(); // まだ続きがあれば、また次のアイドル時に予約する
   };
   if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 4000 });
   else setTimeout(run, 2000); // 未対応ブラウザ向けの簡易フォールバック
@@ -492,11 +509,20 @@ function evict() {
 }
 // 別のボードを開く時に必ず呼ぶ: 異なるボード同士で画像ID("i1"等)が
 // 偶然重複していても、前のボードのデコード済み画像を誤って使い回さないようにする。
+// (原本取得の記録・失敗の記録も同じ理由で必ずここで一緒にクリアする。でないと、
+//  前のボードで「i1」が読み込み済み/失敗扱いだった場合、次に開いたボードの
+//  たまたま同じIDの画像が、実際には一度も取得していないのに読み込み済み扱いに
+//  なってしまったり、逆に一度も試していないのに裏読みを諦めた扱いになってしまう。)
 function clearBmpCache() {
   for (const e of bmpCache.values()) e.bmp.close();
   bmpCache.clear();
   cacheBytes = 0;
   pendingDecodes.clear();
+  decodeRetryCount.clear();
+  originalLoadedIds.clear();
+  inflightOriginal.clear();
+  bgPrefetchFailCount.clear();
+  bgPrefetchGaveUp.clear();
 }
 
 async function blobToThumb(srcBmp) { // 256px WebP サムネイル
@@ -1001,14 +1027,23 @@ function updateLoadProgress() {
   const now = performance.now();
   if (now - loadProgressCache.ts > LOAD_PROGRESS_RECOMPUTE_MS || loadProgressCache.itemsLen !== items.length) {
     const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
-    let loaded = 0;
-    for (const id of used) if (originalLoadedIds.has(id)) loaded++;
-    loadProgressCache = { used, loaded, ts: now, itemsLen: items.length };
+    let loaded = 0, gaveUp = 0;
+    for (const id of used) {
+      if (originalLoadedIds.has(id)) loaded++;
+      else if (bgPrefetchGaveUp.has(id)) gaveUp++; // 何度も失敗して裏読みを諦めた画像(=これ以上進みようがない)
+    }
+    loadProgressCache = { used, loaded, gaveUp, ts: now, itemsLen: items.length };
   }
-  const { used, loaded } = loadProgressCache;
+  const { used, loaded, gaveUp } = loadProgressCache;
   if (!used.length) { el.style.display = 'none'; return; }
-  if (loaded >= used.length) { el.style.display = 'none'; return; } // 全部読み込み終わったら消す
-  el.textContent = `Loading full-res images… ${Math.round((loaded / used.length) * 100)}% (${loaded}/${used.length})`;
+  // 諦めた画像を除けば、これ以上進みようがない状態になったら消す(以前は、1枚でも
+  // 恒久的に読み込めない画像があると、進捗が特定のパーセントで止まったまま
+  // ずっと表示され続けてしまっていた)。
+  if (loaded + gaveUp >= used.length) { el.style.display = 'none'; return; }
+  const pct = Math.round((loaded / used.length) * 100);
+  el.textContent = gaveUp > 0
+    ? `Loading full-res images… ${pct}% (${loaded}/${used.length}, ${gaveUp} failed)`
+    : `Loading full-res images… ${pct}% (${loaded}/${used.length})`;
   el.style.display = 'block';
 }
 function updateNoteToolbar() {
