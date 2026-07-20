@@ -417,9 +417,15 @@ function pumpDecodeQueue() {
       decodeActive--;
       pendingDecodes.delete(key);
       console.warn('[MiruMood] decode failed for', key, err); // 失敗の中身が見えないと切り分けできないため、必ずコンソールに残す
-      // 失敗しても諦めず、少し間隔を空けてから自動で再挑戦する。手動でズームし直さないと
-      // 画像が戻ってこない、という不具合(特にサインイン待ちが絡み時間差で失敗するケース)への対策。
-      scheduleDecodeRetry(imgId, lod);
+      if (err && err.permanent) {
+        // driveId無し等、何度リトライしても直りようがない失敗。5回リトライのサイクルに
+        // 乗せても時間の無駄なので、ここで即座に諦める。
+        console.warn('[MiruMood] not retrying', key, '— permanently unavailable');
+      } else {
+        // 失敗しても諦めず、少し間隔を空けてから自動で再挑戦する。手動でズームし直さないと
+        // 画像が戻ってこない、という不具合(特にサインイン待ちが絡み時間差で失敗するケース)への対策。
+        scheduleDecodeRetry(imgId, lod);
+      }
       pumpDecodeQueue();
     });
   }
@@ -514,12 +520,19 @@ function scheduleBackgroundPrefetch() {
           bgPrefetchFailCount.delete(id);
         } catch (err) {
           console.warn('[MiruMood] background prefetch failed for', id, err);
-          const n = (bgPrefetchFailCount.get(id) || 0) + 1;
-          bgPrefetchFailCount.set(id, n);
-          // ここで諦めずに同じ画像だけをずっと狙い続けると、それより後ろの画像が一生
-          // 裏読みされなくなってしまう(実際に起きていた不具合)。既定回数で諦めて、
-          // 次のループでは他の画像に優先度を譲る。
-          if (n >= 5) { bgPrefetchGaveUp.add(id); console.warn('[MiruMood] giving up background prefetch for', id, 'after', n, 'failed attempts'); }
+          if (err && err.permanent) {
+            // driveId無し等、何度リトライしても直りようがない失敗。5回リトライのサイクルに
+            // 乗せても時間の無駄なので、ここで即座に諦める。
+            bgPrefetchGaveUp.add(id);
+            console.warn('[MiruMood] not retrying', id, '— permanently unavailable');
+          } else {
+            const n = (bgPrefetchFailCount.get(id) || 0) + 1;
+            bgPrefetchFailCount.set(id, n);
+            // ここで諦めずに同じ画像だけをずっと狙い続けると、それより後ろの画像が一生
+            // 裏読みされなくなってしまう(実際に起きていた不具合)。既定回数で諦めて、
+            // 次のループでは他の画像に優先度を譲る。
+            if (n >= 5) { bgPrefetchGaveUp.add(id); console.warn('[MiruMood] giving up background prefetch for', id, 'after', n, 'failed attempts'); }
+          }
         }
         // updateStatus()自体が想定外の理由で例外を投げても、その下のPromise.all/再スケジュールが
         // 巻き込まれて止まってしまわないよう、ここだけ個別に保護しておく。
@@ -1913,11 +1926,11 @@ function requestDriveToken(silentOnly) {
     }, err => finish(reject, err));
   });
 }
-async function ensureDriveToken() {
+async function ensureDriveToken(silentOnly = false) {
   if (driveSignedIn()) return driveAccessToken;
   restoreDriveToken(); // 直前のページ再読み込みで消えていないか確認
   if (driveSignedIn()) return driveAccessToken;
-  return requestDriveToken(false);
+  return requestDriveToken(silentOnly);
 }
 // ページを開いた直後、以前サインイン済みだった痕跡があれば裏側で静かに再認証を試みる。
 // 失敗しても何もしない(確認画面をいきなり出したりトーストを出したりしない、あくまで裏側の試み)。
@@ -1982,12 +1995,19 @@ async function driveAuthClick() {
   }
 }
 async function driveApiFetch(url, options = {}) {
-  await ensureDriveToken();
+  // driveApiFetchはデコード・裏読み・保存など、あらゆる自動処理の奥深くから呼ばれるため、
+  // ここでのトークン取得は「ユーザーが今まさにクリックした」という保証が無い。サイレント
+  // 認証(確認画面なし)だけを試み、それが駄目なら確認画面(ポップアップ)へはエスカレーション
+  // しない。自動処理の途中でポップアップを開こうとすると、ブラウザに確実にブロックされて
+  // 20秒間の待ちが無駄になるだけでなく、その間に飛んでいる他の全リクエストも巻き込まれて
+  // 遅くなる。ポップアップでの再認証が必要な場合は、右クリックメニューからの明示的な
+  // サインインなど、ユーザー操作に直結した入り口(ensureDriveToken()を直接呼ぶ側)に任せる。
+  await ensureDriveToken(true);
   const headers = Object.assign({}, options.headers, { Authorization: 'Bearer ' + driveAccessToken });
   let res = await fetch(url, Object.assign({}, options, { headers }));
   if (res.status === 401) { // トークン失効：取り直して1回だけ再試行
     driveAccessToken = null;
-    await ensureDriveToken();
+    await ensureDriveToken(true);
     headers.Authorization = 'Bearer ' + driveAccessToken;
     res = await fetch(url, Object.assign({}, options, { headers }));
   }
@@ -2790,6 +2810,12 @@ const LocalCache = (() => {
 /* ==================== /LOCAL-CACHE ==================== */
 
 async function driveDownloadBlob(fileId, opts) {
+  // driveIdが無い(null/未設定)画像レコードが実在する(アップロードが何らかの理由で
+  // 記録されなかった等)。これに気づかず毎回ネットワークへ投げると、
+  // `.../files/null?alt=media` のような絶対に成功しないリクエストを送り続けることになる
+  // (実際にコンソールでこの404が大量に確認された)。何度リトライしても直りようがない
+  // ("永続的な"失敗)ので、そのことが分かるようにマークしてから即座に諦める。
+  if (!fileId) throw Object.assign(new Error('driveDownloadBlob: missing fileId (this image record has no Drive file to download)'), { permanent: true });
   // board.json(manifest)は同じdriveIdのまま中身が上書きされ得るのでキャッシュ対象外にする。
   // 画像本体/サムネイル/原本は一度アップロードされたら不変なのでキャッシュしてよい。
   const noCache = opts && opts.noCache;
