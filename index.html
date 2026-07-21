@@ -2545,7 +2545,11 @@ const LocalCache = (() => {
           await clearTrackedBoard(root, accName, boardName);
         }
       }
-    } catch {}
+      return true;
+    } catch (err) {
+      console.warn('[MiruMood] failed to clean up previous cache folder:', err);
+      return false;
+    }
   }
 
   async function clearIndexedDbBlobs() { // ブラウザ保存側の中身を空にする(外部フォルダへ切り替えた後、もう使われないので)
@@ -2613,9 +2617,12 @@ const LocalCache = (() => {
       // その上で消すのは「自分が書いたと記録している個々のファイル」だけで、記録に無いもの
       // (ユーザーが手動で置いた別データ等)には一切触れない。全部消せて空になったボード/
       // アカウントフォルダだけがフォルダごと消え、何か残っていればフォルダごと残る。
+      // どちらの安全策も通らなかった場合(権限が切れていた等)は、片付けを行わず、その旨を
+      // 呼び出し元に伝える(以前はここで無条件に「片付けました」と表示してしまっていた)。
+      let previousCleanupOk = null; // null=そもそも前のフォルダが無かった
       if (!sameAsBefore) {
         if (previousDir) {
-          if (await verifyDirOwnership(previousDir, previousDirId)) await clearAllManagedContent(previousDir);
+          previousCleanupOk = (await verifyDirOwnership(previousDir, previousDirId)) && await clearAllManagedContent(previousDir);
         }
         // IndexedDB側は他のアプリやユーザーのファイルとは無関係な、このアプリ専用のサンドボックス
         // されたデータベースなので、誤って無関係なものを消す心配が無い。外部フォルダへ切り替えた
@@ -2624,7 +2631,7 @@ const LocalCache = (() => {
         // 不具合につながるため。
         await clearIndexedDbBlobs();
       }
-      return { ok: true, name: dirLabel, previousLabel: previousLabel || null };
+      return { ok: true, name: dirLabel, previousLabel: previousLabel || null, previousCleanupOk };
     } catch (err) {
       // ダイアログを閉じた/キャンセルした場合はAbortErrorとして区別する。それ以外(権限拒否など
       // 本当のエラー)は、原因が画面に一切出ないと不具合の切り分けができなくなるため、
@@ -2915,9 +2922,16 @@ async function driveDownloadBlob(fileId, opts) {
 async function chooseCacheFolder() {
   const res = await LocalCache.chooseFolder();
   if (res.ok) {
-    toast(res.previousLabel
-      ? `Cache folder set: ${res.name} (cache data cleaned up at previous location "${res.previousLabel}" — any other files there were left untouched)`
-      : `Cache folder set: ${res.name}`);
+    if (res.previousCleanupOk === true) {
+      toast(`Cache folder set: ${res.name} (cache data cleaned up at previous location "${res.previousLabel}" — any other files there were left untouched)`);
+    } else if (res.previousCleanupOk === false) {
+      // 権限が切れていた等で確認が取れず、古い場所の後片付けをスキップした場合。以前はここでも
+      // 無条件に「片付けました」と表示してしまっており、実際には何も消えていないのに
+      // 消えたと勘違いさせてしまっていた。
+      toast(`Cache folder set: ${res.name} (could not confirm ownership of the previous location "${res.previousLabel}", so its old cache data was left in place — you can delete it manually if you want to free up space)`);
+    } else {
+      toast(`Cache folder set: ${res.name}`);
+    }
   } else if (res.reason !== 'cancelled') {
     toast(res.message ? `Could not set the cache folder: ${res.message}` : 'Could not set the cache folder');
   }
