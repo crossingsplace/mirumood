@@ -3196,65 +3196,82 @@ async function saveBoardToDrive(forceNewName) {
     await writeManifestCheckpoint(folderId, used, embeds);
 
     progress('Saving to Drive', 0);
+    // 以前は1枚ずつ順番にアップロードしていた。数GB・数千枚規模のボードだと、1回ごとの
+    // 通信の往復オーバーヘッドと待ち時間の積み重ねだけでかなりの時間がかかっていた。
+    // アップロード自体はネットワーク待ちが主でCPUをほぼ使わないため、裏読み・前面デコードと
+    // 同じ考え方で、複数枚をまとめて並行にアップロードする(同時実行数だけ絞ることで、
+    // 回線やDrive側のレート制限を圧迫しすぎないようにする)。
+    const UPLOAD_CONCURRENCY = 4;
     let dirtySinceCheckpoint = false; // 前回のチェックポイント以降に、実際にDrive側の何かが変わったか
-    for (const id of used) {
-      const rec = store.get(id);
-      if (!rec.driveId) {
-        const blob = await getBlob(rec.original);
-        rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
-        LocalCache.put(rec.driveId, blob, folderId, driveUserEmail).catch(() => {});
-        dirtySinceCheckpoint = true;
-      }
-      if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
-        // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
-        try {
-          const origBlob = await getBlob(rec.original);
-          const obmp = await createImageBitmap(origBlob);
-          rec.thumb = await blobToThumb(obmp);
-          obmp.close();
-        } catch {}
-      }
-      if (rec.thumb) {
-        let tblob = null;
-        if (!rec.thumbDriveId) {
-          tblob = await getBlob(rec.thumb);
-          rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
-          LocalCache.put(rec.thumbDriveId, tblob, folderId, driveUserEmail).catch(() => {});
+    // 複数のワーカーが同時に「5枚ごとのチェックポイント」条件を満たすことがあるため、
+    // 書き込みが重複して競合しないよう、進行中の書き込みを共有し、書き込み中に新たに
+    // 汚れた分は取りこぼさず次の書き込みへ引き継ぐ。
+    let checkpointInFlight = null;
+    async function maybeCheckpoint() {
+      if (!dirtySinceCheckpoint) return;
+      if (checkpointInFlight) { await checkpointInFlight; if (!dirtySinceCheckpoint) return; }
+      dirtySinceCheckpoint = false;
+      checkpointInFlight = writeManifestCheckpoint(folderId, used, embeds).finally(() => { checkpointInFlight = null; });
+      await checkpointInFlight;
+    }
+    let cursor = 0;
+    async function worker() {
+      while (cursor < used.length) {
+        const id = used[cursor++];
+        const rec = store.get(id);
+        if (!rec.driveId) {
+          const blob = await getBlob(rec.original);
+          rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
+          LocalCache.put(rec.driveId, blob, folderId, driveUserEmail).catch(() => {});
           dirtySinceCheckpoint = true;
         }
-        // 既にループ前の一括処理でembeds済み(=変更なし)ならここでは何もしない。
-        // 新規追加画像など、まだ埋め込まれていないものだけ、ここで計算する。
-        if (embedBudgetLeft > 0 && !embeds.has(id)) {
-          if (!rec.thumbEmbedStr) {
-            tblob = tblob || await getBlob(rec.thumb);
-            rec.thumbEmbedStr = await blobToDataURI(tblob);
-          }
-          const need = rec.thumbEmbedStr.length; // 既に出来上がっている文字列の長さそのものを使う(推定不要)
-          if (need <= embedBudgetLeft) {
-            embeds.set(id, rec.thumbEmbedStr);
-            embedBudgetLeft -= need;
+        if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
+          // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
+          try {
+            const origBlob = await getBlob(rec.original);
+            const obmp = await createImageBitmap(origBlob);
+            rec.thumb = await blobToThumb(obmp);
+            obmp.close();
+          } catch {}
+        }
+        if (rec.thumb) {
+          let tblob = null;
+          if (!rec.thumbDriveId) {
+            tblob = await getBlob(rec.thumb);
+            rec.thumbDriveId = await driveUploadFile(`${id}_thumb.webp`, tblob, 'image/webp', folderId);
+            LocalCache.put(rec.thumbDriveId, tblob, folderId, driveUserEmail).catch(() => {});
             dirtySinceCheckpoint = true;
           }
+          // 既にループ前の一括処理でembeds済み(=変更なし)ならここでは何もしない。
+          // 新規追加画像など、まだ埋め込まれていないものだけ、ここで計算する。
+          if (embedBudgetLeft > 0 && !embeds.has(id)) {
+            if (!rec.thumbEmbedStr) {
+              tblob = tblob || await getBlob(rec.thumb);
+              rec.thumbEmbedStr = await blobToDataURI(tblob);
+            }
+            const need = rec.thumbEmbedStr.length; // 既に出来上がっている文字列の長さそのものを使う(推定不要)
+            if (need <= embedBudgetLeft) {
+              embeds.set(id, rec.thumbEmbedStr);
+              embedBudgetLeft -= need;
+              dirtySinceCheckpoint = true;
+            }
+          }
         }
-      }
-      if (rec.fullOriginal && !rec.fullDriveId) { // 保持している無劣化の原本もアップロードする
-        const fblob = await getBlob(rec.fullOriginal);
-        rec.fullDriveId = await driveUploadFile(`${id}_full.${rec.fullExt}`, fblob, fblob.type || 'application/octet-stream', folderId);
-        LocalCache.put(rec.fullDriveId, fblob, folderId, driveUserEmail).catch(() => {});
-        dirtySinceCheckpoint = true;
-      }
-      done++;
-      progress('Saving to Drive', done / used.length);
-      // 5枚ごと(+最後の1枚は端数でも必ず)にboard.jsonへ進捗を反映する。ただし前回の
-      // チェックポイント以降に実際に何かアップロードされていない時は、書いても内容が
-      // 変わらない(=無駄なDriveへの書き込みになる)ので、その時はスキップする。
-      // (画像側が1枚も変わっていない保存では、ループ前のembeds一括処理とループ前の
-      //  1回の書き込みだけで既に完了しており、ここでの書き込みは1回も発生しない。)
-      if (dirtySinceCheckpoint && (done % 5 === 0 || done === used.length)) {
-        await writeManifestCheckpoint(folderId, used, embeds);
-        dirtySinceCheckpoint = false;
+        if (rec.fullOriginal && !rec.fullDriveId) { // 保持している無劣化の原本もアップロードする
+          const fblob = await getBlob(rec.fullOriginal);
+          rec.fullDriveId = await driveUploadFile(`${id}_full.${rec.fullExt}`, fblob, fblob.type || 'application/octet-stream', folderId);
+          LocalCache.put(rec.fullDriveId, fblob, folderId, driveUserEmail).catch(() => {});
+          dirtySinceCheckpoint = true;
+        }
+        done++;
+        progress('Saving to Drive', done / used.length);
+        // 5枚ごと(+最後の1枚は端数でも必ず)にboard.jsonへ進捗を反映する。ただし前回の
+        // チェックポイント以降に実際に何かアップロードされていない時は、書いても内容が
+        // 変わらない(=無駄なDriveへの書き込みになる)ので、その時はスキップする。
+        if (done % 5 === 0 || done === used.length) await maybeCheckpoint();
       }
     }
+    await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, used.length) }, worker));
     driveDirty = false;
     // JPG最適化の状態を、フォルダ自体のプロパティとして書いておく。こうしておくと、
     // Browse boardsの一覧を出す時に、board.jsonを1つずつ取りに行かなくても、
