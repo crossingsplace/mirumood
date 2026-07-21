@@ -4088,8 +4088,12 @@ addEventListener('resize', paint);
 // 画像アップロード中にタブを閉じる/リロードすると、board.jsonが書き込まれる前に中断されて
 // レイアウトが保存されないまま画像だけDriveに残ってしまう(見た目上「レイアウトがリセットされた」ように見える)。
 // これを防ぐため、保存進行中はブラウザ標準の「このページを離れますか」警告を出す。
+// あわせて、保存自体をまだ一度も始めていない「未保存の変更がある」状態(driveDirty)でも同じ
+// 警告を出す。.purの読み込み直後など、保存ボタンを押す前にタブを閉じてしまうと、保存前の
+// データはローカルには一切残っておらず(Driveアップロード成功後に初めてキャッシュされる仕組みの
+// ため)、そのまま何も警告が無いと全て消えてしまう。
 addEventListener('beforeunload', e => {
-  if (driveSaveInProgress) { e.preventDefault(); e.returnValue = ''; }
+  if (driveSaveInProgress || driveDirty) { e.preventDefault(); e.returnValue = ''; }
 });
 restoreDriveToken(); // 直前のページ再読み込みでログイン状態が残っていれば即座に復元する
 LocalCache.restoreFolder().then(updateCacheState).then(maybeNotifyCacheThreshold).catch(() => {}); // 以前選んだキャッシュ用フォルダがあれば復元する(失敗しても既定のIndexedDBが使われるだけ)
