@@ -1706,10 +1706,44 @@ addEventListener('drop', e => {
   if (fs.length) addFiles(fs, e.clientX, e.clientY);
 });
 /* クリップボード */
+const MIRUMOOD_NOTES_CLIP_PREFIX = 'MIRUMOOD_NOTES_V1:'; // 自分自身がコピーしたメモだと分かる目印
 addEventListener('paste', e => {
+  const text = e.clipboardData?.getData('text/plain') || '';
+  if (text.startsWith(MIRUMOOD_NOTES_CLIP_PREFIX)) {
+    // MiruMood自身でコピーしたメモ(1つ以上)。画像として取り込まず、編集可能なテキストの
+    // ままアイテムとして復元する。他アプリ用に同時に書き込まれているimage/pngは無視する。
+    e.preventDefault();
+    try { pasteNotesFromClipboardText(text.slice(MIRUMOOD_NOTES_CLIP_PREFIX.length)); } catch { toast('Could not paste'); }
+    return;
+  }
   const fs = [...(e.clipboardData?.items || [])].filter(i => i.type.startsWith('image/')).map(i => i.getAsFile());
   if (fs.length) { e.preventDefault(); addFiles(fs); }
 });
+// クリップボードから読んだJSONを元に、メモ同士の相対的な位置関係を保ったまま画面中央へ配置し直す。
+function pasteNotesFromClipboardText(json) {
+  const notes = JSON.parse(json);
+  if (!Array.isArray(notes) || !notes.length) return;
+  let x0 = 1 / 0, y0 = 1 / 0, x1 = -1 / 0, y1 = -1 / 0;
+  for (const n of notes) {
+    const hw = (n.w || 0) / 2, hh = (n.h || 0) / 2;
+    x0 = Math.min(x0, n.x - hw); x1 = Math.max(x1, n.x + hw);
+    y0 = Math.min(y0, n.y - hh); y1 = Math.max(y1, n.y + hh);
+  }
+  const gcx = (x0 + x1) / 2, gcy = (y0 + y1) / 2;
+  const wx = s2wX(innerWidth / 2), wy = s2wY(innerHeight / 2); // 貼り付け先はビューポート中央
+  pushUndo();
+  sel.clear();
+  for (const n of notes) {
+    const it = { id: nextId++, type: 'note', text: n.text || '', bold: !!n.bold,
+      x: wx + (n.x - gcx), y: wy + (n.y - gcy), w: n.w, h: n.h, rot: n.rot || 0,
+      flipH: false, flipV: false, gray: false, opacity: n.opacity ?? 1,
+      bg: n.bg || NOTE_COLORS[0][0], fg: n.fg || NOTE_COLORS[0][1], fontSize: n.fontSize || 18 };
+    items.push(it); sel.add(it.id);
+  }
+  driveDirty = true; updateDriveState();
+  paint();
+  toast(notes.length > 1 ? `Pasted ${notes.length} notes` : 'Pasted note');
+}
 
 /* ============ 操作系 ============ */
 function duplicateSel() { // imgIdを共有するのでメモリは増えない
@@ -1849,9 +1883,22 @@ async function copySelectionToClipboard() {
       pngBlob = await new Promise(res => c.toBlob(res, 'image/png'));
     }
     if (!pngBlob) throw new Error('failed to encode PNG');
-    await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+    const clipItems = { 'image/png': pngBlob }; // 他アプリへ貼り付ける用(今まで通り)
+    if (selItems.every(i => i.type === 'note')) {
+      // 選択が全部メモなら、MiruMood自身への貼り付け時に画像化させず編集可能なテキストの
+      // ままにできるよう、テキストとしても書き込んでおく(他アプリでは単なるテキストとして
+      // 貼り付けられるだけで、実害は無い)。
+      const payload = selItems.map(it => ({
+        text: it.text || '', bold: !!it.bold, w: it.w, h: it.h, rot: it.rot || 0,
+        bg: it.bg, fg: it.fg, fontSize: it.fontSize, opacity: it.opacity ?? 1, x: it.x, y: it.y,
+      }));
+      clipItems['text/plain'] = new Blob([MIRUMOOD_NOTES_CLIP_PREFIX + JSON.stringify(payload)], { type: 'text/plain' });
+    }
+    await navigator.clipboard.write([new ClipboardItem(clipItems)]);
     progressDone();
-    toast(selItems.length > 1 ? `Copied ${selItems.length} items — paste into another app with Ctrl+V` : 'Copied — paste it into another app with Ctrl+V');
+    const noteMsg = selItems.length > 1 ? `Copied ${selItems.length} notes — Ctrl+V here to paste as editable notes` : 'Copied note — Ctrl+V here to paste as an editable note';
+    const genericMsg = selItems.length > 1 ? `Copied ${selItems.length} items — paste into another app with Ctrl+V` : 'Copied — paste it into another app with Ctrl+V';
+    toast(selItems.every(i => i.type === 'note') ? noteMsg : genericMsg);
   } catch {
     progressDone();
     toast('Copy failed');
