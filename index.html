@@ -1699,6 +1699,8 @@ addEventListener('drop', e => {
   const fs = [...e.dataTransfer.files];
   const pur = fs.find(f => /\.pur$/i.test(f.name)); // PUR-IMPORT hook
   if (pur && window.__purImport) { window.__purImport.load(pur, e.clientX, e.clientY); return; }
+  const psd = fs.find(f => /\.psd$/i.test(f.name)); // PSD-IMPORT hook
+  if (psd && window.__psdImport) { window.__psdImport.load(psd, e.clientX, e.clientY); return; }
   const board = fs.find(f => /\.(mrmd|zip)$/i.test(f.name));
   if (board) { loadBoard(board); return; }
   if (fs.length) addFiles(fs, e.clientX, e.clientY);
@@ -4752,6 +4754,163 @@ prefetchGoogleLibs();
   window.__purImport = PUR; // drop ハンドラのフックから参照
 })();
 /* ==================== /PUR-IMPORT ==================== */
+
+/* ==================== PSD-IMPORT (undocumented, removable) ====================
+ * PSDファイルをPhotoshopを開かずに、全レイヤーを統合済みの合成ラスタだけを取り出して
+ * リファレンス画像として読み込む隠し機能。ドラッグ&ドロップ専用・UI表記なし。
+ * この機能を削除する場合: このブロック全体と、dropハンドラ内の「PSD-IMPORT hook」1行を
+ * 消すだけでよい。他コードへの依存追加はない。
+ *
+ * スコープ: Adobe公式のPSD仕様のうち、以下だけをサポートする。
+ *  - PSD(バージョン1)のみ。PSB(巨大ドキュメント版、バージョン2)は非対応。
+ *  - カラーモードはRGBのみ、ビット深度は8bitのみ。
+ *  - 圧縮方式は無圧縮/RLE(PackBits)/ZIP/ZIP+予測フィルタに対応。
+ * それ以外(CMYK・16/32bit・グレースケール・インデックスカラー・PSB等)は、
+ * 読み込めない旨をトーストで案内するだけに留める(クラッシュはしない)。
+ *
+ * 形式メモ: PSD = ヘッダ(26byte) → カラーモードデータ(読み飛ばす) → イメージリソース
+ * (読み飛ばす) → レイヤー/マスク情報(読み飛ばす。個々のレイヤーは一切パースしない) →
+ * 画像データ(全レイヤーを合成済みのラスタ。ここだけを取り出して使う)。
+ * レイヤーやブレンドモードを一切理解する必要がないので、`.pur`よりはむしろ単純。
+ */
+(() => {
+  function u16(dv, o) { return dv.getUint16(o); }
+  function u32(dv, o) { return dv.getUint32(o); }
+
+  // PackBits(TIFF/PSDのRLE)復号。1行分のバイト列を返す。
+  function unpackBits(src, srcOff, srcLen, dstLen) {
+    const dst = new Uint8Array(dstLen);
+    let si = srcOff, di = 0;
+    const end = srcOff + srcLen;
+    while (di < dstLen && si < end) {
+      const n = src[si++];
+      if (n < 128) { // 0..127: 次の(n+1)バイトをそのままコピー
+        const cnt = Math.min(n + 1, dstLen - di);
+        dst.set(src.subarray(si, si + cnt), di);
+        si += n + 1; di += cnt;
+      } else if (n > 128) { // 129..255(=-127..-1): 次の1バイトを(257-n)回繰り返す
+        const cnt = Math.min(257 - n, dstLen - di);
+        const b = src[si++];
+        dst.fill(b, di, di + cnt);
+        di += cnt;
+      } // n === 128: no-op
+    }
+    return dst;
+  }
+  // PSDのZIP圧縮はzlib形式(ヘッダ+Adler32付き)。ブラウザ標準のDecompressionStreamで解凍する。
+  async function inflateZlib(bytes) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  // ZIP+予測フィルタは、各行を「直前バイトとの差分」に変換して圧縮してある(8bit時)。
+  // 行ごとに累積和を取れば元の値に戻る。
+  function undoPrediction(plane, w, h) {
+    for (let y = 0; y < h; y++) {
+      const off = y * w;
+      for (let x = 1; x < w; x++) plane[off + x] = (plane[off + x] + plane[off + x - 1]) & 0xff;
+    }
+  }
+  // 「画像データ」セクション(全レイヤー合成済みのラスタ)を復号し、[R,G,B,(A)]の平面配列で返す。
+  async function decodeComposite(dv, bytes, offset, w, h, chCount) {
+    const compression = u16(dv, offset); offset += 2;
+    const wantCh = Math.min(chCount, 4); // RGB、あればアルファまで。それ以上の追加チャンネルは無視する。
+    const planes = [];
+    if (compression === 0) { // 無圧縮
+      for (let c = 0; c < chCount; c++) {
+        if (c < wantCh) planes.push(bytes.subarray(offset, offset + w * h));
+        offset += w * h;
+      }
+    } else if (compression === 1) { // RLE(PackBits)
+      const rowCounts = [];
+      for (let i = 0; i < chCount * h; i++) { rowCounts.push(u16(dv, offset)); offset += 2; }
+      let rowIdx = 0;
+      for (let c = 0; c < chCount; c++) {
+        const plane = c < wantCh ? new Uint8Array(w * h) : null;
+        for (let y = 0; y < h; y++) {
+          const len = rowCounts[rowIdx++];
+          if (plane) plane.set(unpackBits(bytes, offset, len, w), y * w);
+          offset += len;
+        }
+        if (plane) planes.push(plane);
+      }
+    } else if (compression === 2 || compression === 3) { // ZIP / ZIP+予測フィルタ
+      // 全チャンネル分がまとめて1本のzlibストリームになっているため、一度に解凍してから
+      // チャンネルごとに均等分割する。
+      const raw = await inflateZlib(bytes.subarray(offset));
+      let ro = 0;
+      for (let c = 0; c < chCount; c++) {
+        if (c < wantCh) {
+          const plane = raw.slice(ro, ro + w * h); // 予測解除で書き換えるのでコピーする
+          if (compression === 3) undoPrediction(plane, w, h);
+          planes.push(plane);
+        }
+        ro += w * h;
+      }
+    } else {
+      throw new Error('unsupported compression method ' + compression);
+    }
+    return planes;
+  }
+  async function psdToBlob(file) {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const dv = new DataView(buf);
+    if (bytes.length < 26 || u32(dv, 0) !== 0x38425053) throw new Error('not a PSD file'); // "8BPS"
+    if (u16(dv, 4) !== 1) throw new Error('PSB (large document format) is not supported, only PSD');
+    const channels = u16(dv, 12);
+    const height = u32(dv, 14);
+    const width = u32(dv, 18);
+    const depth = u16(dv, 22);
+    const mode = u16(dv, 24);
+    if (mode !== 3) throw new Error('only RGB color mode is supported');
+    if (depth !== 8) throw new Error('only 8-bit color depth is supported');
+    if (!(width > 0 && height > 0 && width <= 30000 && height <= 30000)) throw new Error('unsupported image dimensions');
+
+    let o = 26;
+    o += 4 + u32(dv, o); // カラーモードデータ: 読み飛ばす
+    o += 4 + u32(dv, o); // イメージリソース: 読み飛ばす
+    o += 4 + u32(dv, o); // レイヤー/マスク情報: 読み飛ばす(個々のレイヤーは一切パースしない)
+
+    const planes = await decodeComposite(dv, bytes, o, width, height, channels);
+    if (planes.length < 3) throw new Error('could not read the composite image data');
+    const [R, G, B] = planes, A = planes[3];
+    const imgData = new ImageData(width, height);
+    const px = imgData.data;
+    for (let i = 0, n = width * height; i < n; i++) {
+      px[i * 4] = R[i]; px[i * 4 + 1] = G[i]; px[i * 4 + 2] = B[i];
+      px[i * 4 + 3] = A ? A[i] : 255;
+    }
+    const canvas = new OffscreenCanvas(width, height);
+    canvas.getContext('2d').putImageData(imgData, 0, 0);
+    return canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 }); // PureRef同様、フラット化してJPGとして扱う
+  }
+  async function loadPsd(file, cx, cy) {
+    try {
+      progress('Loading', 0.3);
+      const blob = await psdToBlob(file);
+      progress('Loading', 0.85);
+      const imgId = await importImageBlob(blob, 'image/jpeg');
+      progressDone();
+      if (!imgId) { toast('Could not read this PSD file'); return; }
+      pushUndo();
+      const wx = cx !== undefined ? s2wX(cx) : s2wX(innerWidth / 2);
+      const wy = cy !== undefined ? s2wY(cy) : s2wY(innerHeight / 2);
+      const wasEmpty = !items.length;
+      const it = addItemForImage(imgId, wx, wy);
+      sel.clear(); sel.add(it.id);
+      driveDirty = true; updateDriveState();
+      paint();
+      if (wasEmpty) fitAll();
+      toast('PSD imported as a flattened preview');
+    } catch (err) {
+      console.warn('psd import:', err);
+      progressDone();
+      toast(`Could not read this PSD file (${err && err.message ? err.message : 'unsupported format'})`);
+    }
+  }
+  window.__psdImport = { load: loadPsd };
+})();
+/* ==================== /PSD-IMPORT ==================== */
 </script>
 </body>
 </html>
