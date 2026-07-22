@@ -21,6 +21,11 @@
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:6px;
     opacity:.65;pointer-events:none;z-index:9}
   #bar button{all:unset;cursor:pointer;padding:5px 9px;border-radius:5px;color:var(--text);font-size:12px}
+  #readOnlyBanner{position:fixed;top:0;left:0;right:0;display:none;align-items:center;gap:12px;justify-content:center;
+    padding:8px 14px;font-size:13px;color:#17181c;background:var(--accent);z-index:30}
+  #readOnlyBanner button{all:unset;cursor:pointer;padding:5px 12px;border-radius:6px;font-size:12px;font-weight:600;
+    color:var(--accent);background:#17181c}
+  #readOnlyBanner button:hover{opacity:.85}
   #driveAuthBtn{display:inline-flex;align-items:center;gap:7px;padding:5px 9px;color:var(--text);font-size:12px;cursor:default}
   #bar button:hover{background:#ffffff14}
   #bar .sep{width:1px;background:var(--line);margin:3px 2px}
@@ -148,6 +153,11 @@
   <span id="cacheState" data-act="cache-folder" title="Click to change where the local image cache is stored"></span>
 </div>
 <div id="loadProgress"></div>
+<div id="readOnlyBanner" style="display:none">
+  <span id="readOnlyBannerText">Read-only shared view</span>
+  <button id="readOnlyBannerSignIn" style="display:none">Sign in to view</button>
+  <button id="readOnlyBannerDownload">Download as .mrmd</button>
+</div>
 
 <div id="menu"></div>
 
@@ -794,6 +804,9 @@ const undoStack = [], redoStack = [];
 function snapshot() { return items.map(it => ({ ...it, crop: it.crop ? { ...it.crop } : it.crop })); }
 let driveDirty = false; // 前回のDrive保存以降に変更があったか(状態表示用)
 let driveSaveInProgress = false; // Driveへの保存(アップロードループ)が進行中かどうか。beforeunloadでの警告に使う。
+// リンク共有(閲覧専用)で開いている場合はtrue。パン/ズーム以外の操作を一切受け付けなくする。
+let readOnlyShared = false;
+let sharedViewResourceKey = null; // リンク共有されたフォルダを読むためのリソースキー(自分の所有物ではない場合のみ必要)
 function pushUndo() { undoStack.push(snapshot()); if (undoStack.length > 60) undoStack.shift(); redoStack.length = 0; driveDirty = true; updateDriveState(); }
 function undo() { if (!undoStack.length) return; redoStack.push(snapshot()); items = undoStack.pop(); sel.clear(); cropState = null; driveDirty = true; updateDriveState(); paint(); }
 function redo() { if (!redoStack.length) return; undoStack.push(snapshot()); items = redoStack.pop(); sel.clear(); cropState = null; driveDirty = true; updateDriveState(); paint(); }
@@ -1386,6 +1399,10 @@ cv.addEventListener('pointerdown', e => {
     cropState = null; paint(); // ハンドル外クリック：クロップ終了して通常処理へ
   }
 
+  if (readOnlyShared) { // 閲覧専用の共有ビューでは、パン以外の操作を一切受け付けない
+    mode = 'pan'; drag.ox = view.ox; drag.oy = view.oy; return;
+  }
+
   if (touch) { // ---- タッチ専用ルート（マウス処理には影響しない）----
     clearTimeout(longPressTimer);
     longPressTimer = setTimeout(() => { // 長押しでメニュー
@@ -1619,6 +1636,11 @@ addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
   if (e.code === 'Space') { spaceDown = true; cv.style.cursor = 'grab'; e.preventDefault(); return; }
   const ctl = e.ctrlKey || e.metaKey;
+  if (readOnlyShared) { // 閲覧専用の共有ビューでは、見る操作(全体表示)以外は一切受け付けない
+    if (e.key === 'Escape') { sel.clear(); hideMenu(); paint(); }
+    else if (e.key.toLowerCase() === 'f' && !ctl) fitAll();
+    return;
+  }
   const selected = () => items.filter(i => sel.has(i.id));
 
   if (cropState && (e.key === 'Enter' || e.key === 'Escape' || e.key.toLowerCase() === 'c')) {
@@ -1696,6 +1718,7 @@ addEventListener('dragover', e => { e.preventDefault(); dropOverlay.style.displa
 addEventListener('dragleave', e => { if (e.relatedTarget === null) dropOverlay.style.display = 'none'; });
 addEventListener('drop', e => {
   e.preventDefault(); dropOverlay.style.display = 'none';
+  if (readOnlyShared) { toast('This is a read-only shared view'); return; }
   const fs = [...e.dataTransfer.files];
   const pur = fs.find(f => /\.pur$/i.test(f.name)); // PUR-IMPORT hook
   if (pur && window.__purImport) { window.__purImport.load(pur, e.clientX, e.clientY); return; }
@@ -1708,6 +1731,7 @@ addEventListener('drop', e => {
 /* クリップボード */
 const MIRUMOOD_NOTES_CLIP_PREFIX = 'MIRUMOOD_NOTES_V1:'; // 自分自身がコピーしたメモだと分かる目印
 addEventListener('paste', e => {
+  if (readOnlyShared) return;
   const text = e.clipboardData?.getData('text/plain') || '';
   if (text.startsWith(MIRUMOOD_NOTES_CLIP_PREFIX)) {
     // MiruMood自身でコピーしたメモ(1つ以上)。画像として取り込まず、編集可能なテキストの
@@ -2169,6 +2193,10 @@ async function driveApiFetch(url, options = {}) {
   // サインインなど、ユーザー操作に直結した入り口(ensureDriveToken()を直接呼ぶ側)に任せる。
   await ensureDriveToken(true);
   const headers = Object.assign({}, options.headers, { Authorization: 'Bearer ' + driveAccessToken });
+  // リンク共有(閲覧専用)で開いている場合、自分の所有物ではないフォルダを読むのに
+  // リソースキーが必要になることがある(Googleがリンクの当てずっぽうを防ぐための仕組み)。
+  // 無関係なリクエストに付いていても無視されるだけなので、一律で付けてしまって問題ない。
+  if (sharedViewResourceKey && currentDriveFolderId) headers['X-Goog-Drive-Resource-Keys'] = `${currentDriveFolderId}/${sharedViewResourceKey}`;
   let res = await fetch(url, Object.assign({}, options, { headers }));
   if (res.status === 401) { // トークン失効：取り直して1回だけ再試行
     driveAccessToken = null;
@@ -3156,8 +3184,12 @@ async function chooseCacheFolder() {
 async function renameBoardById(folderId, oldName, newName) {
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return false; }
   try {
-    const rootId = await ensureRootFolder();
-    const existing = await driveFindFolder(newName, rootId);
+    // 重複名チェックは「自分のMiruMoodルート」ではなく、このフォルダが実際に入っている
+    // 親フォルダを見て行う。共有されたボードや、Google Picker経由で開いた自分のMiruMood
+    // ルート外のフォルダは、必ずしも自分のMiruMoodルートの下にあるとは限らないため
+    // (以前はここで常に自分のルートを見てしまい、無関係な場所をチェックしていた)。
+    const parentId = await driveGetParent(folderId).catch(() => null);
+    const existing = parentId ? await driveFindFolder(newName, parentId) : null;
     if (existing && existing !== folderId) { toast(`A board named "${newName}" already exists`); return false; }
     const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${folderId}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
@@ -3365,6 +3397,7 @@ async function writeManifestCheckpoint(folderId, used, embeds) {
 }
 
 async function saveBoardToDrive(forceNewName) {
+  if (readOnlyShared) { toast('This is a read-only shared view — download it as .mrmd to edit your own copy'); return; }
   if (!items.length) { toast('Board is empty'); return; }
   try { await ensureDriveToken(); } catch { toast('Please sign in with Google'); return; }
   if (!driveUserEmail) await fetchDriveUserInfo();
@@ -3590,6 +3623,50 @@ async function confirmDeleteBoard(f) {
     toast('Failed to delete the board');
   }
 }
+// リンクを知っている全員が閲覧できる状態にし、共有リンクをクリップボードにコピーする。
+// 権限は「閲覧者」のみ(編集はさせない)。既に共有済みなら、既存のリンクをそのまま案内する。
+async function shareBoardReadOnly(f) {
+  try {
+    const permRes = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${f.id}/permissions?fields=permissions(id,type,role)`);
+    const permData = await permRes.json();
+    let anyonePerm = (permData.permissions || []).find(p => p.type === 'anyone');
+    if (!anyonePerm) {
+      await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${f.id}/permissions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'anyone', role: 'reader' }),
+      });
+    } else if (anyonePerm.role !== 'reader') {
+      // 万一「編集者」等になっていた場合は、閲覧のみへ引き下げる(この機能は閲覧共有専用のため)
+      await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${f.id}/permissions/${anyonePerm.id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'reader' }),
+      });
+    }
+    const metaRes = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${f.id}?fields=resourceKey`);
+    const meta = await metaRes.json();
+    const url = new URL(location.href);
+    url.search = '';
+    url.searchParams.set('board', f.id);
+    if (meta.resourceKey) url.searchParams.set('key', meta.resourceKey);
+    await navigator.clipboard.writeText(url.toString());
+    toast(`Share link copied — anyone with this link can view "${f.name}" (view only)`);
+  } catch {
+    toast('Failed to create a share link');
+  }
+}
+// 共有を取り消し、リンクを知っていても開けない(元の非公開)状態に戻す
+async function unshareBoardReadOnly(f) {
+  try {
+    const permRes = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${f.id}/permissions?fields=permissions(id,type)`);
+    const permData = await permRes.json();
+    const anyonePerm = (permData.permissions || []).find(p => p.type === 'anyone');
+    if (!anyonePerm) { toast(`"${f.name}" is not currently shared via link`); return; }
+    await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${f.id}/permissions/${anyonePerm.id}`, { method: 'DELETE' });
+    toast(`"${f.name}" is no longer shared via link`);
+  } catch {
+    toast('Failed to update sharing');
+  }
+}
 async function confirmClearCacheFor(f) {
   if (!confirm(`Clear the local cache for "${f.name}"?\nImages will simply be re-downloaded from Drive next time this board is opened.`)) return;
   await LocalCache.clearBoardCache(f.id, driveUserEmail);
@@ -3691,6 +3768,14 @@ function showBoardListModal(folders, simple, cachedIds) {
       const showInDriveBtn = document.createElement('button');
       showInDriveBtn.textContent = 'Show in Drive';
       showInDriveBtn.onclick = (e) => { e.stopPropagation(); openDriveFolderInBrowser(f.id); };
+      const shareBtn = document.createElement('button');
+      shareBtn.textContent = 'Share';
+      shareBtn.title = 'Copy a link that lets anyone view this board (read-only)';
+      shareBtn.onclick = (e) => { e.stopPropagation(); shareBoardReadOnly(f); };
+      const unshareBtn = document.createElement('button');
+      unshareBtn.textContent = 'Unshare';
+      unshareBtn.title = 'Make this board private again (the share link will stop working)';
+      unshareBtn.onclick = (e) => { e.stopPropagation(); unshareBoardReadOnly(f); };
       const cacheAllBtn = document.createElement('button');
       cacheAllBtn.textContent = 'Cache';
       cacheAllBtn.title = "Download and cache all of this board's images to this device";
@@ -3702,7 +3787,7 @@ function showBoardListModal(folders, simple, cachedIds) {
       deleteBtn.className = 'danger';
       deleteBtn.textContent = 'Delete';
       deleteBtn.onclick = (e) => { e.stopPropagation(); confirmDeleteBoard(f); };
-      actions.append(renameBtn, showInDriveBtn, cacheAllBtn, cacheBtn, deleteBtn);
+      actions.append(renameBtn, showInDriveBtn, shareBtn, unshareBtn, cacheAllBtn, cacheBtn, deleteBtn);
       row.appendChild(actions);
       entry.appendChild(row);
 
@@ -4308,6 +4393,21 @@ function openSubmenu(anchorBtn, childRows) {
   submenuEl = sub;
 }
 function openMenu(px, py) {
+  if (readOnlyShared) { // 閲覧専用の共有ビューでは、見る・持ち帰る以外の操作を出さない
+    const menu = document.getElementById('menu');
+    menu.innerHTML = '';
+    closeSubmenu();
+    for (const r of [['Fit all', 'F', fitAll], ['Download as .mrmd (to edit your own copy)', '', saveBoard]]) {
+      const b = document.createElement('button');
+      b.innerHTML = `<span>${r[0]}</span><span class="k">${r[1]}</span>`;
+      b.onclick = () => { hideMenu(); r[2](); };
+      menu.appendChild(b);
+    }
+    menu.style.display = 'block';
+    menu.style.left = Math.min(px, innerWidth - menu.offsetWidth - 8) + 'px';
+    menu.style.top = Math.min(py, innerHeight - menu.offsetHeight - 8) + 'px';
+    return;
+  }
   const wx = s2wX(px), wy = s2wY(py);
   const hit = itemAt(wx, wy);
   if (hit && !sel.has(hit.id)) { sel.clear(); sel.add(hit.id); paint(); }
@@ -4447,6 +4547,41 @@ LocalCache.restoreFolder().then(updateCacheState).then(maybeNotifyCacheThreshold
 updateJpegBtn();
 updateDriveUI();
 paint();
+
+// リンク共有(?board=ID&key=KEY)で開かれた場合、そのボードを閲覧専用で自動的に開く。
+// ページ読み込み自体はユーザー操作(クリック等)ではないため、まだサインインしていない
+// 訪問者に対してはポップアップでのサインインを自動では試みられない(ブラウザに確実に
+// ブロックされる)。その場合は、明示的なクリックを挟んでから改めて開く。
+function setReadOnlyBanner(visible, text, showSignIn) {
+  const el = document.getElementById('readOnlyBanner');
+  if (text) document.getElementById('readOnlyBannerText').textContent = text;
+  document.getElementById('readOnlyBannerSignIn').style.display = showSignIn ? 'inline-block' : 'none';
+  el.style.display = visible ? 'flex' : 'none';
+}
+async function tryOpenSharedLinkFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const boardId = params.get('board');
+  if (!boardId) return;
+  readOnlyShared = true;
+  sharedViewResourceKey = params.get('key') || null;
+  const openIt = async () => {
+    setReadOnlyBanner(true, 'Loading shared board…', false);
+    try {
+      await openDriveFolderById(boardId, 'Shared board');
+      setReadOnlyBanner(true, 'Read-only shared view — changes here are not saved', false);
+    } catch {
+      setReadOnlyBanner(true, 'Could not open this shared board (it may no longer be shared, or the link is incomplete)', false);
+    }
+  };
+  if (driveSignedIn()) { await openIt(); return; }
+  setReadOnlyBanner(true, 'Sign in with Google to view this shared board', true);
+  document.getElementById('readOnlyBannerSignIn').onclick = async () => {
+    try { await ensureDriveToken(false); } catch { toast('Sign-in failed'); return; } // ここは明示的なクリック起点なので確認画面を許可してよい
+    await openIt();
+  };
+}
+document.getElementById('readOnlyBannerDownload').onclick = saveBoard; // 見た人が自分のアカウントで編集したい場合の持ち帰り用
+tryOpenSharedLinkFromUrl();
 
 // Google連携ライブラリの先読み。サインインの実行場所を右クリックメニューへ移したことで、
 // 左上は状態表示だけの非クリック要素になった(ページを開いた瞬間から見えるボタンが
