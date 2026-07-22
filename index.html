@@ -103,6 +103,11 @@
   #cacheMigrateDialog .migProgress .bar{margin-top:6px;height:6px;border-radius:3px;background:#00000040;overflow:hidden}
   #cacheMigrateDialog .migProgress .bar i{display:block;height:100%;width:0%;background:var(--accent);transition:width .15s}
   #boardPickerItems .board-meta{padding:0 10px 6px;font-size:11px;color:var(--dim)}
+  #cacheLocationBar{display:flex;align-items:center;gap:8px;margin:0 0 14px;padding:8px 10px;
+    background:#00000030;border:1px solid var(--line);border-radius:6px}
+  #cacheLocationLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--text)}
+  #boardPicker .dlgBtn{all:unset;cursor:pointer;font-size:12px;color:var(--text);background:#ffffff10;padding:6px 12px;border-radius:6px;white-space:nowrap}
+  #boardPicker .dlgBtn:hover{background:#ffffff1c}
   #hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--dim);text-align:center;z-index:5}
   #hint .big{font-size:15px;margin-bottom:6px;color:var(--text)}
   #toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);padding:8px 16px;border-radius:6px;
@@ -248,6 +253,10 @@
 <div id="boardPicker"><div class="box">
   <h2>Open a board</h2>
   <p class="sub">Click a board to open it</p>
+  <div id="cacheLocationBar" style="display:none">
+    <span id="cacheLocationLabel"></span>
+    <button id="cacheLocationChangeBtn" class="dlgBtn">Change location…</button>
+  </div>
   <div id="boardPickerItems"></div>
 </div></div>
 
@@ -3147,17 +3156,6 @@ async function renameBoardFromList(f) {
   const ok = await renameBoardById(f.id, f.name, newName);
   if (ok) { toast(`Renamed to "${newName}"`); refreshBoardBrowser(); }
 }
-// 今開いているボードのローカルキャッシュだけを消す(外部フォルダならそのボード専用サブフォルダごと、
-// ブラウザ保存ならタグの一致する分だけ)。Driveの複製が無くなるだけなので、次に開けば再取得されるだけで実害はない。
-// キャッシュはDriveのフォルダID(名前を変更しても変わらない識別子)で管理しているので、ここも
-// それを使う。まだDriveに保存していないボードにはそもそもキャッシュが存在しないので、その場合は何もしない。
-async function clearCurrentBoardCache() {
-  if (!currentDriveFolderId) { toast('This board has not been saved to Drive yet'); return; }
-  if (!confirm(`Clear the local cache for "${currentBoardName}"?\nImages will simply be re-downloaded from Drive next time this board is opened.`)) return;
-  await LocalCache.clearBoardCache(currentDriveFolderId, driveUserEmail);
-  toast(`Cleared local cache for "${currentBoardName}"`);
-  updateCacheState();
-}
 // 今開いているボードの画像を、表示に必要な分だけでなく全部まとめてキャッシュする。
 // 普段は「表示に必要になった時に少しずつ」キャッシュされる仕組みなので、
 // 「今キャッシュが終わっているのか」が分かりづらいという声を受けて追加した、
@@ -3229,7 +3227,7 @@ function handleCacheStateClick() {
     return;
   }
   cacheReconnectFailed = false;
-  chooseCacheFolder();
+  openCacheMigrateDialog();
 }
 const CACHE_NUDGE_THRESHOLD = 2 * 1024 * 1024 * 1024; // このサイズを超えたら一度だけ外部フォルダを勧める
 const CACHE_NUDGE_KEY = 'mirumood-cache-nudge-shown';
@@ -3549,6 +3547,46 @@ async function confirmClearCacheFor(f) {
   if (currentDriveFolderId === f.id) updateCacheState(); // 今開いてるボードだった場合は状態表示も更新する
   toast(`Cleared local cache for "${f.name}"`);
 }
+// Browse boards一覧の各行から、そのボードを開かずにまとめてキャッシュする。
+// 今開いているボード専用だったcacheAllBoardImages()と違い、board.jsonをその場で
+// 取得して画像一覧を得るので、一度も開いたことのないボードに対しても使える。
+async function cacheAllImagesForBoard(f) {
+  try {
+    progress(`Fetching "${f.name}"`, 0);
+    const manifestId = await driveFindFileInFolder('board.json', f.id);
+    if (!manifestId) { progressDone(); toast(`"${f.name}" has no board.json to read`); return; }
+    const blob = await driveDownloadBlob(manifestId, { noCache: true }); // manifestは可変なので必ず最新を取りに行く
+    const manifest = JSON.parse(await blob.text());
+    if (manifest.app !== 'MiruMood' || !Array.isArray(manifest.images)) { progressDone(); toast(`"${f.name}" doesn't look like a MiruMood board`); return; }
+    const imgs = manifest.images;
+    if (!imgs.length) { progressDone(); toast(`"${f.name}" has no images`); return; }
+    let done = 0;
+    const label = () => `Caching "${f.name}" (${Math.min(done + 1, imgs.length)}/${imgs.length})`;
+    progress(label(), 0);
+    for (const im of imgs) {
+      try {
+        if (im.driveId) {
+          await driveDownloadBlob(im.driveId, {
+            board: f.id, account: driveUserEmail,
+            onBytes: (received, total) => { const frac = total ? received / total : 0; progress(label(), (done + frac) / imgs.length); },
+          });
+        }
+        if (im.thumbDriveId) await driveDownloadBlob(im.thumbDriveId, { board: f.id, account: driveUserEmail });
+      } catch {
+        // サインインが切れている場合、残り全部も同じ理由で失敗し続けるだけなので、無駄に待たせず打ち切る
+        if (!driveSignedIn()) { progressDone(); toast('Sign-in required to continue caching — please sign in and try again'); return; }
+      }
+      done++;
+      progress(label(), done / imgs.length);
+    }
+    progressDone();
+    if (currentDriveFolderId === f.id) updateCacheState(); // 今開いてるボードだった場合は状態表示も更新する
+    toast(`Cached ${imgs.length} image(s) for "${f.name}"`);
+  } catch {
+    progressDone();
+    toast(`Failed to cache "${f.name}"`);
+  }
+}
 // ボード一覧を表示する。通常(simple未指定)は、各行にボード名(クリックで開く)と、
 // Rename/Clear cache/Deleteの操作ボタンをまとめて持つ(Browse boards用)。
 // simple=trueの時は、ボード名をクリックして開くだけのシンプルな一覧にする
@@ -3557,8 +3595,20 @@ function showBoardListModal(folders, simple, cachedIds) {
   const modal = document.getElementById('boardPicker');
   const list = document.getElementById('boardPickerItems');
   const h2 = modal.querySelector('h2'), sub = modal.querySelector('p.sub');
-  if (simple) { h2.textContent = 'Open a board'; sub.textContent = 'Click a board to open it'; }
-  else { h2.textContent = 'Browse boards'; sub.textContent = 'Click a board to open it, or use the buttons to rename, clear its cache, or delete it'; }
+  const cacheBar = document.getElementById('cacheLocationBar');
+  if (simple) {
+    h2.textContent = 'Open a board'; sub.textContent = 'Click a board to open it';
+    cacheBar.style.display = 'none';
+  } else {
+    h2.textContent = 'Browse boards';
+    sub.textContent = 'Click a board to open it, or use the buttons to rename, manage its cache, or delete it';
+    cacheBar.style.display = 'flex';
+    LocalCache.describeCurrentSource().then(src => {
+      document.getElementById('cacheLocationLabel').textContent = src.kind === 'dir'
+        ? `Local cache: ${src.label}`
+        : `Local cache: Browser storage (${(src.bytes / (1024 ** 3)).toFixed(1)} GB)`;
+    });
+  }
   list.innerHTML = '';
   if (!folders.length) {
     list.innerHTML = '<div class="empty">No boards saved to Drive yet</div>';
@@ -3592,6 +3642,10 @@ function showBoardListModal(folders, simple, cachedIds) {
       const showInDriveBtn = document.createElement('button');
       showInDriveBtn.textContent = 'Show in Drive';
       showInDriveBtn.onclick = (e) => { e.stopPropagation(); openDriveFolderInBrowser(f.id); };
+      const cacheAllBtn = document.createElement('button');
+      cacheAllBtn.textContent = 'Cache';
+      cacheAllBtn.title = "Download and cache all of this board's images to this device";
+      cacheAllBtn.onclick = (e) => { e.stopPropagation(); cacheAllImagesForBoard(f); };
       const cacheBtn = document.createElement('button');
       cacheBtn.textContent = 'Clear cache';
       cacheBtn.onclick = (e) => { e.stopPropagation(); confirmClearCacheFor(f); };
@@ -3599,7 +3653,7 @@ function showBoardListModal(folders, simple, cachedIds) {
       deleteBtn.className = 'danger';
       deleteBtn.textContent = 'Delete';
       deleteBtn.onclick = (e) => { e.stopPropagation(); confirmDeleteBoard(f); };
-      actions.append(renameBtn, showInDriveBtn, cacheBtn, deleteBtn);
+      actions.append(renameBtn, showInDriveBtn, cacheAllBtn, cacheBtn, deleteBtn);
       row.appendChild(actions);
       entry.appendChild(row);
 
@@ -4067,9 +4121,14 @@ document.getElementById('exportDialogCancel').onclick = () => { document.getElem
 document.getElementById('exportDialogX').onclick = () => { document.getElementById('exportDialog').style.display = 'none'; };
 
 /* ============ キャッシュの保存場所を移行するダイアログ ============
- * chooseCacheFolder()(即座に切り替えて中身は使いながら少しずつ再キャッシュする、軽い切り替え)
- * とは別に、既存のキャッシュを実際に新しい場所へコピーしてから切り替える、明示的な移行操作。
- * 数GB規模になり得るため、進捗表示・中断・(中断時に)元データが無事であることの案内が要る。
+ * 「右クリック→Cache→Local image cache」から場所を変える時の、唯一の入り口。
+ * 既存のキャッシュを実際に新しい場所へコピーしてから切り替える(コピーが全部終わるまでは
+ * 古い場所を使い続ける)。数GB規模になり得るため、進捗表示・中断・(中断時に)元データが
+ * 無事であることの案内が要る。
+ * (chooseCacheFolder()自体は、大きいボードを初めて開いた時の自動サジェスト
+ *  (maybeOfferBackgroundCache)からは今も使われている。あちらは「まだ何も設定していない
+ *  端末で、これから使い始める」場面なので、移せる既存データがそもそも無く、軽い切り替えで
+ *  十分なため。)
  */
 let migPickedFolder = null; // 移行先として選んだフォルダ
 let migRunning = false;
@@ -4158,6 +4217,7 @@ document.getElementById('bar').addEventListener('click', e => {
 });
 helpBox.addEventListener('click', e => { if (e.target === helpBox) helpBox.style.display = 'none'; });
 document.getElementById('boardPicker').addEventListener('click', e => { if (e.target.id === 'boardPicker') e.currentTarget.style.display = 'none'; });
+document.getElementById('cacheLocationChangeBtn').onclick = openCacheMigrateDialog;
 document.getElementById('ntbBold').addEventListener('click', () => {
   const it = items.find(i => sel.has(i.id));
   if (it) { toggleNoteBold(it); updateNoteToolbar(); }
@@ -4254,12 +4314,6 @@ function openMenu(px, py) {
     ]],
     ['Browse boards…', '', browseBoards],
     null,
-    [`Cache (${LocalCache.dirSupported() ? (LocalCache.folderLabel() || 'browser storage') : 'browser storage'}${cacheNeedsReconnect ? ' — tap to reconnect' : ''})`, '', [
-      ...(LocalCache.dirSupported() ? [[`Local image cache (${LocalCache.folderLabel() || 'browser storage'}${cacheNeedsReconnect ? ' — tap to reconnect' : ''})`, '', handleCacheStateClick]] : []),
-      ...(LocalCache.dirSupported() ? [['Change cache location (copy to new folder)…', '', openCacheMigrateDialog]] : []),
-      [`Cache all images in "${currentBoardName}"`, '', cacheAllBoardImages],
-      [`Clear local cache for "${currentBoardName}"`, '', clearCurrentBoardCache],
-    ]],
     [`JPG optimization (${!jpegOptimize ? 'Off' : (keepOriginalOnOptimize ? 'On+PNG' : 'On')})`, '', cycleJpegOptimize],
     ['Export', '', [
       ['Export canvas as PNG', '', exportPNG],
