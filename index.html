@@ -1625,11 +1625,17 @@ cv.addEventListener('dblclick', e => {
   const it = itemAt(s2wX(cxp), s2wY(cyp));
   if (it && it.type === 'note') { openNoteEditor(it); return; }
   if (it) fitToRect(it.x - it.w / 2, it.y - it.h / 2, it.w, it.h);
-  else { view.s = 1; paint(); }
+  // 何も無い場所でのダブルクリックは何もしない(以前はview.s=1にしていたが、パン位置は
+  // そのままだったため、ズーム率だけ変わって関係の無い場所へ「ジャンプ」したように見えていた)。
 });
 
 cv.addEventListener('wheel', e => {
   e.preventDefault();
+  // パン・移動・リサイズ等、何らかのドラッグ操作(mode)が進行中の間はホイールを無視する。
+  // 例えば中クリックでパン中に(押しっぱなしのまま)ホイールを回すと、ドラッグ側は
+  // 「押し始めた時点のview.ox/oy」を基準に計算し続けるのに対し、ホイール側はその場で
+  // view.ox/oyを直接書き換えるため、2つの計算が競合してビューが暴れるように見えていた。
+  if (mode) return;
   const [cxp, cyp] = canvasXY(e);
   if (e.altKey && sel.size) {
     const d = e.deltaY < 0 ? .05 : -.05;
@@ -1742,14 +1748,15 @@ addEventListener('dragleave', e => { if (e.relatedTarget === null) dropOverlay.s
 addEventListener('drop', e => {
   e.preventDefault(); dropOverlay.style.display = 'none';
   if (readOnlyShared) { toast('This is a read-only shared view'); return; }
+  const [cxp, cyp] = canvasXY(e);
   const fs = [...e.dataTransfer.files];
   const pur = fs.find(f => /\.pur$/i.test(f.name)); // PUR-IMPORT hook
-  if (pur && window.__purImport) { window.__purImport.load(pur, e.clientX, e.clientY); return; }
+  if (pur && window.__purImport) { window.__purImport.load(pur, cxp, cyp); return; }
   const psd = fs.find(f => /\.psd$/i.test(f.name)); // PSD-IMPORT hook
-  if (psd && window.__psdImport) { window.__psdImport.load(psd, e.clientX, e.clientY); return; }
+  if (psd && window.__psdImport) { window.__psdImport.load(psd, cxp, cyp); return; }
   const board = fs.find(f => /\.(mrmd|zip)$/i.test(f.name));
   if (board) { loadBoard(board); return; }
-  if (fs.length) addFiles(fs, e.clientX, e.clientY);
+  if (fs.length) addFiles(fs, cxp, cyp);
 });
 /* クリップボード */
 const MIRUMOOD_NOTES_CLIP_PREFIX = 'MIRUMOOD_NOTES_V1:'; // 自分自身がコピーしたメモだと分かる目印
