@@ -1704,6 +1704,13 @@ addEventListener('keydown', e => {
   if (e.key === 'PageDown' && sel.size) { pushUndo(); const s = selected(); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }
 });
 addEventListener('keyup', e => { if (e.code === 'Space') { spaceDown = false; cv.style.cursor = 'default'; } });
+// ブラウザ外(OSのファイルエクスプローラー等)からのドラッグ&ドロップ中は、ウインドウの
+// フォーカスが一時的に移り、Spaceキーのkeyupイベントが正しく配信されないことがある
+// (ブラウザ・OS側の既知の癖で、MiruMood固有の問題ではない)。これが起きるとspaceDownが
+// trueのまま固まり、カーソルが手のひらのままになるだけでなく、通常のクリックが全部
+// パン扱いになって画像を選択できなくなってしまう。フォーカスを失った時点で、念のため
+// 強制的に解除しておくことで、この状態が固定化しないようにする。
+addEventListener('blur', () => { spaceDown = false; cv.style.cursor = 'default'; });
 
 /* ============ 画像の追加 ============ */
 function addItemForImage(imgId, wx, wy) {
@@ -1747,6 +1754,7 @@ addEventListener('dragover', e => { e.preventDefault(); dropOverlay.style.displa
 addEventListener('dragleave', e => { if (e.relatedTarget === null) dropOverlay.style.display = 'none'; });
 addEventListener('drop', e => {
   e.preventDefault(); dropOverlay.style.display = 'none';
+  spaceDown = false; cv.style.cursor = 'default'; // 念のためここでも解除しておく(blurイベントだけに頼らない)
   if (readOnlyShared) { toast('This is a read-only shared view'); return; }
   const [cxp, cyp] = canvasXY(e);
   const fs = [...e.dataTransfer.files];
