@@ -3093,6 +3093,25 @@ const LocalCache = (() => {
   }
 
   /* ---------- IndexedDB側(既定のフォールバック) ---------- */
+  // 壊れている可能性のある1件だけをキャッシュから消す(「読み込めない/ブラックアウトする画像を
+  // 再読み込みする」機能用)。外部フォルダ・IndexedDBのどちらのバックエンドでも動く。
+  // 台帳(board index)はここでは更新しない(1件消しても実害は無く、最悪その古い記録が
+  // 次回の読み取りで空振りするだけで、既存のtry/catchで問題なく吸収されるため)。
+  async function deleteEntry(key, board, account) {
+    mem.delete(key); // セッション内メモリキャッシュからも外す
+    const root = await getVerifiedDir();
+    if (root) {
+      try {
+        const bd = await boardDirHandle(account, board, false);
+        if (bd) await bd.removeEntry(safeFileName(key));
+      } catch {} // 元々無かった/読み取れない等は無視してよい(再取得されるだけ)
+    } else {
+      try {
+        const os = await store(STORE, 'readwrite');
+        os.delete(key);
+      } catch {}
+    }
+  }
   async function get(key, board, account) {
     if (mem.has(key)) return mem.get(key);
     const verifiedRoot = await getVerifiedDir();
@@ -3255,7 +3274,7 @@ const LocalCache = (() => {
 
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} // 追い出されにくくする(結果は問わないベストエフォート)
 
-  return { get, put, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache, setBoardNameHint, getCachedBoardIds, needsReconnect, reconnect, startMigration, finishMigration, describeCurrentSource };
+  return { get, put, deleteEntry, chooseFolder, clearFolder, restoreFolder, folderLabel, dirSupported, getUsage, clearBoardCache, setBoardNameHint, getCachedBoardIds, needsReconnect, reconnect, startMigration, finishMigration, describeCurrentSource };
 })();
 /* ==================== /LOCAL-CACHE ==================== */
 
@@ -3387,6 +3406,33 @@ async function renameBoardFromList(f) {
 // 「今キャッシュが終わっているのか」が分かりづらいという声を受けて追加した、
 // 明示的に実行でき、進捗と完了がはっきり分かる操作。既にキャッシュ済みの画像は
 // 一瞬で終わる(何もダウンロードし直さない)ので、何度呼んでも安全。
+// 選択中の画像を強制的に再読み込みする(ブラックアウトして表示できない画像の手動リトライ用)。
+// 前面デコード・裏読みの「諦めた」状態やリトライ回数だけリセットしても、ローカルキャッシュ
+// 自体が壊れている場合は同じ壊れたデータを読み直すだけになってしまうため、キャッシュも
+// 一緒に消してDriveから取り直す。
+async function reloadSelectedImages() {
+  const imgIds = [...new Set(items.filter(i => sel.has(i.id) && i.imgId).map(i => i.imgId))];
+  if (!imgIds.length) { toast('No images selected'); return; }
+  for (const imgId of imgIds) {
+    for (const lod of [LOD_THUMB, LOD_MID, LOD_FULL]) {
+      const key = imgId + ':' + lod;
+      bmpCache.delete(key);
+      decodeRetryCount.delete(key);
+      pendingDecodes.delete(key); // 万一「対応中」のまま残っていた場合の保険
+    }
+    permanentlyFailedIds.delete(imgId);
+    bgPrefetchFailCount.delete(imgId);
+    originalLoadedIds.delete(imgId);
+    const rec = store.get(imgId);
+    if (rec) {
+      rec.thumbEmbedStr = undefined; // 埋め込みサムネの文字列も壊れている可能性があるので作り直させる
+      if (rec.driveId) await LocalCache.deleteEntry(rec.driveId, currentDriveFolderId, driveUserEmail).catch(() => {});
+      if (rec.thumbDriveId) await LocalCache.deleteEntry(rec.thumbDriveId, currentDriveFolderId, driveUserEmail).catch(() => {});
+    }
+  }
+  paint(); // 再描画のたびにdrawItem内でrequestDecodeが呼ばれるので、自動的に再取得が始まる
+  toast(imgIds.length > 1 ? `Reloading ${imgIds.length} images…` : 'Reloading image…');
+}
 async function cacheAllBoardImages() {
   const used = [...new Set(items.filter(i => i.imgId).map(i => i.imgId))];
   if (!used.length) { toast('No images in this board'); return; }
@@ -3678,9 +3724,14 @@ async function saveBoardToDrive(forceNewName) {
     toast(`Saved "${currentBoardName}" to Drive`);
     updateCacheState();
     maybeNotifyCacheThreshold();
-  } catch {
+  } catch (err) {
+    console.warn('[MiruMood] save to Drive failed:', err); // 以前は握りつぶすだけで、原因がコンソールにすら残らなかった
     progressDone();
-    toast('Failed to save to Drive');
+    if (!driveSignedIn()) {
+      toast('Failed to save — you appear to be signed out. Please sign in again and retry.');
+    } else {
+      toast(`Failed to save to Drive${err && err.message ? `: ${err.message}` : ''} (see console for details)`);
+    }
   } finally {
     driveSaveInProgress = false;
   }
@@ -4568,6 +4619,7 @@ function openMenu(px, py) {
                       [`Bold (${selItems[0].bold ? 'On' : 'Off'})`, '', () => toggleNoteBold(selItems[0])],
                       [`Font size + (${selItems[0].fontSize || 18}px)`, '', () => adjustNoteFontSize(selItems[0], 2)],
                       ['Font size -', '', () => adjustNoteFontSize(selItems[0], -2)]] : []),
+    ...(selItems.some(i => i.imgId) ? [['Reload image(s)', '', reloadSelectedImages]] : []),
     ...(has ? [['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard], null] : []),
     ...(selItems.length >= 2 ? [['Match width', '', () => matchDimension('w')], ['Match height', '', () => matchDimension('h')], ['Auto arrange selection', 'A', arrange], null] : []),
     ['Duplicate', 'Ctrl+D', duplicateSel],
