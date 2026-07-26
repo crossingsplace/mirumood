@@ -1869,26 +1869,30 @@ addEventListener('drop', e => {
   if (fs.length) addFiles(fs, cxp, cyp);
 });
 /* クリップボード */
-const MIRUMOOD_NOTES_CLIP_PREFIX = 'MIRUMOOD_NOTES_V1:'; // 自分自身がコピーしたメモだと分かる目印
+const MIRUMOOD_ITEMS_CLIP_PREFIX = 'MIRUMOOD_ITEMS_V1:'; // 自分自身がコピーしたアイテム(メモ・画像)だと分かる目印
 addEventListener('paste', e => {
   if (readOnlyShared) return;
   const text = e.clipboardData?.getData('text/plain') || '';
-  if (text.startsWith(MIRUMOOD_NOTES_CLIP_PREFIX)) {
-    // MiruMood自身でコピーしたメモ(1つ以上)。画像として取り込まず、編集可能なテキストの
-    // ままアイテムとして復元する。他アプリ用に同時に書き込まれているimage/pngは無視する。
+  if (text.startsWith(MIRUMOOD_ITEMS_CLIP_PREFIX)) {
+    // MiruMood自身でコピーしたアイテム(1つ以上)。画像として取り込まず、編集可能なアイテムの
+    // ままボードへ復元する。他アプリ用に同時に書き込まれているimage/pngは無視する。
     e.preventDefault();
-    try { pasteNotesFromClipboardText(text.slice(MIRUMOOD_NOTES_CLIP_PREFIX.length)); } catch { toast('Could not paste'); }
+    try { pasteItemsFromClipboardText(text.slice(MIRUMOOD_ITEMS_CLIP_PREFIX.length)); } catch { toast('Could not paste'); }
     return;
   }
   const fs = [...(e.clipboardData?.items || [])].filter(i => i.type.startsWith('image/')).map(i => i.getAsFile());
   if (fs.length) { e.preventDefault(); addFiles(fs); }
 });
-// クリップボードから読んだJSONを元に、メモ同士の相対的な位置関係を保ったまま画面中央へ配置し直す。
-function pasteNotesFromClipboardText(json) {
-  const notes = JSON.parse(json);
-  if (!Array.isArray(notes) || !notes.length) return;
+// クリップボードから読んだJSONを元に、アイテム同士の相対的な位置関係を保ったまま画面中央へ
+// 配置し直す。メモは中身(文章・スタイル)だけで完結しているので常に復元できるが、画像は
+// 参照している画像データ(store内)が今このボードに実在する場合だけ復元できる。別のボードへ
+// 貼り付けた場合など、参照先が見つからない画像は、無理に画像化はせずその分だけ諦める
+// (画像そのものは他アプリ用にPNGとしてもクリップボードに入っているので、そちらは支障ない)。
+function pasteItemsFromClipboardText(json) {
+  const list = JSON.parse(json);
+  if (!Array.isArray(list) || !list.length) return;
   let x0 = 1 / 0, y0 = 1 / 0, x1 = -1 / 0, y1 = -1 / 0;
-  for (const n of notes) {
+  for (const n of list) {
     const hw = (n.w || 0) / 2, hh = (n.h || 0) / 2;
     x0 = Math.min(x0, n.x - hw); x1 = Math.max(x1, n.x + hw);
     y0 = Math.min(y0, n.y - hh); y1 = Math.max(y1, n.y + hh);
@@ -1897,16 +1901,28 @@ function pasteNotesFromClipboardText(json) {
   const wx = s2wX(innerWidth / 2), wy = s2wY(innerHeight / 2); // 貼り付け先はビューポート中央
   pushUndo();
   sel.clear();
-  for (const n of notes) {
-    const it = { id: nextId++, type: 'note', text: n.text || '', bold: !!n.bold,
-      x: wx + (n.x - gcx), y: wy + (n.y - gcy), w: n.w, h: n.h, rot: n.rot || 0,
-      flipH: false, flipV: false, gray: false, opacity: n.opacity ?? 1,
-      bg: n.bg || NOTE_COLORS[0][0], fg: n.fg || NOTE_COLORS[0][1], fontSize: n.fontSize || 18 };
-    items.push(it); sel.add(it.id);
+  let pasted = 0, skipped = 0;
+  for (const n of list) {
+    if (n.type === 'note') {
+      const it = { id: nextId++, type: 'note', text: n.text || '', bold: !!n.bold,
+        x: wx + (n.x - gcx), y: wy + (n.y - gcy), w: n.w, h: n.h, rot: n.rot || 0,
+        flipH: false, flipV: false, gray: false, opacity: n.opacity ?? 1,
+        bg: n.bg || NOTE_COLORS[0][0], fg: n.fg || NOTE_COLORS[0][1], fontSize: n.fontSize || 18 };
+      items.push(it); sel.add(it.id); pasted++;
+    } else {
+      if (!n.imgId || !store.has(n.imgId)) { skipped++; continue; }
+      const it = { id: nextId++, imgId: n.imgId,
+        x: wx + (n.x - gcx), y: wy + (n.y - gcy), w: n.w, h: n.h, rot: n.rot || 0,
+        flipH: !!n.flipH, flipV: !!n.flipV, gray: !!n.gray, opacity: n.opacity ?? 1, crop: n.crop || undefined };
+      items.push(it); sel.add(it.id); pasted++;
+    }
   }
   driveDirty = true; updateDriveState();
   paint();
-  toast(notes.length > 1 ? `Pasted ${notes.length} notes` : 'Pasted note');
+  if (!pasted) { toast('Could not paste — those images are from a different board'); return; }
+  let msg = pasted > 1 ? `Pasted ${pasted} items` : 'Pasted item';
+  if (skipped) msg += ` (${skipped} skipped — from a different board)`;
+  toast(msg);
 }
 
 /* ============ 操作系 ============ */
@@ -2048,21 +2064,22 @@ async function copySelectionToClipboard() {
     }
     if (!pngBlob) throw new Error('failed to encode PNG');
     const clipItems = { 'image/png': pngBlob }; // 他アプリへ貼り付ける用(今まで通り)
-    if (selItems.every(i => i.type === 'note')) {
-      // 選択が全部メモなら、MiruMood自身への貼り付け時に画像化させず編集可能なテキストの
-      // ままにできるよう、テキストとしても書き込んでおく(他アプリでは単なるテキストとして
-      // 貼り付けられるだけで、実害は無い)。
-      const payload = selItems.map(it => ({
-        text: it.text || '', bold: !!it.bold, w: it.w, h: it.h, rot: it.rot || 0,
-        bg: it.bg, fg: it.fg, fontSize: it.fontSize, opacity: it.opacity ?? 1, x: it.x, y: it.y,
-      }));
-      clipItems['text/plain'] = new Blob([MIRUMOOD_NOTES_CLIP_PREFIX + JSON.stringify(payload)], { type: 'text/plain' });
-    }
+    // MiruMood自身への貼り付け時に、画像化させず編集可能なアイテムのまま復元できるよう、
+    // 選択中の全アイテム(メモ・画像どちらも)をテキストとしても書き込んでおく(他アプリでは
+    // 単なるテキストとして貼り付けられるだけで、実害は無い)。画像は実データそのものではなく
+    // imgIdの参照だけを持たせる(同じボード内でだけ復元できる。他アプリ用のPNGは別途ある)。
+    const payload = selItems.map(it => {
+      const base = { type: it.type === 'note' ? 'note' : 'image', x: it.x, y: it.y, w: it.w, h: it.h,
+        rot: it.rot || 0, flipH: !!it.flipH, flipV: !!it.flipV, gray: !!it.gray, opacity: it.opacity ?? 1 };
+      if (it.type === 'note') return { ...base, text: it.text || '', bold: !!it.bold, bg: it.bg, fg: it.fg, fontSize: it.fontSize };
+      return { ...base, imgId: it.imgId, crop: it.crop || null };
+    });
+    clipItems['text/plain'] = new Blob([MIRUMOOD_ITEMS_CLIP_PREFIX + JSON.stringify(payload)], { type: 'text/plain' });
     await navigator.clipboard.write([new ClipboardItem(clipItems)]);
     progressDone();
-    const noteMsg = selItems.length > 1 ? `Copied ${selItems.length} notes — Ctrl+V here to paste as editable notes` : 'Copied note — Ctrl+V here to paste as an editable note';
-    const genericMsg = selItems.length > 1 ? `Copied ${selItems.length} items — paste into another app with Ctrl+V` : 'Copied — paste it into another app with Ctrl+V';
-    toast(selItems.every(i => i.type === 'note') ? noteMsg : genericMsg);
+    toast(selItems.length > 1
+      ? `Copied ${selItems.length} items — Ctrl+V here to paste as editable items`
+      : 'Copied — Ctrl+V here to paste as an editable item');
   } catch {
     progressDone();
     toast('Copy failed');
