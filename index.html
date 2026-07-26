@@ -833,6 +833,48 @@ function corners(it) {
   const hw = it.w / 2, hh = it.h / 2;
   return [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(p => worldOf(it, p[0], p[1]));
 }
+function bboxOf(it) { // 回転も考慮した、そのアイテムの軸並行バウンディングボックス(ワールド座標)
+  let l = 1e15, t = 1e15, r = -1e15, b = -1e15;
+  for (const [cx, cy] of corners(it)) { l = Math.min(l, cx); r = Math.max(r, cx); t = Math.min(t, cy); b = Math.max(b, cy); }
+  return { l, t, r, b };
+}
+// 他の画像/メモの辺・中心へ吸い付かせる(Photoshop等の「スマートガイド」に近い動き)ための下地。
+// ボード全体ではなく、今画面に映っている(=今まさに並べようとしている対象である可能性が高い)
+// アイテムだけを対象にすることで、遠く離れた無関係なアイテムへ意図せず吸い付くのを防ぐと同時に、
+// 大きいボードでも対象を絞ることで軽量に保つ。
+function nearbySnapCandidates() {
+  const out = [];
+  for (const it of items) {
+    if (sel.has(it.id)) continue; // 動かしている本人(グループ内含む)は対象外
+    const r = Math.hypot(it.w, it.h) / 2 * view.s;
+    const sx = w2sX(it.x), sy = w2sY(it.y);
+    if (sx + r < 0 || sx - r > innerWidth || sy + r < 0 || sy - r > innerHeight) continue; // 画面外は対象外
+    out.push(bboxOf(it));
+  }
+  return out;
+}
+// staticVals(動かしていないバウンディングボックス側の値)のどれかが、candidateVals(吸い付き先候補)の
+// どれかにしきい値th以内で近づいたら、その差を打ち消す新しいdxを返す。見つからなければnull。
+function bestAxisSnap(staticVals, candidateVals, dx, th) {
+  let bestNewDx = null, bestDist = th;
+  for (const sv of staticVals) {
+    const cur = sv + dx;
+    for (const cv of candidateVals) {
+      const d = Math.abs(cur - cv);
+      if (d < bestDist) { bestDist = d; bestNewDx = cv - sv; }
+    }
+  }
+  return bestNewDx;
+}
+// リサイズ時のスナップ用: targetに一番近い候補値を、しきい値th以内でなら返す(無ければnull)
+function closestWithin(target, candidates, th) {
+  let best = null, bestDist = th;
+  for (const cv of candidates) {
+    const d = Math.abs(target - cv);
+    if (d < bestDist) { bestDist = d; best = cv; }
+  }
+  return best;
+}
 
 /* ============ 描画 ============ */
 let raf = 0;
@@ -1142,6 +1184,7 @@ function drawCropOverlay(d) {
 /* ============ グリッド ============ */
 let gridMode = 1; // 0=非表示 1=表示 2=表示+スナップ
 const GRID = 64;
+const ITEM_SNAP_PX = 8; // 他のアイテムの辺・中心へ吸い付く感度(画面px)
 function cycleGrid() {
   gridMode = (gridMode + 1) % 3;
   toast(['Grid: off', 'Grid: on', 'Grid: snap enabled'][gridMode]);
@@ -1515,8 +1558,8 @@ cv.addEventListener('pointermove', e => {
       driveDirty = true; updateDriveState(); // 移動もpushUndo()同様に「未保存の変更」として扱う
     }
     let dx = wx - drag.wx, dy = wy - drag.wy;
-    if (gridMode === 2 && !e.altKey) { // グリッドスナップ（Altで一時無効）
-      if (!drag.bbox0) { // 開始時点の選択グループのバウンディングボックス
+    if (!e.altKey) { // 各種スナップはAltキーで一時無効にできる(グリッドスナップと同じ操作感に揃える)
+      if (!drag.bbox0) { // 開始時点の選択グループのバウンディングボックス(アイテム吸い付き・グリッドスナップ共通)
         let l = 1e15, t = 1e15, r = -1e15, b = -1e15;
         for (const s of drag.starts) {
           for (const [cx2, cy2] of corners({ ...s.it, x: s.x, y: s.y })) {
@@ -1525,20 +1568,31 @@ cv.addEventListener('pointermove', e => {
         }
         drag.bbox0 = { l, t, r, b };
       }
-      const th = 10 / view.s;
-      const snapAxis = (vals) => {
-        let best = null;
-        for (const v of vals) {
-          const dlt = Math.round(v / GRID) * GRID - v;
-          if (Math.abs(dlt) < th && (best === null || Math.abs(dlt) < Math.abs(best))) best = dlt;
-        }
-        return best;
-      };
       const bb = drag.bbox0;
-      const sx2 = snapAxis([bb.l + dx, bb.r + dx, (bb.l + bb.r) / 2 + dx]);
-      const sy2 = snapAxis([bb.t + dy, bb.b + dy, (bb.t + bb.b) / 2 + dy]);
-      if (sx2 !== null) dx += sx2;
-      if (sy2 !== null) dy += sy2;
+      // 他のアイテムの辺・中心への吸い付き。ドラッグ開始時に1回だけ、画面内にある(=並べようと
+      // している可能性が高い)アイテムを候補として集めておく(毎フレーム全アイテムを走査しない)。
+      if (!drag.snapCandidates) drag.snapCandidates = nearbySnapCandidates();
+      const ith = ITEM_SNAP_PX / view.s;
+      const xVals = [bb.l, bb.r, (bb.l + bb.r) / 2], yVals = [bb.t, bb.b, (bb.t + bb.b) / 2];
+      const candXs = [], candYs = [];
+      for (const cb of drag.snapCandidates) { candXs.push(cb.l, cb.r, (cb.l + cb.r) / 2); candYs.push(cb.t, cb.b, (cb.t + cb.b) / 2); }
+      const itemDx = bestAxisSnap(xVals, candXs, dx, ith);
+      const itemDy = bestAxisSnap(yVals, candYs, dy, ith);
+      if (itemDx !== null) dx = itemDx;
+      if (itemDy !== null) dy = itemDy;
+      if (gridMode === 2) { // グリッドスナップは、アイテム吸い付きが見つからなかった軸だけ働かせる
+        const gth = 10 / view.s;
+        const snapAxis = (vals) => {
+          let best = null;
+          for (const v of vals) {
+            const dlt = Math.round(v / GRID) * GRID - v;
+            if (Math.abs(dlt) < gth && (best === null || Math.abs(dlt) < Math.abs(best))) best = dlt;
+          }
+          return best;
+        };
+        if (itemDx === null) { const sx2 = snapAxis([bb.l + dx, bb.r + dx, (bb.l + bb.r) / 2 + dx]); if (sx2 !== null) dx += sx2; }
+        if (itemDy === null) { const sy2 = snapAxis([bb.t + dy, bb.b + dy, (bb.t + bb.b) / 2 + dy]); if (sy2 !== null) dy += sy2; }
+      }
     }
     for (const s of drag.starts) { s.it.x = s.x + dx; s.it.y = s.y + dy; }
     paint(); return;
@@ -1547,7 +1601,30 @@ cv.addEventListener('pointermove', e => {
     const [ax, ay] = drag.groupAnchor;
     let lx = (wx - ax) * drag.groupSign[0], ly = (wy - ay) * drag.groupSign[1];
     let w = Math.max(8, lx), h = Math.max(8, ly);
-    if (!e.shiftKey) { const k = Math.max(w / drag.groupW0, h / drag.groupH0); w = drag.groupW0 * k; h = drag.groupH0 * k; }
+    const freeAspect = e.shiftKey;
+    if (!freeAspect) { const k = Math.max(w / drag.groupW0, h / drag.groupH0); w = drag.groupW0 * k; h = drag.groupH0 * k; }
+    // 他のアイテムの辺への吸い付き。グループの外接矩形は常に軸並行(選択全体を囲む、回転しない
+    // 矩形)なので、単一アイテムの場合と違って回転を考慮する必要がなく、そのまま計算できる。
+    if (!e.altKey) {
+      if (!drag.snapCandidates) drag.snapCandidates = nearbySnapCandidates();
+      const ith = ITEM_SNAP_PX / view.s;
+      const candXs = [], candYs = [];
+      for (const cb of drag.snapCandidates) { candXs.push(cb.l, cb.r, (cb.l + cb.r) / 2); candYs.push(cb.t, cb.b, (cb.t + cb.b) / 2); }
+      const movingEdgeX = ax + drag.groupSign[0] * w, movingEdgeY = ay + drag.groupSign[1] * h;
+      const snapX = closestWithin(movingEdgeX, candXs, ith);
+      const snapY = closestWithin(movingEdgeY, candYs, ith);
+      if (!freeAspect) {
+        const kW = snapX !== null ? Math.abs(snapX - ax) / drag.groupW0 : null;
+        const kH = snapY !== null ? Math.abs(snapY - ay) / drag.groupH0 : null;
+        let chosenK = null;
+        if (kW !== null && kH !== null) { const curK = w / drag.groupW0; chosenK = Math.abs(kW - curK) <= Math.abs(kH - curK) ? kW : kH; }
+        else chosenK = kW !== null ? kW : kH;
+        if (chosenK !== null) { w = drag.groupW0 * chosenK; h = drag.groupH0 * chosenK; }
+      } else {
+        if (snapX !== null) w = Math.max(8, Math.abs(snapX - ax));
+        if (snapY !== null) h = Math.max(8, Math.abs(snapY - ay));
+      }
+    }
     const sx = w / drag.groupW0, sy = h / drag.groupH0;
     for (const s of drag.groupStarts) {
       s.it.x = ax + (s.x - ax) * sx;
@@ -1567,6 +1644,31 @@ cv.addEventListener('pointermove', e => {
     // 既定で自由に縦横比を変えられるようにする(画像はShiftを押した時だけ自由)
     const freeAspect = it.type === 'note' ? !e.shiftKey : e.shiftKey;
     if (!freeAspect) { const k = Math.max(w / drag.w0, h / drag.h0); w = drag.w0 * k; h = drag.h0 * k; }
+    // 他のアイテムの辺への吸い付き(隣の画像と高さ/幅をきっちり揃えたい時用)。回転していない
+    // アイテムに限定する(回転していると、バウンディングボックスの辺と実際の幅/高さの対応が
+    // ズレてしまい正しく計算できないため)。Altキーで一時無効にできるのは移動時と同じ。
+    if (!e.altKey && Math.abs(it.rot) < 0.001) {
+      if (!drag.snapCandidates) drag.snapCandidates = nearbySnapCandidates();
+      const ith = ITEM_SNAP_PX / view.s;
+      const candXs = [], candYs = [];
+      for (const cb of drag.snapCandidates) { candXs.push(cb.l, cb.r, (cb.l + cb.r) / 2); candYs.push(cb.t, cb.b, (cb.t + cb.b) / 2); }
+      // 動いている辺(ドラッグしている角の側)の、ワールド座標での現在位置
+      const movingEdgeX = ax + drag.sign[0] * w, movingEdgeY = ay + drag.sign[1] * h;
+      const snapX = closestWithin(movingEdgeX, candXs, ith);
+      const snapY = closestWithin(movingEdgeY, candYs, ith);
+      if (!freeAspect) {
+        // 縦横比ロック中は、幅由来・高さ由来どちらの倍率で揃えるかを、実際の操作量に近い方で選ぶ
+        const kW = snapX !== null ? Math.abs(snapX - ax) / drag.w0 : null;
+        const kH = snapY !== null ? Math.abs(snapY - ay) / drag.h0 : null;
+        let chosenK = null;
+        if (kW !== null && kH !== null) { const curK = w / drag.w0; chosenK = Math.abs(kW - curK) <= Math.abs(kH - curK) ? kW : kH; }
+        else chosenK = kW !== null ? kW : kH;
+        if (chosenK !== null) { w = drag.w0 * chosenK; h = drag.h0 * chosenK; }
+      } else {
+        if (snapX !== null) w = Math.max(8, Math.abs(snapX - ax));
+        if (snapY !== null) h = Math.max(8, Math.abs(snapY - ay));
+      }
+    }
     it.w = w; it.h = h;
     const cxp = drag.sign[0] * w / 2, cyp = drag.sign[1] * h / 2;
     const cc = Math.cos(it.rot), ss = Math.sin(it.rot);
@@ -2743,15 +2845,19 @@ const LocalCache = (() => {
    * 元データは成功しても失敗しても一切削除しない(ユーザーが自分で判断して消せるように)。
    */
   // 現在のバックエンド(外部フォルダ or IndexedDB)にある全レコードを、1件ずつonEntryへ渡す。
-  async function iterateSourceEntries(onEntry) {
+  async function iterateSourceEntries(onEntry, shouldStop) {
     const root = await getVerifiedDir();
     if (root) {
+      accountLoop:
       for await (const [accName, accHandle] of root.entries()) {
+        if (shouldStop && shouldStop()) break accountLoop;
         if (accHandle.kind !== 'directory') continue;
         for await (const [boardName, boardHandle] of accHandle.entries()) {
+          if (shouldStop && shouldStop()) break accountLoop;
           if (boardHandle.kind !== 'directory') continue;
           const files = await readBoardIndex(boardHandle);
           for (const key of files) {
+            if (shouldStop && shouldStop()) break accountLoop; // 中断が要求されたら、残りのファイルは律儀に舐めず即座に打ち切る
             try {
               const fh = await boardHandle.getFileHandle(safeFileName(key), { create: false });
               const blob = await fh.getFile();
@@ -2766,7 +2872,7 @@ const LocalCache = (() => {
         const cur = os.openCursor();
         cur.onsuccess = () => {
           const c = cur.result;
-          if (!c) { resolve(); return; }
+          if (!c || (shouldStop && shouldStop())) { resolve(); return; }
           Promise.resolve(onEntry({ account: c.value.account, board: c.value.board, key: c.primaryKey, blob: c.value.blob }))
             .catch(() => {})
             .then(() => c.continue());
@@ -2804,14 +2910,15 @@ const LocalCache = (() => {
     const targetRoot = await resolveMigrationTargetRoot(picked);
     const targetId = await ensureMarker(targetRoot);
     let total = 0;
-    await iterateSourceEntries(async () => { total++; });
+    await iterateSourceEntries(async () => { total++; }, cancelledCheck);
     let done = 0, cancelled = false;
     await iterateSourceEntries(async (entry) => {
-      if (cancelled) return;
-      if (cancelledCheck && cancelledCheck()) { cancelled = true; return; }
       await writeMigratedEntry(targetRoot, entry);
       done++;
       if (onProgress) onProgress(done, total);
+    }, () => {
+      if (cancelledCheck && cancelledCheck()) { cancelled = true; return true; }
+      return false;
     });
     return { cancelled, done, total, targetRoot, targetId };
   }
