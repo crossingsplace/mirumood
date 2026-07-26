@@ -2696,16 +2696,41 @@ const LocalCache = (() => {
     }
     return set;
   }
+  // 台帳ファイルへの実際の書き込みをまとめる(デバウンスする)ための下地。
+  // 以前はaddToBoardIndex()が呼ばれるたびに台帳ファイル全体(そのボードの全キー)を
+  // 毎回丸ごと書き直しており、ボードの枚数が増えるほど1回の書き込みが重くなる上に、
+  // 移行や一括キャッシュのように短時間に大量の画像を続けて処理する場面では、
+  // 実質O(N^2)のディスクI/Oになって極端に遅くなっていた(数千枚規模のボードでは
+  // 「1枚目から先へ進まない」ように見えるほど深刻だった)。短い間隔の呼び出しは
+  // 1回の書き込みにまとめることで、この問題を解消する。
+  const boardIndexWriteTimers = new Map(); // memKey -> setTimeoutのハンドル(予約済みなら重複予約しない)
+  function scheduleBoardIndexFlush(boardDir, memKey) {
+    if (boardIndexWriteTimers.has(memKey)) return; // 既に書き込みが予約済みなら、それに任せる
+    const t = setTimeout(async () => {
+      boardIndexWriteTimers.delete(memKey);
+      await flushBoardIndexNow(boardDir, memKey);
+    }, 500);
+    boardIndexWriteTimers.set(memKey, t);
+  }
+  async function flushBoardIndexNow(boardDir, memKey) { // 予約を待たず、今すぐ書き込む(操作の最後の仕上げ用)
+    const pendingTimer = boardIndexWriteTimers.get(memKey);
+    if (pendingTimer) { clearTimeout(pendingTimer); boardIndexWriteTimers.delete(memKey); }
+    try {
+      const set = boardIndexMem.get(memKey);
+      if (!set) return;
+      const fh = await boardDir.getFileHandle(BOARD_INDEX_FILE, { create: true });
+      const w = await fh.createWritable();
+      await w.write(JSON.stringify({ files: [...set] }));
+      await w.close();
+    } catch {} // 書けなくても、書き込んだ画像自体は使えるので致命的ではない(将来の削除対象から漏れるだけ)
+  }
   async function addToBoardIndex(boardDir, key, account, board) {
     try {
       const memKey = boardIndexMemKey(account, board);
       const set = await loadBoardIndexSet(boardDir, memKey);
       if (set.has(key)) return; // 既に台帳にある(と分かっている)ので、ディスクへは触らない
       set.add(key);
-      const fh = await boardDir.getFileHandle(BOARD_INDEX_FILE, { create: true });
-      const w = await fh.createWritable();
-      await w.write(JSON.stringify({ files: [...set] }));
-      await w.close();
+      scheduleBoardIndexFlush(boardDir, memKey);
     } catch {} // 記録に失敗しても、書き込んだ画像自体は使えるので致命的ではない(将来の削除対象から漏れるだけ)
   }
 
@@ -2792,6 +2817,11 @@ const LocalCache = (() => {
       if (!ad) return;
       const bd = await ad.getDirectoryHandle(boardSan, { create: false }).catch(() => null);
       if (bd) {
+        // 台帳の書き込みはデバウンスしているため、直前にこのセッションでキャッシュした分が
+        // まだディスクに反映されていない可能性がある。読み取って削除対象を決める前に、
+        // このボード分だけ念のため確実に書き切っておく(でないと、まだ反映されていない
+        // 分だけ削除対象から漏れてしまう)。
+        await flushBoardIndexNow(bd, boardIndexMemKey(account, board));
         const files = await readBoardIndex(bd);
         for (const key of files) await bd.removeEntry(safeFileName(key)).catch(() => {});
         await bd.removeEntry(BOARD_INDEX_FILE).catch(() => {});
@@ -2855,6 +2885,10 @@ const LocalCache = (() => {
         for await (const [boardName, boardHandle] of accHandle.entries()) {
           if (shouldStop && shouldStop()) break accountLoop;
           if (boardHandle.kind !== 'directory') continue;
+          // 台帳の書き込みはデバウンスしているため、直前にこのセッションでキャッシュした分が
+          // まだディスクに反映されていない可能性がある。読み取る前に、このボード分だけ
+          // 念のため確実に書き切っておく(でないと、その分だけ列挙(≒移行対象)から漏れてしまう)。
+          await flushBoardIndexNow(boardHandle, boardIndexMemKey(accName, boardName));
           const files = await readBoardIndex(boardHandle);
           for (const key of files) {
             if (shouldStop && shouldStop()) break accountLoop; // 中断が要求されたら、残りのファイルは律儀に舐めず即座に打ち切る
@@ -2889,10 +2923,11 @@ const LocalCache = (() => {
   }
   // 1件を移行先へ書き込む。既に同じサイズで存在するならスキップする(中断からの再開で、
   // 前回コピー済みの分をやり直さないようにするため)。
-  async function writeMigratedEntry(targetRoot, { account, board, key, blob }) {
+  async function writeMigratedEntry(targetRoot, { account, board, key, blob }, touchedBoards) {
     const accSan = sanitizeFolderName(account || UNKNOWN_ACCOUNT), boardSan = sanitizeFolderName(board);
     const ad = await targetRoot.getDirectoryHandle(accSan, { create: true });
     const bd = await ad.getDirectoryHandle(boardSan, { create: true });
+    if (touchedBoards) touchedBoards.set(boardIndexMemKey(account, board), bd); // 最後にまとめて確実に書き込むための記録
     const fname = safeFileName(key);
     try {
       const existingFile = await (await bd.getFileHandle(fname, { create: false })).getFile();
@@ -2912,14 +2947,18 @@ const LocalCache = (() => {
     let total = 0;
     await iterateSourceEntries(async () => { total++; }, cancelledCheck);
     let done = 0, cancelled = false;
+    const touchedBoards = new Map(); // memKey -> そのボードの移行先ディレクトリハンドル
     await iterateSourceEntries(async (entry) => {
-      await writeMigratedEntry(targetRoot, entry);
+      await writeMigratedEntry(targetRoot, entry, touchedBoards);
       done++;
       if (onProgress) onProgress(done, total);
     }, () => {
       if (cancelledCheck && cancelledCheck()) { cancelled = true; return true; }
       return false;
     });
+    // 台帳の書き込みは短い間隔でまとめている(デバウンスしている)ため、途中で中断した場合や、
+    // 終了直後にタブが閉じられる場合に備えて、触れたボード分だけ予約を待たず確実に書き切る。
+    for (const [memKey, bd] of touchedBoards) await flushBoardIndexNow(bd, memKey);
     return { cancelled, done, total, targetRoot, targetId };
   }
   // 移行が完了した後、実際に「今後はここを使う」へ切り替える。chooseFolder()の切り替え部分と
@@ -2982,7 +3021,11 @@ const LocalCache = (() => {
       // boardIndexMem(台帳のメモリキャッシュ)も同じ理由で無条件に空にする(別の実フォルダを
       // 指すようになった以上、そちらの台帳の中身を確認し直さないと正しく積み増しできないため)。
       mem.clear();
-      boardIndexMem.clear();
+      // boardIndexMem(台帳のメモリキャッシュ)は、後片付け処理(clearAllManagedContent)が
+      // 「直前にこのセッションでキャッシュしたが、まだデバウンス中でディスクに書き込まれて
+      // いない分」を正しく認識できるよう、後片付けが終わった後に空にする(先に空にしてしまうと、
+      // その情報が失われ、片付け対象から漏れてしまう)。実際に空にする行は、下の後片付け処理の
+      // 直後にある。
       // ドライブ直下(例: V:\そのもの)を選んだ場合、Chromeがそのフォルダの名前を空文字として
       // 返すことがある。その場合「/MiruMood Cache」のような中途半端な表示になってしまうため、
       // 名前が取れない時は「MiruMood Cache」単体の表示にする。
@@ -3014,6 +3057,10 @@ const LocalCache = (() => {
         // 不具合につながるため。
         await clearIndexedDbBlobs();
       }
+      // ここでようやく空にする(理由は上のコメントの通り、後片付けより後にする必要があるため)。
+      // 同じフォルダを選び直した場合でも無条件に空にする(そうしないと、memだけ古いまま残り
+      // 続けてDriveへの再取得が発生しなくなる不具合につながるため)。
+      boardIndexMem.clear();
       return { ok: true, name: dirLabel, previousLabel: previousLabel || null, previousCleanupOk };
     } catch (err) {
       // ダイアログを閉じた/キャンセルした場合はAbortErrorとして区別する。それ以外(権限拒否など
