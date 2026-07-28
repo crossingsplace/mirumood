@@ -239,6 +239,7 @@
     <tr><td>Canvas button</td><td>Cycle canvas background color (Dark / Mid Gray / Light / Black — saved per board)</td></tr>
     <tr><td>JPG button</td><td>Cycle JPG optimization: Off / On / On+keep original PNG (asked once per board automatically for large images)</td></tr>
     <tr><td>PageUp / PageDown</td><td>Bring to front / Send to back</td></tr>
+    <tr><td>Ctrl+] / Ctrl+[</td><td>Bring forward / Send backward (one step, past the nearest overlapping item)</td></tr>
     <tr><td class="grp" colspan="2">Touch (tablet)</td></tr>
     <tr><td>One-finger drag</td><td>Move image (pan on empty area)</td></tr>
     <tr><td>Two-finger pinch</td><td>Zoom / pan</td></tr>
@@ -1739,7 +1740,14 @@ cv.addEventListener('pointercancel', e => {
   pointers.delete(e.pointerId);
   mode = null; band = null; paint();
 });
-cv.addEventListener('contextmenu', e => e.preventDefault());
+// 以前はcanvas要素にしか右クリックメニュー抑制が配線されておらず、canvasの上に重なっている
+// 別のUI要素(上部のステータスバー等)で右クリックすると、ブラウザ標準のメニューが
+// MiruMood自身のメニューと二重に出てしまっていた。ページ全体に配線し直す(テキスト入力欄
+// (メモ編集等)だけは、コピー&ペースト等でブラウザ標準メニューが必要なため除外する)。
+addEventListener('contextmenu', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  e.preventDefault();
+});
 
 cv.addEventListener('dblclick', e => {
   if (performance.now() - lastDoubleTapT < 600) return; // タッチのダブルタップと二重処理しない
@@ -1801,6 +1809,8 @@ addEventListener('keydown', e => {
   if (ctl && e.key.toLowerCase() === 'a') { e.preventDefault(); items.forEach(i => sel.add(i.id)); paint(); return; }
   if (ctl && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if (ctl && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSel(); return; }
+  if (ctl && e.key === ']' && sel.size) { e.preventDefault(); bringForward(); return; }
+  if (ctl && e.key === '[' && sel.size) { e.preventDefault(); sendBackward(); return; }
   if (ctl && e.key.toLowerCase() === 'c' && sel.size) { e.preventDefault(); copySelectionToClipboard(); return; }
   if (ctl && e.key.toLowerCase() === 's') { e.preventDefault(); saveBoard(); return; }
   if (ctl && e.key.toLowerCase() === 'o') { e.preventDefault(); fJson.click(); return; }
@@ -4746,12 +4756,21 @@ function openMenu(px, py) {
                       ['Font size +', '', () => adjustNoteFontSize(selNotes, 2)],
                       ['Font size -', '', () => adjustNoteFontSize(selNotes, -2)]] : []),
     ...(selItems.some(i => i.imgId) ? [['Reload image(s)', '', reloadSelectedImages]] : []),
-    ...(has ? [['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard], ['Paste', 'Ctrl+V', pasteFromMenu], null] : []),
+    null,
+    ['Copy (paste into other apps)', 'Ctrl+C', copySelectionToClipboard],
+    ['Paste', 'Ctrl+V', pasteFromMenu],
+    ['Duplicate', 'Ctrl+D', duplicateSel],
     ['Undo', 'Ctrl+Z', undo],
     ['Redo', 'Ctrl+Shift+Z', redo],
     null,
-    ...(selItems.length >= 2 ? [['Match width', '', () => matchDimension('w')], ['Match height', '', () => matchDimension('h')], ['Auto arrange selection', 'A', arrange], null] : []),
-    ['Duplicate', 'Ctrl+D', duplicateSel],
+    // 配置系(整列・重ね順)をひとまとめにする
+    ...(selItems.length >= 2 ? [['Match width', '', () => matchDimension('w')], ['Match height', '', () => matchDimension('h')], ['Auto arrange selection', 'A', arrange]] : []),
+    ['Bring to front', 'PgUp', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = items.filter(i => !sel.has(i.id)).concat(s); paint(); }],
+    ['Bring forward', 'Ctrl+]', bringForward],
+    ['Send backward', 'Ctrl+[', sendBackward],
+    ['Send to back', 'PgDn', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }],
+    null,
+    // 変形系(反転・グレースケール・回転・不透明度)をひとまとめにする
     ['Flip horizontal', 'H', () => keyAction('h')],
     ['Flip vertical', 'V', () => keyAction('v')],
     ['Grayscale', 'G', () => keyAction('g')],
@@ -4765,9 +4784,6 @@ function openMenu(px, py) {
       ['Export canvas as PNG', '', exportPNG],
     ]],
     null,
-    ['Bring to front', 'PgUp', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = items.filter(i => !sel.has(i.id)).concat(s); paint(); }],
-    ['Send to back', 'PgDn', () => { pushUndo(); const s = items.filter(i => sel.has(i.id)); items = s.concat(items.filter(i => !sel.has(i.id))); paint(); }],
-    null,
     ['Delete', 'Del', () => { pushUndo(); items = items.filter(i => !sel.has(i.id)); sel.clear(); paint(); }],
   ] : [
     ['Add images…', '', () => fImg.click()],
@@ -4778,10 +4794,10 @@ function openMenu(px, py) {
     ['Redo', 'Ctrl+Shift+Z', redo],
     ['Select all', 'Ctrl+A', () => { items.forEach(i => sel.add(i.id)); paint(); }],
     null,
-    [`Toggle grid (${['off', 'on', 'snap'][gridMode]})`, 'S', cycleGrid],
-    ['Canvas color', '', CANVAS_PRESETS.map(p => [`${p.bg === currentCanvasBg ? '✓ ' : ''}${p.name}`, '', () => { setCanvasBg(p.bg); toast('Canvas: ' + p.name); }])],
     ['Fit all', 'F', fitAll],
     ['Reset zoom to 100%', 'Home', () => { view.s = 1; paint(); }],
+    [`Toggle grid (${['off', 'on', 'snap'][gridMode]})`, 'S', cycleGrid],
+    ['Canvas color', '', CANVAS_PRESETS.map(p => [`${p.bg === currentCanvasBg ? '✓ ' : ''}${p.name}`, '', () => { setCanvasBg(p.bg); toast('Canvas: ' + p.name); }])],
     null,
     ...(gisReady
       ? [[driveSignedIn() ? `Sign out (${driveUserEmail || 'Google'})` : 'Sign in with Google', '', driveAuthClick]]
@@ -4826,6 +4842,30 @@ function openMenu(px, py) {
   menu.style.display = 'block';
   menu.style.left = Math.min(px, innerWidth - menu.offsetWidth - 8) + 'px';
   menu.style.top = Math.min(py, innerHeight - menu.offsetHeight - 8) + 'px';
+}
+// 1段階だけ前後させる(一番前/後ろへ飛ばすのではなく、隣接する1枚とだけ重ね順を入れ替える)。
+// 複数選択時は、選択グループがひとかたまりのまま、一番近い「選択していない1枚」を
+// 飛び越える形で動く(選択同士の相対的な順番は保たれる)。画像が重なっている場面で、
+// その2枚だけの前後関係を細かく調整したい時に使う。
+function bringForward() {
+  if (!sel.size) return;
+  pushUndo();
+  for (let i = items.length - 2; i >= 0; i--) {
+    if (sel.has(items[i].id) && !sel.has(items[i + 1].id)) {
+      const tmp = items[i]; items[i] = items[i + 1]; items[i + 1] = tmp;
+    }
+  }
+  paint();
+}
+function sendBackward() {
+  if (!sel.size) return;
+  pushUndo();
+  for (let i = 1; i < items.length; i++) {
+    if (sel.has(items[i].id) && !sel.has(items[i - 1].id)) {
+      const tmp = items[i]; items[i] = items[i - 1]; items[i - 1] = tmp;
+    }
+  }
+  paint();
 }
 function adjustOpacity(delta) {
   if (!sel.size) return;
