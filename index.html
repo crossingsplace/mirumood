@@ -13,6 +13,26 @@
     font:13px/1.5 "Hiragino Sans","Noto Sans JP",system-ui,sans-serif;color:var(--text);
     -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
   #cv{position:fixed;inset:0;display:block;cursor:default;touch-action:none}
+  /* VIDEO-PLAYER: 再生モード中だけ出る操作バー */
+  #vpBar{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);width:min(760px,calc(100vw - 24px));
+    display:none;flex-direction:column;gap:6px;padding:8px 10px;background:var(--panel);backdrop-filter:blur(8px);
+    border:1px solid var(--line);border-radius:10px;z-index:30;box-sizing:border-box}
+  #vpBar .vpTop{display:flex;align-items:center;gap:10px}
+  #vpTC{font:600 13px/1 ui-monospace,Menlo,Consolas,monospace;color:var(--text);white-space:nowrap}
+  #vpFr{font:11px/1 ui-monospace,Menlo,Consolas,monospace;color:var(--dim);white-space:nowrap}
+  #vpScrubWrap{position:relative;flex:1;height:18px;display:flex;align-items:center}
+  #vpScrub{width:100%;margin:0;accent-color:var(--accent);position:relative;z-index:1;background:transparent}
+  #vpRange{position:absolute;top:2px;bottom:2px;display:none;background:#ffb45433;border-left:2px solid var(--accent);
+    border-right:2px solid var(--accent);box-sizing:border-box;pointer-events:none}
+  #vpBar .vpBtns{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
+  #vpBar button{all:unset;cursor:pointer;padding:3px 8px;border-radius:5px;color:var(--text);font-size:12px;min-width:14px;text-align:center}
+  #vpBar button:hover{background:#ffffff14}
+  #vpBar button.on{color:var(--accent)}
+  #vpBar select{background:#ffffff0d;color:var(--text);border:1px solid var(--line);border-radius:5px;font-size:11px;padding:2px 4px}
+  #vpBar .sep{width:1px;height:16px;background:var(--line);margin:0 4px}
+  #vpBar .grow{flex:1}
+  #vpBar.busy .vpBtns > :not(#vpClose):not(.grow){opacity:.35;pointer-events:none}
+  #vpBar.busy #vpScrubWrap{opacity:.35;pointer-events:none}
   #bar{position:fixed;top:10px;left:10px;display:flex;gap:2px;padding:4px;
     background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--line);
     border-radius:8px;opacity:.65;transition:opacity .2s;z-index:10}
@@ -236,7 +256,7 @@
     <tr><td>Wheel</td><td>Zoom (centered on cursor)</td></tr>
     <tr><td>Middle/right drag, Space+drag</td><td>Pan</td></tr>
     <tr><td>F / Home</td><td>Fit all / Reset to 100%</td></tr>
-    <tr><td>Double-click</td><td>Fit image to screen (100% on empty area)</td></tr>
+    <tr><td>Double-click</td><td>Fit image to screen (100% on empty area) / play a video or GIF</td></tr>
     <tr><td class="grp" colspan="2">Selection & editing</td></tr>
     <tr><td>Click / Shift+click</td><td>Select / Add to selection</td></tr>
     <tr><td>Drag empty area</td><td>Box select</td></tr>
@@ -257,6 +277,16 @@
     <tr><td>JPG button</td><td>Cycle JPG optimization: Off / On / On+keep original PNG (asked once per board automatically for large images)</td></tr>
     <tr><td>PageUp / PageDown</td><td>Bring to front / Send to back</td></tr>
     <tr><td>Ctrl+] / Ctrl+[</td><td>Bring forward / Send backward (one step, past the nearest overlapping item)</td></tr>
+    <tr><td class="grp" colspan="2">Video &amp; animated GIF (while playing)</td></tr>
+    <tr><td>Double-click / Enter</td><td>Play (MP4/WebM/MOV, animated GIF/WebP — one at a time)</td></tr>
+    <tr><td>Space tap / K</td><td>Play / Pause (Space+drag still pans)</td></tr>
+    <tr><td>← → / , .</td><td>Previous / next frame (Shift = 10 frames)</td></tr>
+    <tr><td>R</td><td>Reverse playback</td></tr>
+    <tr><td>I / O / Alt+I</td><td>Set In / Set Out / Clear In-Out (saved with the board)</td></tr>
+    <tr><td>P</td><td>Loop on/off</td></tr>
+    <tr><td>J / L, [ / ], 0</td><td>Slower / Faster / Reset speed</td></tr>
+    <tr><td>C</td><td>Grab the current frame onto the board as an image</td></tr>
+    <tr><td>M / Esc</td><td>Mute / Close the player</td></tr>
     <tr><td class="grp" colspan="2">Touch (tablet)</td></tr>
     <tr><td>One-finger drag</td><td>Move image (pan on empty area)</td></tr>
     <tr><td>Two-finger pinch</td><td>Zoom / pan</td></tr>
@@ -307,7 +337,30 @@
   <button id="ntbSizeUp" title="Increase font size">A+</button>
 </div>
 
-<input type="file" id="fImg" accept="image/*" multiple>
+<div id="vpBar">
+  <div class="vpTop"><span id="vpTC">00:00:00:00</span><span id="vpFr"></span>
+    <div id="vpScrubWrap"><div id="vpRange"></div><input id="vpScrub" type="range" min="0" max="1000" value="0" tabindex="-1"></div></div>
+  <div class="vpBtns">
+    <button id="vpRev" title="Reverse (R)">◀</button>
+    <button id="vpPrev" title="Previous frame (← / ,)">|◁</button>
+    <button id="vpPlay" title="Play / Pause (Space tap / K / Enter)">▶</button>
+    <button id="vpNext" title="Next frame (→ / .)">▷|</button>
+    <div class="sep"></div>
+    <button id="vpIn" title="Set In point (I)">In</button>
+    <button id="vpOut" title="Set Out point (O)">Out</button>
+    <button id="vpClr" title="Clear In/Out (Alt+I)">✕In/Out</button>
+    <button id="vpLoop" title="Loop (P)">Loop</button>
+    <div class="sep"></div>
+    <select id="vpSpeed" title="Speed (J / L, [ / ], 0)"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+    <select id="vpFps" title="Frame rate (auto-detected)"></select>
+    <div class="grow"></div>
+    <button id="vpGrab" title="Add the current frame to the board as an image (C)">Grab frame</button>
+    <button id="vpMute" title="Mute (M)">🔇</button>
+    <button id="vpClose" title="Close player (Esc)">✕</button>
+  </div>
+</div>
+
+<input type="file" id="fImg" accept="image/*,video/*,.mkv,.mov,.m4v" multiple>
 <input type="file" id="fJson" accept=".mrmd,.zip,.json">
 
 <script>
@@ -543,7 +596,9 @@ const originalLoadedIds = new Set(); // 原本データを取得できた画像I
 const permanentlyFailedIds = new Set();
 function getOriginalBlob(imgId, rec) {
   if (inflightOriginal.has(imgId)) return inflightOriginal.get(imgId);
-  const p = getBlob(rec.original)
+  const ref = displayRef(rec); // 動画はposter(静止画)を「表示用の原本」として扱う。動画本体は再生時まで落とさない
+  if (!ref) return Promise.reject(Object.assign(new Error('no display source for this item'), { permanent: true }));
+  const p = getBlob(ref)
     .then(blob => { originalLoadedIds.add(imgId); permanentlyFailedIds.delete(imgId); return blob; })
     .finally(() => inflightOriginal.delete(imgId));
   inflightOriginal.set(imgId, p);
@@ -695,6 +750,7 @@ function evict() {
 //  たまたま同じIDの画像が、実際には一度も取得していないのに読み込み済み扱いに
 //  なってしまったり、逆に一度も試していないのに裏読みを諦めた扱いになってしまう。)
 function clearBmpCache() {
+  vpClose(); vpMemo.imgId = null; vpMemo.blob = null; // 別ボードを開く時は再生中のものも閉じる
   for (const e of bmpCache.values()) e.bmp.close();
   bmpCache.clear();
   cacheBytes = 0;
@@ -769,7 +825,9 @@ async function importImageBlob(blob, typeHint) { // -> imgId | null
   const ext = ((typeHint || blob.type || 'image/png').split('/')[1] || 'png')
     .replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'png';
 
-  const eligible = ext !== 'jpg' && blob.size > OPTIMIZE_SIZE_THRESHOLD;
+  // アニメーションGIF/WebP/APNGは動画と同じく再生対象にする(JPG化すると動かなくなるので最適化の対象外)
+  const animFrames = await detectAnimFrames(blob, (typeHint || blob.type || '').toLowerCase());
+  const eligible = !animFrames && ext !== 'jpg' && blob.size > OPTIMIZE_SIZE_THRESHOLD;
   if (eligible && !jpegPromptDismissed) {
     jpegPromptDismissed = true;
     const hasAlpha = await bitmapHasAlpha(bmp);
@@ -785,7 +843,7 @@ async function importImageBlob(blob, typeHint) { // -> imgId | null
   }
 
   let storeBlob = blob, storeExt = ext, fullOriginal = null;
-  if (jpegOptimize && ext !== 'jpg') {
+  if (jpegOptimize && ext !== 'jpg' && !animFrames) {
     const hasAlpha = await bitmapHasAlpha(bmp);
     if (!hasAlpha) {
       const jpgBlob = await tryConvertToJpeg(bmp);
@@ -797,7 +855,8 @@ async function importImageBlob(blob, typeHint) { // -> imgId | null
   }
 
   const thumb = Math.max(bmp.width, bmp.height) > 320 ? await blobToThumb(bmp) : null;
-  store.set(id, { w: bmp.width, h: bmp.height, ext: storeExt, original: storeBlob, thumb, fullOriginal, fullExt: fullOriginal ? ext : null });
+  store.set(id, { w: bmp.width, h: bmp.height, ext: storeExt, original: storeBlob, thumb, fullOriginal, fullExt: fullOriginal ? ext : null,
+    ...(animFrames ? { kind: 'anim', frames: animFrames, mime: blob.type || typeHint } : {}) });
   bmp.close();
   return id;
 }
@@ -939,6 +998,7 @@ function render() {
   }
 
   if (cropState) drawCropOverlay(d);
+  if (vpActive() && !vpItem()) setTimeout(vpClose, 0); // 再生中のアイテムが削除された(Undo等も含む)
 
   ctx.setTransform(d, 0, 0, d, 0, 0);
   for (const it of items) if (sel.has(it.id) && !(cropState && cropState.id === it.id)) drawSelection(it);
@@ -960,6 +1020,13 @@ function drawItem(g, it, live) {
   if (it.type === 'note') { drawNote(g, it); g.restore(); return; } // メモは反転/グレスケ対象外
   g.scale(it.flipH ? -1 : 1, it.flipV ? -1 : 1);
   g.filter = it.gray ? 'grayscale(1)' : 'none';
+  const vfr = live ? vpFrameFor(it) : null; // 再生中の動画/GIFは、今のフレームをそのまま描く
+  if (vfr) {
+    const c = it.crop;
+    if (c) g.drawImage(vfr.src, c.x * vfr.w, c.y * vfr.h, Math.max(1, c.w * vfr.w), Math.max(1, c.h * vfr.h), -it.w / 2, -it.h / 2, it.w, it.h);
+    else g.drawImage(vfr.src, -it.w / 2, -it.h / 2, it.w, it.h);
+    g.restore(); return;
+  }
   let bmp = null;
   let unavailable = false; // 原本の取得を諦めた画像かどうか(driveId無し・削除済み等)
   let thumbOnly = false;   // サムネイルはあるが、原寸へは永久に引き上げられない状態かどうか
@@ -992,6 +1059,7 @@ function drawItem(g, it, live) {
     g.strokeRect(-it.w / 2, -it.h / 2, it.w, it.h);
   }
   if (unavailable) drawUnavailableBadge(g, it, !bmp, thumbOnly);
+  if (live && isMediaRec(store.get(it.imgId))) drawMediaBadge(g, it);
   g.restore();
 }
 // 読み込めない画像に付ける印。グレースケール表示中でも見失わないよう、フィルタは解除して描く。
@@ -1771,6 +1839,7 @@ cv.addEventListener('dblclick', e => {
   const [cxp, cyp] = canvasXY(e);
   const it = itemAt(s2wX(cxp), s2wY(cyp));
   if (it && it.type === 'note') { openNoteEditor(it); return; }
+  if (it && isMediaRec(store.get(it.imgId))) { vpOpen(it); return; } // 動画/GIFは再生(再生中なら一時停止/再開)
   if (it) fitToRect(it.x - it.w / 2, it.y - it.h / 2, it.w, it.h);
   // 何も無い場所でのダブルクリックは何もしない(以前はview.s=1にしていたが、パン位置は
   // そのままだったため、ズーム率だけ変わって関係の無い場所へ「ジャンプ」したように見えていた)。
@@ -1837,6 +1906,10 @@ addEventListener('keydown', e => {
     return;
   }
   if (e.key === '?') { helpBox.style.display = 'grid'; return; }
+  if (e.key === 'Enter' && sel.size === 1) {
+    const it0 = items.find(i => sel.has(i.id));
+    if (it0 && isMediaRec(store.get(it0.imgId))) { e.preventDefault(); vpOpen(it0); return; }
+  }
 
   switch (e.key.toLowerCase()) {
     case 'f': fitAll(); break;
@@ -1862,6 +1935,599 @@ addEventListener('keyup', e => { if (e.code === 'Space') { spaceDown = false; cv
 // 強制的に解除しておくことで、この状態が固定化しないようにする。
 addEventListener('blur', () => { spaceDown = false; cv.style.cursor = 'default'; });
 
+/* =====================================================================
+ * 動画 / アニメーション画像(GIF・WebP・APNG)  ── VIDEO-PLAYER
+ * YMvideoplayerの再生コア(コマ送り・逆再生・イン/アウトループ・速度・fps自動判定・
+ * TC表示・フレーム取り出し)をMiruMood用に移植したもの。変換(ffmpeg)は持たない。
+ *
+ * 設計:
+ *  - レコード(store)に kind:'video'|'anim' を持たせる。動画は表示用に poster(先頭フレームの
+ *    JPEG)を持ち、LOD/裏読み/進捗はすべて poster 側で回す(=動画本体は再生する時まで落とさない)。
+ *  - 再生できるのは常に1本だけ(VP)。ボード上に動画があっても、再生モードに入るまでは何も
+ *    初期化しない。再生中のフレームはキャンバスへdrawImageするので、クロップ・回転・反転・
+ *    グレースケール・不透明度・重ね順は画像と同じように効く。
+ *  - 操作UIは画面下部の固定バー(#vpBar)だけをDOMで出す。
+ * =================================================================== */
+const VIDEO_EXT_RE = /\.(mp4|m4v|webm|mov|mkv|ogv)$/i;
+const VIDEO_WARN_BYTES = 200 * 1024 * 1024; // これを超える動画は追加前に確認する
+const POSTER_MAX = 3840;                     // ポスター(静止画)の長辺上限
+const VIDEO_MIME = { mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', mkv: 'video/x-matroska', ogv: 'video/ogg' };
+const STANDARD_FPS = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60, 120];
+
+function isVideoFile(f) { return (f.type || '').startsWith('video/') || VIDEO_EXT_RE.test(f.name || ''); }
+function isMediaRec(rec) { return !!rec && (rec.kind === 'video' || rec.kind === 'anim'); }
+// 画面表示(LOD・サムネイル・裏読み)に使う静止画の参照。動画は poster、それ以外は原本。
+function displayRef(rec) { return rec.kind === 'video' ? (rec.poster || rec.thumb) : rec.original; }
+// 書き出し・コピー等「静止画として使う」時の参照。動画は poster、画像は無劣化原本を優先。
+function stillRef(rec) { return rec.kind === 'video' ? displayRef(rec) : (rec.fullOriginal || rec.original); }
+
+// アニメーション画像かどうか(フレーム数)。ImageDecoder非対応の環境では常に静止画扱い(0)。
+async function detectAnimFrames(blob, type) {
+  if (typeof ImageDecoder === 'undefined') return 0;
+  if (!/^image\/(gif|webp|png|apng)$/.test(type)) return 0;
+  let dec = null;
+  try {
+    if (!(await ImageDecoder.isTypeSupported(type))) return 0;
+    dec = new ImageDecoder({ data: await blob.arrayBuffer(), type });
+    await dec.tracks.ready;
+    const tr = dec.tracks.selectedTrack;
+    if (!tr || !tr.animated) return 0;
+    await dec.completed;
+    return tr.frameCount > 1 ? tr.frameCount : 0;
+  } catch { return 0; }
+  finally { try { dec && dec.close(); } catch {} }
+}
+
+// <video>で読めるかを実際に読み込んで確かめる(拡張子ではなく中身で判定する)。
+// 先頭フレームが描ける状態(loadeddata)になったら成功。HEVCが再生できない環境等はerrorになる。
+function loadVideoElement(v, url, timeoutMs = 20000) {
+  return new Promise((res, rej) => {
+    let done = false;
+    const t = setTimeout(() => fin(new Error('timeout')), timeoutMs);
+    function fin(err) {
+      if (done) return; done = true; clearTimeout(t);
+      v.removeEventListener('loadeddata', ok); v.removeEventListener('error', ng);
+      err ? rej(err) : res(v);
+    }
+    function ok() { v.videoWidth ? fin() : fin(new Error('no video track')); }
+    function ng() { fin(new Error('unsupported')); }
+    v.addEventListener('loadeddata', ok); v.addEventListener('error', ng);
+    v.src = url;
+  });
+}
+// MediaRecorder製のWebM等はdurationがInfinityになることがある。末尾へシークして確定させる。
+async function settleDuration(v) {
+  if (isFinite(v.duration) && v.duration > 0) return;
+  await new Promise(res => {
+    const t = setTimeout(res, 3000);
+    v.addEventListener('durationchange', function h() { if (isFinite(v.duration)) { clearTimeout(t); v.removeEventListener('durationchange', h); res(); } });
+    v.currentTime = 1e101;
+  });
+  v.currentTime = 0;
+}
+
+async function importVideoBlob(blob, name) { // -> imgId | null
+  const v = document.createElement('video');
+  v.muted = true; v.preload = 'auto'; v.playsInline = true;
+  const url = URL.createObjectURL(blob);
+  try {
+    await loadVideoElement(v, url);
+    await settleDuration(v);
+    const w = v.videoWidth, h = v.videoHeight;
+    const k = Math.min(1, POSTER_MAX / Math.max(w, h));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(w * k)); c.height = Math.max(1, Math.round(h * k));
+    c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+    const poster = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.9));
+    if (!poster) return null;
+    let thumb = null;
+    if (Math.max(w, h) > 320) { const pb = await createImageBitmap(c); thumb = await blobToThumb(pb); pb.close(); }
+    const m = (name || '').match(VIDEO_EXT_RE);
+    const ext = m ? m[1].toLowerCase() : (((blob.type || '').split('/')[1] || 'mp4').replace('quicktime', 'mov').replace('x-matroska', 'mkv').replace(/[^a-z0-9]/gi, '') || 'mp4');
+    const id = 'i' + (imgSeq++);
+    store.set(id, { kind: 'video', w, h, ext, mime: blob.type || VIDEO_MIME[ext] || 'video/mp4',
+      original: blob, poster, thumb, dur: isFinite(v.duration) ? v.duration : 0, fps: null });
+    return id;
+  } catch (err) {
+    console.warn('[MiruMood] video import failed:', name, err);
+    return null;
+  } finally {
+    v.removeAttribute('src'); v.load();
+    URL.revokeObjectURL(url);
+  }
+}
+
+/* ---------------- プレイヤー本体(常に1本だけ) ---------------- */
+const VP = {
+  itemId: null, imgId: null, kind: null, token: 0,
+  el: null, url: null,                          // video
+  dec: null, frame: null, fIdx: 0, fCount: 0, fDur: [], animTimer: 0, animChain: Promise.resolve(), // anim
+  playing: false, reversing: false, rate: 1, fps: 24, muted: true,
+  loading: false, loadFrac: 0, error: null,
+  revTimer: 0, revAt: 0, scrubbing: false,
+  spaceT: 0, spacePanned: false,
+};
+const vpMemo = { imgId: null, blob: null }; // 直前に開いた動画の本体を1本だけ覚えておく(開き直しで再取得しない)
+const vpBar = document.getElementById('vpBar');
+const $vp = id => document.getElementById(id);
+
+function vpItem() { return VP.itemId == null ? null : items.find(i => i.id === VP.itemId) || null; }
+function vpActive() { return VP.itemId != null; }
+function vpRate() { return VP.rate; }
+// 時間の単位: 動画は秒、アニメ画像はフレーム番号(=fps 1扱い)。イン/アウト点も同じ単位で持つ。
+function vpUnit() { return VP.kind === 'anim' ? 1 : 1 / VP.fps; }
+function vpDuration() { return VP.kind === 'anim' ? VP.fCount : (VP.el && isFinite(VP.el.duration) ? VP.el.duration : 0); }
+function vpTime() { return VP.kind === 'anim' ? VP.fIdx : (VP.el ? VP.el.currentTime : 0); }
+function vpRange() {
+  const it = vpItem(), u = vpUnit(), d = vpDuration();
+  const lastT = VP.kind === 'anim' ? VP.fCount - 1 : Math.max(0, d - u);
+  const s = it && it.vIn != null ? Math.min(it.vIn, lastT) : 0;
+  const e = it && it.vOut != null ? Math.min(it.vOut, lastT) : lastT;
+  return [s, Math.max(s, e)];
+}
+function vpLoopOn() { const it = vpItem(); return !it || it.vLoop !== false; }
+
+// drawItem()から呼ばれる: このアイテムが再生中で、描けるフレームがあればその描画元を返す
+function vpFrameFor(it) {
+  if (it.id !== VP.itemId || VP.loading || VP.error) return null;
+  if (VP.kind === 'video' && VP.el && VP.el.readyState >= 2) return { src: VP.el, w: VP.el.videoWidth, h: VP.el.videoHeight };
+  if (VP.kind === 'anim' && VP.frame) return { src: VP.frame, w: VP.frame.displayWidth, h: VP.frame.displayHeight };
+  return null;
+}
+// 動画・アニメ画像であることが分かる小さな印(再生中のアイテムには出さない)
+function drawMediaBadge(g, it) {
+  if (it.id === VP.itemId && !VP.error) return;
+  g.save();
+  g.filter = 'none'; g.globalAlpha = .85;
+  const r = Math.min(Math.min(it.w, it.h) * 0.12, 14 / view.s);
+  const cx = -it.w / 2 + r * 1.6, cy = it.h / 2 - r * 1.6;
+  g.fillStyle = '#000000a0';
+  g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.fill();
+  g.fillStyle = '#fff';
+  g.beginPath(); g.moveTo(cx - r * .32, cy - r * .48); g.lineTo(cx + r * .52, cy); g.lineTo(cx - r * .32, cy + r * .48); g.closePath(); g.fill();
+  g.restore();
+}
+
+async function vpGetMediaBlob(imgId, rec, onFrac) {
+  if (vpMemo.imgId === imgId && vpMemo.blob) return vpMemo.blob;
+  const blob = await getBlob(rec.original, (got, total) => onFrac(total ? got / total : 0));
+  if (!blob) throw new Error('missing');
+  vpMemo.imgId = imgId; vpMemo.blob = blob;
+  return blob;
+}
+
+async function vpOpen(it) {
+  const rec = it && it.imgId ? store.get(it.imgId) : null;
+  if (!isMediaRec(rec)) return;
+  if (VP.itemId === it.id) { vpTogglePlay(); return; }
+  vpClose();
+  const token = ++VP.token;
+  Object.assign(VP, { itemId: it.id, imgId: it.imgId, kind: rec.kind, loading: true, loadFrac: 0, error: null, playing: false, reversing: false, rate: 1 });
+  vpBar.style.display = 'flex';
+  vpBuildFpsSelect();
+  vpUI();
+  try {
+    const blob = await vpGetMediaBlob(it.imgId, rec, f => { if (token === VP.token) { VP.loadFrac = f; vpUI(); } });
+    if (token !== VP.token) return;
+    if (rec.kind === 'video') await vpInitVideo(blob, rec, token);
+    else await vpInitAnim(blob, rec, token);
+    if (token !== VP.token) return;
+    VP.loading = false;
+    vpPlay();
+  } catch (err) {
+    if (token !== VP.token) return;
+    console.warn('[MiruMood] could not open media', err);
+    VP.loading = false;
+    VP.error = err && err.message === 'unsupported'
+      ? 'This video format can\'t be played on this PC/browser (try converting it to MP4 / H.264)'
+      : (driveSignedIn() || !rec.driveId ? 'Could not load this video' : 'Sign in with Google to load this video');
+    vpUI(); paint();
+  }
+}
+
+async function vpInitVideo(blob, rec, token) {
+  const v = document.createElement('video');
+  v.muted = VP.muted; v.playsInline = true; v.preload = 'auto'; v.loop = false;
+  // 画面外・非表示の動画はブラウザに省電力で止められたり、フレーム通知(rVFC)が来なかったり
+  // することがあるため、表示領域内にごく小さく・ほぼ透明な状態で実在させておく。
+  v.style.cssText = 'position:fixed;right:0;bottom:0;width:2px;height:2px;opacity:.01;pointer-events:none;z-index:-1';
+  document.body.appendChild(v);
+  VP.el = v;
+  VP.url = URL.createObjectURL(blob.type ? blob : new Blob([blob], { type: rec.mime || VIDEO_MIME[rec.ext] || '' }));
+  await loadVideoElement(v, VP.url);
+  await settleDuration(v);
+  if (token !== VP.token) return;
+  if (!rec.dur && isFinite(v.duration)) rec.dur = v.duration;
+  VP.fps = rec.fps || await vpDetectFps(v) || 24;
+  if (!rec.fps) rec.fps = VP.fps; // 自動判定の結果は次回保存時にboard.jsonへ残る(これだけでは未保存扱いにしない)
+  vpBuildFpsSelect();
+  v.addEventListener('seeked', vpOnSeeked);
+  v.addEventListener('ended', vpOnEnded);
+  const tick = () => {
+    if (VP.el !== v) return;
+    vpCheckForwardRange();
+    paint(); vpUI();
+    v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+  };
+  v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+  const [s] = vpRange();
+  await vpSeekVideo(s + vpUnit() / 2);
+}
+function vpSeekVideo(t) {
+  const v = VP.el;
+  return new Promise(res => {
+    const h = () => { v.removeEventListener('seeked', h); res(); };
+    v.addEventListener('seeked', h);
+    v.currentTime = Math.max(0, Math.min(vpDuration(), t));
+    setTimeout(h, 1500);
+  });
+}
+// YMvideoplayerのautoDetectFps②(requestVideoFrameCallbackでフレームの実時刻を拾う方式)
+async function vpDetectFps(v) {
+  if (!('requestVideoFrameCallback' in v) || !v.duration) return null;
+  const samples = [], NUM = 8;
+  await new Promise(done => {
+    const t = setTimeout(done, 2500);
+    const collect = pos => {
+      if (!isFinite(pos) || pos >= v.duration - 0.1) { clearTimeout(t); done(); return; }
+      v.requestVideoFrameCallback((_, m) => {
+        samples.push(m.mediaTime);
+        if (samples.length >= NUM) { clearTimeout(t); done(); } else collect(m.mediaTime + 1 / 15);
+      });
+      v.currentTime = pos;
+    };
+    collect(Math.min(0.5, v.duration * 0.1));
+  });
+  if (samples.length < 2) return null;
+  const per = [];
+  for (let i = 1; i < samples.length; i++) {
+    const dt = samples[i] - samples[i - 1];
+    if (dt <= 0) continue;
+    for (const sf of STANDARD_FPS) { const n = Math.round(dt * sf); if (n > 0) { per.push(dt / n); break; } }
+  }
+  if (!per.length) return null;
+  per.sort((a, b) => a - b);
+  const raw = 1 / per[Math.floor(per.length / 2)];
+  const coarse = STANDARD_FPS.reduce((p, c) => Math.abs(c - raw) < Math.abs(p - raw) ? c : p);
+  // 上の推定だけだと 24 と 23.976(29.97/30等も)を取り違えることがある(実際に起きた)。
+  // 離れた2点のフレーム時刻の差を取り、「整数フレーム数にきれいに収まる」方の候補を採る
+  // (時間差が長いほど差がはっきり出る)。
+  const twins = STANDARD_FPS.filter(c => Math.abs(c - coarse) / coarse < 0.01);
+  if (twins.length < 2) return coarse;
+  const far = await new Promise(done => {
+    const target = Math.min(v.duration - 0.2, samples[0] + 8);
+    if (!(target - samples[0] > 1.5)) { done(null); return; }
+    const t = setTimeout(() => done(null), 2000);
+    v.requestVideoFrameCallback((_, m) => { clearTimeout(t); done(m.mediaTime); });
+    v.currentTime = target;
+  });
+  if (far == null) return coarse;
+  const D = far - samples[0];
+  const resid = c => { const x = D * c; return Math.abs(x - Math.round(x)); };
+  return twins.reduce((p, c) => resid(c) < resid(p) ? c : p);
+}
+
+async function vpInitAnim(blob, rec, token) {
+  if (typeof ImageDecoder === 'undefined') throw new Error('unsupported');
+  const type = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/' + (rec.ext === 'jpg' ? 'jpeg' : rec.ext);
+  const dec = new ImageDecoder({ data: await blob.arrayBuffer(), type });
+  await dec.tracks.ready; await dec.completed;
+  if (token !== VP.token) { dec.close(); return; }
+  VP.dec = dec;
+  VP.fCount = dec.tracks.selectedTrack.frameCount || 1;
+  VP.fDur = new Array(VP.fCount).fill(0);
+  VP.fps = 1;
+  const [s] = vpRange();
+  await vpAnimShow(s);
+}
+// デコードは直列に並べる(同時に複数走らせるとフレームの入れ替わり順が崩れるため)
+function vpAnimShow(idx) {
+  const dec = VP.dec;
+  VP.animChain = VP.animChain.then(async () => {
+    if (VP.dec !== dec) return;
+    const r = await dec.decode({ frameIndex: idx });
+    if (VP.dec !== dec) { r.image.close(); return; }
+    if (VP.frame) VP.frame.close();
+    VP.frame = r.image; VP.fIdx = idx;
+    const ms = (r.image.duration || 0) / 1000;
+    VP.fDur[idx] = ms > 10 ? ms : 100; // GIFの0/10ms指定はブラウザ同様100ms扱い
+    paint(); vpUI();
+  }).catch(err => console.warn('[MiruMood] anim decode failed', err));
+  return VP.animChain;
+}
+function vpAnimTick() {
+  clearTimeout(VP.animTimer);
+  if (!VP.playing || VP.kind !== 'anim') return;
+  const dir = VP.reversing ? -1 : 1;
+  const [s, e] = vpRange();
+  let n = VP.fIdx + dir;
+  if (n > e || n < s) {
+    if (!vpLoopOn()) { vpPause(); return; }
+    n = dir > 0 ? s : e;
+  }
+  const delay = (VP.fDur[VP.fIdx] || 100) / VP.rate;
+  VP.animTimer = setTimeout(async () => { await vpAnimShow(n); vpAnimTick(); }, delay);
+}
+
+function vpClose() {
+  VP.token++;
+  clearTimeout(VP.animTimer); clearTimeout(VP.revTimer);
+  if (VP.el) {
+    VP.el.pause();
+    VP.el.removeEventListener('seeked', vpOnSeeked); VP.el.removeEventListener('ended', vpOnEnded);
+    VP.el.removeAttribute('src'); VP.el.load(); VP.el.remove();
+  }
+  if (VP.url) URL.revokeObjectURL(VP.url);
+  if (VP.frame) { try { VP.frame.close(); } catch {} }
+  if (VP.dec) { try { VP.dec.close(); } catch {} }
+  Object.assign(VP, { itemId: null, imgId: null, kind: null, el: null, url: null, dec: null, frame: null,
+    fIdx: 0, fCount: 0, fDur: [], playing: false, reversing: false, loading: false, error: null });
+  vpBar.style.display = 'none';
+  paint();
+}
+
+/* ---- 再生制御(YMvideoplayerのロジックを、イン/アウト範囲＋ループ設定に合わせて整理) ---- */
+function vpPlay() {
+  if (!vpActive() || VP.loading || VP.error) return;
+  const [s, e] = vpRange(), t = vpTime();
+  if (!VP.reversing && t >= e - (VP.kind === 'anim' ? 0 : vpUnit())) vpSeek(s); // 範囲の末尾にいる時は頭から
+  VP.playing = true;
+  if (VP.kind === 'anim') vpAnimTick();
+  else if (VP.reversing) vpRevStep();
+  else { VP.el.playbackRate = VP.rate; VP.el.play().catch(() => {}); }
+  vpUI();
+}
+function vpPause() {
+  VP.playing = false;
+  clearTimeout(VP.animTimer); clearTimeout(VP.revTimer);
+  if (VP.el) VP.el.pause();
+  vpUI();
+}
+function vpTogglePlay() { VP.playing ? vpPause() : vpPlay(); }
+function vpToggleReverse() {
+  if (!vpActive()) return;
+  VP.reversing = !VP.reversing;
+  if (VP.el) VP.el.pause();
+  clearTimeout(VP.revTimer); clearTimeout(VP.animTimer);
+  toast(VP.reversing ? 'Reverse' : 'Forward');
+  VP.playing = false; vpPlay();
+}
+function vpSeek(t) {
+  if (!vpActive() || VP.loading || VP.error) return;
+  const [s, e] = [0, VP.kind === 'anim' ? VP.fCount - 1 : vpDuration()];
+  t = Math.max(s, Math.min(e, t));
+  if (VP.kind === 'anim') vpAnimShow(Math.round(t));
+  else VP.el.currentTime = t;
+}
+// コマ送り: 現在のフレーム番号から±n。範囲の端では反対側へ折り返す(YMvideoplayerと同じ)。
+function vpStep(dir) {
+  if (!vpActive() || VP.loading || VP.error) return;
+  vpPause(); VP.reversing = false;
+  const [s, e] = vpRange();
+  if (VP.kind === 'anim') {
+    let n = VP.fIdx + dir;
+    if (n > e) n = s; else if (n < s) n = e;
+    vpAnimShow(n); return;
+  }
+  const fps = VP.fps;
+  const cur = Math.floor(VP.el.currentTime * fps + 1e-3);
+  const sF = Math.round(s * fps), eF = Math.floor(e * fps + 1e-3);
+  let n = cur + dir;
+  if (n > eF) n = sF; else if (n < sF) n = eF;
+  VP.el.currentTime = (n + 0.5) / fps; // フレームの中央を狙う(端だと前後のフレームに丸められることがある)
+}
+// 順方向再生中のアウト点処理(ループON=イン点へ戻る / OFF=止める)
+function vpCheckForwardRange() {
+  if (!VP.playing || VP.reversing || VP.kind !== 'video') return;
+  const [s, e] = vpRange();
+  if (VP.el.currentTime >= e + vpUnit() * 0.999) {
+    if (vpLoopOn()) VP.el.currentTime = s + vpUnit() / 2;
+    else { vpPause(); VP.el.currentTime = e + vpUnit() / 2; }
+  }
+}
+function vpOnEnded() {
+  if (!VP.playing || VP.reversing) return;
+  if (vpLoopOn()) { const [s] = vpRange(); VP.el.currentTime = s + vpUnit() / 2; VP.el.play().catch(() => {}); }
+  else vpPause();
+}
+// 逆再生: seekedで実際に到達した位置を確かめてから次の1コマへ(YMvideoplayerの方式)
+function vpRevStep() {
+  if (!VP.reversing || !VP.playing || VP.kind !== 'video') return;
+  const u = vpUnit(), [s, e] = vpRange();
+  let next = VP.el.currentTime - u;
+  if (next < s) {
+    if (!vpLoopOn()) { vpPause(); VP.el.currentTime = s + u / 2; return; }
+    next = e + u / 2;
+  }
+  VP.revAt = performance.now();
+  VP.el.currentTime = next;
+}
+function vpOnSeeked() {
+  paint(); vpUI();
+  if (VP.reversing && VP.playing) {
+    const interval = 1000 / (VP.fps * VP.rate);
+    clearTimeout(VP.revTimer);
+    VP.revTimer = setTimeout(vpRevStep, Math.max(0, interval - (performance.now() - VP.revAt)));
+  }
+}
+
+function vpSetRate(r) {
+  VP.rate = Math.max(0.1, Math.min(VP.kind === 'anim' ? 16 : 4, r));
+  if (VP.el) VP.el.playbackRate = VP.rate;
+  $vp('vpSpeed').value = String(VP.rate);
+  if (![...$vp('vpSpeed').options].some(o => parseFloat(o.value) === VP.rate)) {
+    const o = document.createElement('option'); o.value = String(VP.rate); o.textContent = VP.rate.toFixed(2) + '×'; $vp('vpSpeed').appendChild(o); $vp('vpSpeed').value = String(VP.rate);
+  }
+  if (VP.playing && VP.kind === 'anim') vpAnimTick();
+  toast('Speed: ' + VP.rate.toFixed(2) + '×');
+}
+function vpSetFps(f) {
+  const rec = store.get(VP.imgId);
+  if (!rec || VP.kind !== 'video' || !(f > 0)) return;
+  VP.fps = f; rec.fps = f;
+  driveDirty = true; updateDriveState();
+  vpUI();
+}
+function vpMarkDirty() { driveDirty = true; updateDriveState(); }
+function vpSetIn() {
+  const it = vpItem(); if (!it || VP.loading || VP.error) return;
+  const t = VP.kind === 'anim' ? VP.fIdx : Math.floor(VP.el.currentTime * VP.fps + 1e-3) / VP.fps;
+  it.vIn = t; if (it.vOut != null && it.vOut < t) it.vOut = null;
+  vpMarkDirty(); vpUI(); toast('In point set');
+}
+function vpSetOut() {
+  const it = vpItem(); if (!it || VP.loading || VP.error) return;
+  const t = VP.kind === 'anim' ? VP.fIdx : Math.floor(VP.el.currentTime * VP.fps + 1e-3) / VP.fps;
+  it.vOut = t; if (it.vIn != null && it.vIn > t) it.vIn = null;
+  vpMarkDirty(); vpUI(); toast('Out point set');
+}
+function vpClearInOut() {
+  const it = vpItem(); if (!it) return;
+  it.vIn = null; it.vOut = null;
+  vpMarkDirty(); vpUI(); toast('In/Out cleared');
+}
+function vpToggleLoop() {
+  const it = vpItem(); if (!it) return;
+  it.vLoop = it.vLoop === false; // 既定はON(undefined)
+  vpMarkDirty(); vpUI(); toast(vpLoopOn() ? 'Loop: On' : 'Loop: Off');
+}
+function vpToggleMute() {
+  VP.muted = !VP.muted;
+  if (VP.el) VP.el.muted = VP.muted;
+  vpUI(); toast(VP.muted ? 'Muted' : 'Sound on');
+}
+
+// 今のフレームを、そのまま画像アイテムとしてボードに置く(YMvideoplayerのcopyFrameの置き換え)。
+// クロップ・反転・グレースケール等も引き継ぎ、動画のすぐ右隣に同じ見た目で並べる。
+async function vpGrabFrame() {
+  if (readOnlyShared) { toast('This is a read-only shared view'); return; }
+  const it = vpItem(), fr = it && vpFrameFor(it);
+  if (!fr) return;
+  vpPause();
+  const c = document.createElement('canvas');
+  c.width = fr.w; c.height = fr.h;
+  c.getContext('2d').drawImage(fr.src, 0, 0, fr.w, fr.h);
+  const isAnim = VP.kind === 'anim';
+  const blob = await new Promise(r => c.toBlob(r, isAnim ? 'image/png' : 'image/jpeg', 0.92));
+  if (!blob) { toast('Could not capture this frame'); return; }
+  const imgId = await importImageBlob(blob, blob.type);
+  if (!imgId) { toast('Could not capture this frame'); return; }
+  pushUndo();
+  const cur = vpItem() || it;
+  const n = addItemForImage(imgId, cur.x + cur.w + 16 / view.s, cur.y);
+  Object.assign(n, { w: cur.w, h: cur.h, rot: cur.rot, flipH: cur.flipH, flipV: cur.flipV, gray: cur.gray, opacity: cur.opacity,
+    crop: cur.crop ? { ...cur.crop } : undefined });
+  paint();
+  toast('Frame added to the board');
+}
+
+/* ---- 表示 ---- */
+const pad2 = n => String(n).padStart(2, '0');
+function vpBuildFpsSelect() {
+  const s = $vp('vpFps');
+  s.style.display = VP.kind === 'video' ? '' : 'none';
+  const vals = [...STANDARD_FPS];
+  if (VP.kind === 'video' && !vals.includes(VP.fps)) vals.push(VP.fps);
+  s.innerHTML = vals.map(v => `<option value="${v}">${v} fps</option>`).join('');
+  s.value = String(VP.fps);
+}
+function vpUI() {
+  if (!vpActive()) return;
+  const tc = $vp('vpTC'), fr = $vp('vpFr');
+  if (VP.loading) { tc.textContent = VP.loadFrac ? `Loading… ${Math.round(VP.loadFrac * 100)}%` : 'Loading…'; fr.textContent = ''; }
+  else if (VP.error) { tc.textContent = VP.error; fr.textContent = ''; }
+  else if (VP.kind === 'anim') {
+    tc.textContent = `Frame ${String(VP.fIdx + 1).padStart(String(VP.fCount).length, '0')} / ${VP.fCount}`;
+    const avg = VP.fDur.filter(Boolean); const ms = avg.length ? avg.reduce((a, b) => a + b, 0) / avg.length : 0;
+    fr.textContent = ms ? `≈${(1000 / ms).toFixed(1)} fps` : '';
+  } else {
+    const t = VP.el.currentTime, fps = VP.fps;
+    const f = Math.floor(t * fps + 1e-3);
+    tc.textContent = `${pad2(Math.floor(t / 3600))}:${pad2(Math.floor(t % 3600 / 60))}:${pad2(Math.floor(t % 60))}:${pad2(f % Math.round(fps))}`;
+    fr.textContent = `Fr ${f} / ${Math.floor(vpDuration() * fps)}`;
+  }
+  const busy = VP.loading || !!VP.error;
+  vpBar.classList.toggle('busy', busy);
+  $vp('vpPlay').textContent = VP.playing ? '❚❚' : '▶';
+  $vp('vpRev').classList.toggle('on', VP.reversing);
+  $vp('vpLoop').classList.toggle('on', vpLoopOn());
+  $vp('vpMute').textContent = VP.muted ? '🔇' : '🔊';
+  $vp('vpMute').style.display = VP.kind === 'video' ? '' : 'none';
+  $vp('vpGrab').style.display = readOnlyShared ? 'none' : '';
+  const d = vpDuration(), span = VP.kind === 'anim' ? Math.max(1, VP.fCount - 1) : d;
+  if (!busy && span > 0) {
+    if (!VP.scrubbing) $vp('vpScrub').value = Math.round(vpTime() / span * 1000);
+    const it = vpItem();
+    const a = it && it.vIn != null ? it.vIn / span : 0, b = it && it.vOut != null ? it.vOut / span : 1;
+    const rng = $vp('vpRange');
+    rng.style.display = it && (it.vIn != null || it.vOut != null) ? 'block' : 'none';
+    rng.style.left = (a * 100) + '%'; rng.style.width = Math.max(0.5, (b - a) * 100) + '%';
+  }
+}
+
+/* ---- UIイベント ---- */
+(function wireVpBar() {
+  const on = (id, fn) => $vp(id).addEventListener('click', e => { e.stopPropagation(); fn(); e.currentTarget.blur(); });
+  on('vpPlay', vpTogglePlay);
+  on('vpRev', vpToggleReverse);
+  on('vpPrev', () => vpStep(-1));
+  on('vpNext', () => vpStep(1));
+  on('vpIn', vpSetIn);
+  on('vpOut', vpSetOut);
+  on('vpClr', vpClearInOut);
+  on('vpLoop', vpToggleLoop);
+  on('vpGrab', vpGrabFrame);
+  on('vpMute', vpToggleMute);
+  on('vpClose', vpClose);
+  const sc = $vp('vpScrub');
+  sc.addEventListener('pointerdown', () => { VP.scrubbing = true; vpPause(); });
+  sc.addEventListener('input', () => {
+    const span = VP.kind === 'anim' ? Math.max(1, VP.fCount - 1) : vpDuration();
+    vpSeek(sc.value / 1000 * span);
+  });
+  const endScrub = () => { VP.scrubbing = false; sc.blur(); };
+  sc.addEventListener('pointerup', endScrub); sc.addEventListener('change', endScrub);
+  $vp('vpSpeed').addEventListener('change', e => { vpSetRate(parseFloat(e.target.value)); e.target.blur(); });
+  $vp('vpFps').addEventListener('change', e => { vpSetFps(parseFloat(e.target.value)); e.target.blur(); });
+  // バー上の操作がキャンバス側(選択解除・パン等)に伝わらないようにする
+  for (const ev of ['pointerdown', 'dblclick', 'wheel', 'contextmenu']) vpBar.addEventListener(ev, e => e.stopPropagation());
+})();
+
+// 再生モード中だけ有効なキー。メインのキー処理より先に(capture)受け取り、使ったキーはそこで止める。
+// 使わないキー(F・H・G等)は通常どおりボード側の操作として流す。
+addEventListener('keydown', e => {
+  if (!vpActive()) return;
+  if (e.target.tagName === 'INPUT' && e.target.type !== 'range' || e.target.tagName === 'TEXTAREA') return;
+  if (e.code === 'Space') { if (!e.repeat) { VP.spaceT = performance.now(); VP.spacePanned = false; } return; } // 短押し=再生/停止、押したままドラッグ=パン(従来どおり)
+  const k = e.key, lk = k.toLowerCase(), ctl = e.ctrlKey || e.metaKey;
+  if (ctl) return;
+  let used = true;
+  if (k === 'Escape') vpClose();
+  else if (lk === 'k' || k === 'Enter') vpTogglePlay();
+  else if (k === 'ArrowRight' || k === '.') vpStep(e.shiftKey ? 10 : 1);
+  else if (k === 'ArrowLeft' || k === ',') vpStep(e.shiftKey ? -10 : -1);
+  else if (lk === 'j') vpSetRate(VP.rate / 2);
+  else if (lk === 'l') vpSetRate(VP.rate * 2);
+  else if (k === '[') vpSetRate(VP.rate / 2);
+  else if (k === ']') vpSetRate(VP.rate * 2);
+  else if (k === '0') vpSetRate(1);
+  else if (lk === 'i') e.altKey ? vpClearInOut() : vpSetIn();
+  else if (lk === 'o') vpSetOut();
+  else if (lk === 'p') vpToggleLoop();
+  else if (lk === 'r') vpToggleReverse();
+  else if (lk === 'c') vpGrabFrame();
+  else if (lk === 'm') vpToggleMute();
+  else if (k === 'Home') { vpPause(); vpSeek(vpRange()[0] + (VP.kind === 'anim' ? 0 : vpUnit() / 2)); }
+  else if (k === 'End') { vpPause(); vpSeek(vpRange()[1] + (VP.kind === 'anim' ? 0 : vpUnit() / 2)); }
+  else used = false;
+  if (used) { e.preventDefault(); e.stopImmediatePropagation(); }
+}, true);
+addEventListener('keyup', e => {
+  if (!vpActive() || e.code !== 'Space') return;
+  if (!VP.spacePanned && performance.now() - VP.spaceT < 250) vpTogglePlay();
+});
+cv.addEventListener('pointerdown', () => { if (vpActive() && spaceDown) VP.spacePanned = true; }, true);
+
 /* ============ 画像の追加 ============ */
 function addItemForImage(imgId, wx, wy) {
   const rec = store.get(imgId);
@@ -1872,18 +2538,24 @@ function addItemForImage(imgId, wx, wy) {
   return it;
 }
 async function addFiles(files, cx, cy) {
-  const list = [...files].filter(f => f.type.startsWith('image/'))
+  const list = [...files].filter(f => f.type.startsWith('image/') || isVideoFile(f))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })); // ファイル名順(2.jpg < 10.jpgのように数字も考慮)
   if (!list.length) return;
+  const bigVideos = list.filter(f => isVideoFile(f) && f.size > VIDEO_WARN_BYTES);
+  if (bigVideos.length && !confirm(
+    `${bigVideos.length > 1 ? bigVideos.length + ' videos are' : 'This video is'} over ${VIDEO_WARN_BYTES / 1048576 | 0}MB.\n\n` +
+    'Large videos take a while to save to Drive and to download on other PCs. Add anyway?')) return;
   pushUndo();
   const wx = cx !== undefined ? s2wX(cx) : s2wX(innerWidth / 2);
   const wy = cy !== undefined ? s2wY(cy) : s2wY(innerHeight / 2);
-  let i = 0, added = 0;
+  let i = 0, added = 0, rejectedVideos = 0;
   sel.clear();
   const newItems = [];
   for (const f of list) {
     progress('Loading', i / list.length);
-    const imgId = await importImageBlob(f, f.type);
+    const video = isVideoFile(f);
+    const imgId = video ? await importVideoBlob(f, f.name) : await importImageBlob(f, f.type);
+    if (!imgId && video) rejectedVideos++;
     if (imgId) {
       const it = addItemForImage(imgId, wx, wy); // 複数枚の場合は仮位置。後でpackGridが隙間なく詰め直す
       sel.add(it.id);
@@ -1895,7 +2567,8 @@ async function addFiles(files, cx, cy) {
   }
   if (newItems.length > 1) packGrid(newItems, 0, wx, wy); // PureRefと同じく隙間なしで詰める
   progressDone();
-  toast(added + ' image(s) added');
+  if (rejectedVideos) toast(`${added} item(s) added — ${rejectedVideos} video(s) can't be played in this browser (convert to MP4 / H.264)`);
+  else toast(added + ' image(s) added');
 }
 
 /* ドラッグ&ドロップ */
@@ -1961,7 +2634,8 @@ function pasteItemsFromClipboardText(json) {
       if (!n.imgId || !store.has(n.imgId)) { skipped++; continue; }
       const it = { id: nextId++, imgId: n.imgId,
         x: wx + (n.x - gcx), y: wy + (n.y - gcy), w: n.w, h: n.h, rot: n.rot || 0,
-        flipH: !!n.flipH, flipV: !!n.flipV, gray: !!n.gray, opacity: n.opacity ?? 1, crop: n.crop || undefined };
+        flipH: !!n.flipH, flipV: !!n.flipV, gray: !!n.gray, opacity: n.opacity ?? 1, crop: n.crop || undefined,
+        vIn: n.vIn ?? undefined, vOut: n.vOut ?? undefined, vLoop: n.vLoop };
       items.push(it); sel.add(it.id); pasted++;
     }
   }
@@ -2075,7 +2749,7 @@ async function renderMultiItemToPng(selItems) {
     if (!rec) continue;
     const cr = it.crop;
     const need = Math.max(it.w / (cr ? cr.w : 1), it.h / (cr ? cr.h : 1)) * k;
-    const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
+    const blob = await getBlob(stillRef(rec)); // 原本があれば無劣化のもの(動画はポスター)を使う
     let bmp;
     if (need >= Math.max(rec.w, rec.h)) bmp = await createImageBitmap(blob);
     else {
@@ -2124,7 +2798,7 @@ async function copySelectionToClipboard() {
       } else {
         const rec = store.get(it.imgId);
         if (!rec) throw new Error('image unavailable');
-        const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
+        const blob = await getBlob(stillRef(rec)); // 原本があれば無劣化のもの(動画はポスター)を使う
         const bmp = await createImageBitmap(blob);
         const cr = it.crop;
         const sx = cr ? cr.x * bmp.width : 0, sy = cr ? cr.y * bmp.height : 0;
@@ -2154,7 +2828,7 @@ async function copySelectionToClipboard() {
       const base = { type: it.type === 'note' ? 'note' : 'image', x: it.x, y: it.y, w: it.w, h: it.h,
         rot: it.rot || 0, flipH: !!it.flipH, flipV: !!it.flipV, gray: !!it.gray, opacity: it.opacity ?? 1 };
       if (it.type === 'note') return { ...base, text: it.text || '', bold: !!it.bold, bg: it.bg, fg: it.fg, fontSize: it.fontSize };
-      return { ...base, imgId: it.imgId, crop: it.crop || null };
+      return { ...base, imgId: it.imgId, crop: it.crop || null, vIn: it.vIn ?? null, vOut: it.vOut ?? null, vLoop: it.vLoop };
     });
     clipItems['text/plain'] = new Blob([MIRUMOOD_ITEMS_CLIP_PREFIX + JSON.stringify(payload)], { type: 'text/plain' });
     await navigator.clipboard.write([new ClipboardItem(clipItems)]);
@@ -3622,6 +4296,8 @@ async function reloadSelectedImages() {
       rec.thumbEmbedStr = undefined; // 埋め込みサムネの文字列も壊れている可能性があるので作り直させる
       if (rec.driveId) await LocalCache.deleteEntry(rec.driveId, currentDriveFolderId, driveUserEmail).catch(() => {});
       if (rec.thumbDriveId) await LocalCache.deleteEntry(rec.thumbDriveId, currentDriveFolderId, driveUserEmail).catch(() => {});
+      if (rec.posterDriveId) await LocalCache.deleteEntry(rec.posterDriveId, currentDriveFolderId, driveUserEmail).catch(() => {});
+      if (vpMemo.imgId === imgId) { vpMemo.imgId = null; vpMemo.blob = null; }
     }
   }
   paint(); // 再描画のたびにdrawItem内でrequestDecodeが呼ばれるので、自動的に再取得が始まる
@@ -3645,6 +4321,7 @@ async function cacheAllBoardImages() {
           progress(label(), (imagesDone + frac) / used.length);
         });
         if (rec.thumb) await getBlob(rec.thumb);
+        if (rec.poster) await getBlob(rec.poster);
       } catch {
         // サインインが切れている場合、残り全部も同じ理由(タイムアウトするまで)で失敗し続けるだけ
         // なので、無駄に待たせず、ここで一度打ち切って分かりやすいメッセージを出す。
@@ -3766,13 +4443,14 @@ async function writeManifestCheckpoint(folderId, used, embeds) {
     app: 'MiruMood', version: 3,
     canvasBg: currentCanvasBg,
     jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
-    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
-      ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
+    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity, vIn, vOut, vLoop }) =>
+      ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity, vIn, vOut, vLoop })),
     images: used.map(id => {
       const r = store.get(id);
       return {
         id, w: r.w, h: r.h, ext: r.ext, driveId: r.driveId || null, thumbDriveId: r.thumbDriveId || null, thumbEmbed: embeds.get(id) || null,
-        fullDriveId: r.fullDriveId || null, fullExt: r.fullExt || null
+        fullDriveId: r.fullDriveId || null, fullExt: r.fullExt || null,
+        ...mediaManifestFields(r), posterDriveId: r.posterDriveId || null
       };
     })
   };
@@ -3781,6 +4459,24 @@ async function writeManifestCheckpoint(folderId, used, embeds) {
   currentDriveManifestId = await driveUploadFile('board.json', mBlob, 'application/json', folderId, currentDriveManifestId);
 }
 
+// 動画のアップロードを1本ずつに絞るための簡易ロック
+let videoUploadChain = Promise.resolve();
+function withVideoUploadSlot(fn) {
+  const run = videoUploadChain.then(fn, fn);
+  videoUploadChain = run.catch(() => {});
+  return run;
+}
+// board.jsonの画像エントリに足す、動画/アニメ画像用の項目(静止画では何も足さない)
+function mediaManifestFields(r) {
+  if (r.kind === 'video') return { kind: 'video', mime: r.mime || null, dur: r.dur || 0, fps: r.fps || null };
+  if (r.kind === 'anim') return { kind: 'anim', mime: r.mime || null, frames: r.frames || 0 };
+  return {};
+}
+function mediaRecFields(im) { // board.json → store のレコード側
+  if (im.kind === 'video') return { kind: 'video', mime: im.mime || null, dur: im.dur || 0, fps: im.fps || null };
+  if (im.kind === 'anim') return { kind: 'anim', mime: im.mime || null, frames: im.frames || 0 };
+  return {};
+}
 async function saveBoardToDrive(forceNewName) {
   if (readOnlyShared) { toast('This is a read-only shared view — download it as .mrmd to edit your own copy'); return; }
   if (!items.length) { toast('Board is empty'); return; }
@@ -3850,16 +4546,27 @@ async function saveBoardToDrive(forceNewName) {
       while (cursor < used.length) {
         const id = used[cursor++];
         const rec = store.get(id);
+        if (rec.poster && !rec.posterDriveId) { // 動画の表示用ポスター(他のPCではまずこれだけを取得する)
+          const pblob = await getBlob(rec.poster);
+          rec.posterDriveId = await driveUploadFile(`${id}_poster.jpg`, pblob, 'image/jpeg', folderId);
+          LocalCache.put(rec.posterDriveId, pblob, folderId, driveUserEmail).catch(() => {});
+          dirtySinceCheckpoint = true;
+        }
         if (!rec.driveId) {
           const blob = await getBlob(rec.original);
-          rec.driveId = await driveUploadFile(`${id}.${rec.ext}`, blob, blob.type || 'application/octet-stream', folderId);
+          const mime = blob.type || rec.mime || 'application/octet-stream';
+          // 大きな動画が並行して何本も上がると回線を占有して画像側まで詰まるので、動画だけは1本ずつ通す
+          rec.driveId = rec.kind === 'video'
+            ? await withVideoUploadSlot(() => driveUploadFile(`${id}.${rec.ext}`, blob, mime, folderId, null,
+                f => progress(`Saving to Drive — uploading video ${Math.round(f * 100)}%`, done / used.length)))
+            : await driveUploadFile(`${id}.${rec.ext}`, blob, mime, folderId);
           LocalCache.put(rec.driveId, blob, folderId, driveUserEmail).catch(() => {});
           dirtySinceCheckpoint = true;
         }
         if (!rec.thumb && Math.max(rec.w, rec.h) > 320) {
           // Driveフォルダを直接開いた画像などサムネイル未生成のものは、この保存のタイミングで生成する
           try {
-            const origBlob = await getBlob(rec.original);
+            const origBlob = await getBlob(displayRef(rec));
             const obmp = await createImageBitmap(origBlob);
             rec.thumb = await blobToThumb(obmp);
             obmp.close();
@@ -4345,7 +5052,10 @@ function loadManifestIntoBoard(manifest, folderId, manifestId, folderName) {
       original: (onBytes) => driveDownloadBlob(im.driveId, { board: folderId, account: driveUserEmail, onBytes }),
       thumb: im.thumbEmbed ? () => Promise.resolve(dataURItoBlob(im.thumbEmbed))
            : (im.thumbDriveId ? (onBytes) => driveDownloadBlob(im.thumbDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null),
-      fullOriginal: im.fullDriveId ? (onBytes) => driveDownloadBlob(im.fullDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null
+      fullOriginal: im.fullDriveId ? (onBytes) => driveDownloadBlob(im.fullDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null,
+      ...mediaRecFields(im),
+      posterDriveId: im.posterDriveId || null,
+      poster: im.posterDriveId ? (onBytes) => driveDownloadBlob(im.posterDriveId, { board: folderId, account: driveUserEmail, onBytes }) : null
     });
     const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
     if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
@@ -4411,9 +5121,9 @@ async function saveBoard() {
     app: 'MiruMood', version: 2,
     canvasBg: currentCanvasBg,
     jpegOptimize, keepOriginalOnOptimize, jpegPromptDismissed,
-    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity }) =>
-      ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity })),
-    images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, fullExt: r.fullExt || null }; })
+    items: items.map(({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity, vIn, vOut, vLoop }) =>
+      ({ id, imgId, type, text, bg, fg, fontSize, bold, crop, x, y, w, h, rot, flipH, flipV, gray, opacity, vIn, vOut, vLoop })),
+    images: used.map(id => { const r = store.get(id); return { id, w: r.w, h: r.h, ext: r.ext, fullExt: r.fullExt || null, ...mediaManifestFields(r) }; })
   };
   const files = [{ name: 'board.json', blob: new Blob([JSON.stringify(manifest)]) }];
   try {
@@ -4424,6 +5134,7 @@ async function saveBoard() {
       files.push({ name: `images/${id}.${r.ext}`, blob: await getBlob(r.original) });
       if (r.thumb) files.push({ name: `thumbs/${id}.webp`, blob: await getBlob(r.thumb) });
       if (r.fullOriginal) files.push({ name: `images_full/${id}.${r.fullExt}`, blob: await getBlob(r.fullOriginal) });
+      if (r.poster) files.push({ name: `posters/${id}.jpg`, blob: await getBlob(r.poster) });
       done++;
       progress('Preparing', done / used.length);
     }
@@ -4454,12 +5165,15 @@ async function loadBoard(file) {
       const th = entries.get(`thumbs/${im.id}.webp`);
       const full = im.fullExt ? entries.get(`images_full/${im.id}.${im.fullExt}`) : null;
       if (!orig) continue;
+      const pst = entries.get(`posters/${im.id}.jpg`);
       store.set(im.id, {
         w: im.w, h: im.h, ext: im.ext,
         original: () => orig.data(),
         thumb: th ? () => th.data() : null,
         fullOriginal: full ? () => full.data() : null,
-        fullExt: full ? im.fullExt : null
+        fullExt: full ? im.fullExt : null,
+        ...mediaRecFields(im),
+        poster: pst ? () => pst.data() : null
       });
       const n = parseInt(String(im.id).replace(/\D/g, ''), 10);
       if (!isNaN(n) && n >= imgSeq) imgSeq = n + 1;
@@ -4531,7 +5245,7 @@ async function exportPNG() {
     if (!rec) continue;
     const cr = it.crop;
     const need = Math.max(it.w / (cr ? cr.w : 1), it.h / (cr ? cr.h : 1)) * k;
-    const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
+    const blob = await getBlob(stillRef(rec)); // 原本があれば無劣化のもの(動画はポスター)を使う
     let bmp;
     if (need >= Math.max(rec.w, rec.h)) bmp = await createImageBitmap(blob);
     else {
@@ -4609,7 +5323,8 @@ async function runExport() {
     try {
       const rec = store.get(it.imgId);
       if (rec) {
-        const blob = await getBlob(rec.fullOriginal || rec.original); // 原本があれば無劣化のものを使う
+        // 「元の形式のまま」書き出す時は、動画は動画ファイルそのものを書き出す。PNG/JPG指定ならポスター。
+        const blob = await getBlob(fmt === 'original' ? (rec.fullOriginal || rec.original) : stillRef(rec));
         let outBlob = blob, ext = exportExt(fmt, rec);
         if (fmt !== 'original') {
           const bmp = await createImageBitmap(blob);
@@ -4816,6 +5531,8 @@ function openMenu(px, py) {
   const selNotes = selItems.filter(i => i.type === 'note');
   const multiNote = selNotes.length >= 2 && selNotes.length === selItems.length; // 選択が全部メモの複数選択
   const rows = has ? [
+    ...(singleImg && isMediaRec(store.get(selItems[0].imgId)) ? [[selItems[0].id === VP.itemId ? 'Close player' : 'Play', selItems[0].id === VP.itemId ? 'Esc' : 'Double-click',
+        () => selItems[0].id === VP.itemId ? vpClose() : vpOpen(selItems[0])]] : []),
     ...(singleImg ? [['Crop', 'C', toggleCrop]] : []),
     ...(singleImg && selItems[0].crop ? [['Remove crop', '', () => clearCrop(selItems[0])]] : []),
     ...(singleNote ? [['Edit note', 'Double-click', () => openNoteEditor(selItems[0])],
