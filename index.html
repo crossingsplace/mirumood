@@ -749,7 +749,12 @@ function evict() {
 //  前のボードで「i1」が読み込み済み/失敗扱いだった場合、次に開いたボードの
 //  たまたま同じIDの画像が、実際には一度も取得していないのに読み込み済み扱いに
 //  なってしまったり、逆に一度も試していないのに裏読みを諦めた扱いになってしまう。)
+// 今開いているボードの識別子。ボードを開く/閉じるたびに(=clearBmpCacheのたびに)振り直す。
+// クリップボードへのコピーに付けておき、「同じボードへの貼り付けか」の判定に使う(CLIP参照)。
+function newClipKey() { return (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36)); }
+let boardSessionKey = newClipKey();
 function clearBmpCache() {
+  boardSessionKey = newClipKey();
   vpClose(); vpMemo.imgId = null; vpMemo.blob = null; // 別ボードを開く時は再生中のものも閉じる
   for (const e of bmpCache.values()) e.bmp.close();
   bmpCache.clear();
@@ -2589,29 +2594,229 @@ addEventListener('drop', e => {
   if (board) { loadBoard(board); return; }
   if (fs.length) addFiles(fs, cxp, cyp);
 });
-/* クリップボード */
-const MIRUMOOD_ITEMS_CLIP_PREFIX = 'MIRUMOOD_ITEMS_V1:'; // 自分自身がコピーしたアイテム(メモ・画像)だと分かる目印
-addEventListener('paste', e => {
-  if (readOnlyShared) return;
-  const text = e.clipboardData?.getData('text/plain') || '';
-  if (text.startsWith(MIRUMOOD_ITEMS_CLIP_PREFIX)) {
-    // MiruMood自身でコピーしたアイテム(1つ以上)。画像として取り込まず、編集可能なアイテムの
-    // ままボードへ復元する。他アプリ用に同時に書き込まれているimage/pngは無視する。
-    e.preventDefault();
-    try { pasteItemsFromClipboardText(text.slice(MIRUMOOD_ITEMS_CLIP_PREFIX.length)); } catch { toast('Could not paste'); }
-    return;
+/* =====================================================================
+ * クリップボード(MiruMood同士のコピー&ペースト)  ── CLIP
+ *
+ * 以前は、MiruMoodへ貼り戻すためのデータ(アイテムの配置＋imgId)をtext/plainとして
+ * 画像(image/png)と一緒にクリップボードへ書いていた。そのため、Gmailのように「テキストが
+ * あればテキストを優先して貼る」アプリでは、画像ではなく`MIRUMOOD_ITEMS_V1:[...]`という
+ * 文字列が貼られてしまっていた。また、imgIdはボードごとにi1,i2…と振られるため、別のボード
+ * (別ウインドウ・ボード切り替え後)へ貼ると、たまたま同じIDの「別の画像」が貼られていた。
+ *
+ * 現在の仕組み:
+ *  - 他アプリ向けにはimage/pngだけを見せる。MiruMood用のデータはChromeの独自形式
+ *    (Web Custom Formats: 'web application/x-mirumood-items')に入れる。これはWebページからしか
+ *    読めないので、他アプリには一切見えない。
+ *  - データには「どのウインドウの・どのボードの」コピーかを示す印(win/board)と、コピーの
+ *    識別子(clipId)を付ける。同じウインドウの同じボードなら今まで通りimgIdをそのまま使う。
+ *  - それ以外の場合は、画像の実データを取り寄せて、新しいimgIdで取り込み直す。
+ *      同じウインドウ(ボードを切り替えた後): コピー時に控えておいたレコードから直接読む
+ *      別ウインドウ: BroadcastChannelでコピー元のウインドウに実データを要求する
+ *    取り込んだ画像はdriveIdを持たないので、次にDriveへ保存した時に、貼り付け先のボードの
+ *    フォルダへ改めてアップロードされる(他ボードのファイルを参照し続けると、元のボードを
+ *    消した時に壊れるため)。
+ *  - コピー元のウインドウが既に閉じられている等で応答が無い場合は、他アプリと同じく
+ *    合成PNGを1枚の画像として貼る。
+ *  - 独自形式が読めない場合(Firefox等の非対応ブラウザ、クリップボード読み取りの許可を拒否した
+ *    場合)は、同じウインドウ内に限り、直前のコピーと貼り付けようとしている画像の見た目が
+ *    一致するかで判定して復元する。
+ * =================================================================== */
+const CLIP_MIME = 'web application/x-mirumood-items';
+const CLIP_CHANNEL_NAME = 'mirumood-clip';
+const CLIP_ACK_TIMEOUT_MS = 1500;        // コピー元のウインドウが生きているかの確認を待つ時間
+const CLIP_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000; // 応答があった後、実データ(Driveからの取得含む)を待つ上限
+const CLIP_REGISTRY_MAX = 8;             // このウインドウで控えておく直近のコピーの数(参照だけなので軽い)
+const MM_WIN_ID = newClipKey();          // このウインドウ(タブ)の識別子。開くたびに変わる
+
+const clipRegistry = new Map();   // clipId -> { board, recs: Map<imgId, rec> }  このウインドウでのコピー
+const clipImportMap = new Map();  // `${clipId}:${imgId}` -> 取り込み済みのローカルimgId(同じコピーを2回貼っても重複させない)
+let clipImportBoard = null;       // clipImportMapがどのボードでの取り込みか(ボードが変わったら捨てる)
+let lastCopyFallback = null;      // 直前のコピーの控え: { payload, png, fp }。独自形式が読めなかった時の照合用
+
+const clipChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(CLIP_CHANNEL_NAME) : null;
+let clipSupportsCustom = null; // null=未確認 / true / false
+
+function clipCustomFormatSupported() {
+  if (clipSupportsCustom !== null) return clipSupportsCustom;
+  try {
+    clipSupportsCustom = typeof ClipboardItem !== 'undefined' && typeof ClipboardItem.supports === 'function'
+      ? ClipboardItem.supports(CLIP_MIME) : null;
+  } catch { clipSupportsCustom = false; }
+  return clipSupportsCustom; // supports()自体が無い古いChromeはnullのまま(書き込みを試して判断する)
+}
+
+// ---- 他アプリと共通の「見た目」の指紋(独自形式非対応ブラウザでの照合用) ----
+async function clipFingerprint(blob) {
+  try {
+    const bmp = await createImageBitmap(blob, { resizeWidth: 8, resizeHeight: 8, resizeQuality: 'medium' });
+    const c = document.createElement('canvas'); c.width = 8; c.height = 8;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(bmp, 0, 0);
+    const out = { w: 0, h: 0, px: Array.from(g.getImageData(0, 0, 8, 8).data) };
+    bmp.close();
+    const full = await createImageBitmap(blob); out.w = full.width; out.h = full.height; full.close();
+    return out;
+  } catch { return null; }
+}
+function clipFingerprintMatch(a, b) {
+  if (!a || !b || a.w !== b.w || a.h !== b.h) return false;
+  let d = 0;
+  for (let i = 0; i < a.px.length; i++) d += Math.abs(a.px[i] - b.px[i]);
+  return d / a.px.length < 6; // OSのクリップボードを経由すると色が微妙に変わることがあるので多少の誤差は許す
+}
+
+// ---- コピー ----
+function buildClipPayload(selItems) {
+  const clipId = newClipKey();
+  const recs = new Map();
+  const list = selItems.map(it => {
+    const base = { type: it.type === 'note' ? 'note' : 'image', x: it.x, y: it.y, w: it.w, h: it.h,
+      rot: it.rot || 0, flipH: !!it.flipH, flipV: !!it.flipV, gray: !!it.gray, opacity: it.opacity ?? 1 };
+    if (it.type === 'note') return { ...base, text: it.text || '', bold: !!it.bold, bg: it.bg, fg: it.fg, fontSize: it.fontSize };
+    const rec = store.get(it.imgId);
+    if (rec) recs.set(it.imgId, rec); // レコードそのもの(遅延取得の関数を含む)を控えておく。ボードを切り替えても読める
+    return { ...base, imgId: it.imgId, crop: it.crop || null, vIn: it.vIn ?? null, vOut: it.vOut ?? null, vLoop: it.vLoop };
+  });
+  clipRegistry.set(clipId, { board: boardSessionKey, recs });
+  while (clipRegistry.size > CLIP_REGISTRY_MAX) clipRegistry.delete(clipRegistry.keys().next().value);
+  return { v: 2, app: 'MiruMood', clipId, win: MM_WIN_ID, board: boardSessionKey, items: list };
+}
+async function writeClipboard(pngBlob, payload) {
+  // 独自形式のBlobは、typeを書き込み先のMIMEと一致させないとChromeに拒否される(text/plainは不可)
+  const json = new Blob([JSON.stringify(payload)], { type: CLIP_MIME });
+  if (clipCustomFormatSupported() !== false) {
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob, [CLIP_MIME]: json })]);
+      clipSupportsCustom = true;
+      lastCopyFallback = { payload, png: pngBlob, fp: null }; // 読み取りを拒否された時などの保険
+      return;
+    } catch (err) {
+      if (clipSupportsCustom === true) throw err; // 対応しているのに失敗した = 権限等の別の理由
+      console.warn('[MiruMood] custom clipboard format unavailable, falling back to image only', err);
+      clipSupportsCustom = false;
+    }
   }
-  const fs = [...(e.clipboardData?.items || [])].filter(i => i.type.startsWith('image/')).map(i => i.getAsFile());
-  if (fs.length) { e.preventDefault(); addFiles(fs); }
-});
-// クリップボードから読んだJSONを元に、アイテム同士の相対的な位置関係を保ったまま画面中央へ
-// 配置し直す。メモは中身(文章・スタイル)だけで完結しているので常に復元できるが、画像は
-// 参照している画像データ(store内)が今このボードに実在する場合だけ復元できる。別のボードへ
-// 貼り付けた場合など、参照先が見つからない画像は、無理に画像化はせずその分だけ諦める
-// (画像そのものは他アプリ用にPNGとしてもクリップボードに入っているので、そちらは支障ない)。
-function pasteItemsFromClipboardText(json) {
-  const list = JSON.parse(json);
-  if (!Array.isArray(list) || !list.length) return;
+  // 独自形式が使えないブラウザ: 画像だけを書き、MiruMood用のデータはこのウインドウ内に控える
+  await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+  lastCopyFallback = { payload, png: pngBlob, fp: null };
+}
+
+// ---- 別ウインドウへの実データの受け渡し(BroadcastChannel) ----
+// 1枚分の実データを、構造化複製でそのまま送れる形(Blobは参照渡しになるので動画でも軽い)にまとめる
+async function packRecForTransfer(rec) {
+  const get = ref => ref ? getBlob(ref) : Promise.resolve(null);
+  const [original, thumb, poster, fullOriginal] = await Promise.all([
+    get(rec.original), get(rec.thumb), get(rec.poster), get(rec.fullOriginal)]);
+  if (!original) throw new Error('missing original');
+  return {
+    w: rec.w, h: rec.h, ext: rec.ext, fullExt: rec.fullExt || null,
+    kind: rec.kind || null, mime: rec.mime || null, dur: rec.dur || 0, fps: rec.fps || null, frames: rec.frames || 0,
+    original, thumb, poster, fullOriginal
+  };
+}
+async function resolveFromRegistry(clipId, imgIds, onProgress) {
+  const entry = clipRegistry.get(clipId);
+  if (!entry) return null;
+  const out = {};
+  let done = 0;
+  for (const id of imgIds) {
+    const rec = entry.recs.get(id);
+    if (rec) {
+      try { out[id] = await packRecForTransfer(rec); }
+      catch (err) { console.warn('[MiruMood] could not read copied image', id, err); }
+    }
+    if (onProgress) onProgress(++done / imgIds.length);
+  }
+  return out;
+}
+if (clipChannel) {
+  clipChannel.addEventListener('message', async ev => {
+    const m = ev.data || {};
+    if (m.type !== 'req' || m.to !== MM_WIN_ID) return;
+    if (!clipRegistry.has(m.clipId)) { clipChannel.postMessage({ type: 'gone', reqId: m.reqId }); return; }
+    clipChannel.postMessage({ type: 'ack', reqId: m.reqId });
+    const recs = await resolveFromRegistry(m.clipId, m.imgIds || [],
+      f => clipChannel.postMessage({ type: 'progress', reqId: m.reqId, f }));
+    clipChannel.postMessage({ type: 'res', reqId: m.reqId, recs: recs || {} });
+  });
+}
+function requestFromOtherWindow(payload, imgIds) {
+  return new Promise(resolve => {
+    if (!clipChannel) { resolve(null); return; }
+    const reqId = newClipKey();
+    let acked = false;
+    const finish = v => { clearTimeout(ackTimer); clearTimeout(xferTimer); clipChannel.removeEventListener('message', onMsg); resolve(v); };
+    const onMsg = ev => {
+      const m = ev.data || {};
+      if (m.reqId !== reqId) return;
+      if (m.type === 'ack') { acked = true; clearTimeout(ackTimer); progress('Pasting from another window', 0); }
+      else if (m.type === 'progress') progress('Pasting from another window', m.f || 0);
+      else if (m.type === 'res') finish(m.recs || {});
+      else if (m.type === 'gone') finish(null);
+    };
+    clipChannel.addEventListener('message', onMsg);
+    const ackTimer = setTimeout(() => { if (!acked) finish(null); }, CLIP_ACK_TIMEOUT_MS);
+    const xferTimer = setTimeout(() => finish(null), CLIP_TRANSFER_TIMEOUT_MS);
+    clipChannel.postMessage({ type: 'req', reqId, to: payload.win, clipId: payload.clipId, imgIds });
+  });
+}
+// 取り寄せた実データを、このボードの新しい画像として登録する
+function registerTransferredRec(t) {
+  const id = 'i' + (imgSeq++);
+  store.set(id, {
+    w: t.w, h: t.h, ext: t.ext,
+    original: t.original, thumb: t.thumb || null,
+    fullOriginal: t.fullOriginal || null, fullExt: t.fullOriginal ? t.fullExt : null,
+    ...(t.kind === 'video' ? { kind: 'video', mime: t.mime, dur: t.dur, fps: t.fps, poster: t.poster || null } : {}),
+    ...(t.kind === 'anim' ? { kind: 'anim', mime: t.mime, frames: t.frames } : {})
+  });
+  return id;
+}
+
+// ---- 貼り付け ----
+// payload(独自形式のJSON)をボードへ復元する。fallbackFiles: 復元できない時に代わりに貼る画像(合成PNG)
+async function pasteClipPayload(payload, fallbackFiles) {
+  if (!payload || !Array.isArray(payload.items) || !payload.items.length) return false;
+  const sameBoard = payload.win === MM_WIN_ID && payload.board === boardSessionKey;
+  const needIds = [...new Set(payload.items.filter(n => n.type !== 'note' && n.imgId).map(n => n.imgId))];
+  let idMap = new Map();
+  if (sameBoard) {
+    for (const id of needIds) if (store.has(id)) idMap.set(id, id);
+  } else if (needIds.length) {
+    if (clipImportBoard !== boardSessionKey) { clipImportMap.clear(); clipImportBoard = boardSessionKey; }
+    const todo = [];
+    for (const id of needIds) {
+      const local = clipImportMap.get(payload.clipId + ':' + id);
+      if (local && store.has(local)) idMap.set(id, local); else todo.push(id);
+    }
+    if (todo.length) {
+      let recs;
+      try {
+        recs = payload.win === MM_WIN_ID
+          ? await resolveFromRegistry(payload.clipId, todo, f => progress('Pasting', f)) // ボードを切り替えた後の同じウインドウ
+          : await requestFromOtherWindow(payload, todo);
+      } finally { progressDone(); }
+      if (!recs) {
+        // コピー元のウインドウが閉じている等で取り寄せられなかった: 合成PNGを1枚の画像として貼る
+        if (fallbackFiles && fallbackFiles.length) {
+          await addFiles(fallbackFiles);
+          toast('The window you copied from is closed — pasted as a single flattened image');
+        } else toast('Could not paste — the window you copied from is closed');
+        return true;
+      }
+      for (const id of todo) {
+        if (!recs[id]) continue;
+        const local = registerTransferredRec(recs[id]);
+        clipImportMap.set(payload.clipId + ':' + id, local);
+        idMap.set(id, local);
+      }
+    }
+  }
+  placePastedItems(payload.items, idMap, !sameBoard);
+  return true;
+}
+// アイテム同士の相対的な位置関係を保ったまま、画面中央へ配置し直す
+function placePastedItems(list, idMap, fromElsewhere) {
   let x0 = 1 / 0, y0 = 1 / 0, x1 = -1 / 0, y1 = -1 / 0;
   for (const n of list) {
     const hw = (n.w || 0) / 2, hh = (n.h || 0) / 2;
@@ -2631,8 +2836,9 @@ function pasteItemsFromClipboardText(json) {
         bg: n.bg || NOTE_COLORS[0][0], fg: n.fg || NOTE_COLORS[0][1], fontSize: n.fontSize || 18 };
       items.push(it); sel.add(it.id); pasted++;
     } else {
-      if (!n.imgId || !store.has(n.imgId)) { skipped++; continue; }
-      const it = { id: nextId++, imgId: n.imgId,
+      const imgId = idMap.get(n.imgId);
+      if (!imgId) { skipped++; continue; }
+      const it = { id: nextId++, imgId,
         x: wx + (n.x - gcx), y: wy + (n.y - gcy), w: n.w, h: n.h, rot: n.rot || 0,
         flipH: !!n.flipH, flipV: !!n.flipV, gray: !!n.gray, opacity: n.opacity ?? 1, crop: n.crop || undefined,
         vIn: n.vIn ?? undefined, vOut: n.vOut ?? undefined, vLoop: n.vLoop };
@@ -2641,44 +2847,88 @@ function pasteItemsFromClipboardText(json) {
   }
   driveDirty = true; updateDriveState();
   paint();
-  if (!pasted) { toast('Could not paste — those images are from a different board'); return; }
+  if (fromElsewhere) scheduleBackgroundPrefetch();
+  if (!pasted) { toast('Could not paste — the copied images are no longer available'); return; }
   let msg = pasted > 1 ? `Pasted ${pasted} items` : 'Pasted item';
-  if (skipped) msg += ` (${skipped} skipped — from a different board)`;
+  if (skipped) msg += ` (${skipped} could not be loaded)`;
   toast(msg);
 }
-// 右クリックメニューの「Paste」用。キーボードのCtrl+Vと違い、メニューのクリックからは
-// ブラウザ標準のpasteイベントが発生しないため、Clipboard APIで直接クリップボードを読みに行く。
+async function readClipPayloadFromItems(clipItems) {
+  for (const item of clipItems) {
+    if (!item.types.includes(CLIP_MIME)) continue;
+    try { return JSON.parse(await (await item.getType(CLIP_MIME)).text()); } catch {}
+  }
+  return null;
+}
+async function imageFilesFromClipItems(clipItems) {
+  const files = [];
+  for (const item of clipItems) {
+    const imgType = item.types.find(t => t.startsWith('image/'));
+    if (!imgType) continue;
+    const blob = await item.getType(imgType);
+    files.push(new File([blob], `pasted.${imgType.split('/')[1] || 'png'}`, { type: imgType }));
+  }
+  return files;
+}
+// 独自形式が読めなかった時(非対応ブラウザ・読み取りの許可が拒否された等): 貼ろうとしている画像が、
+// このウインドウで直前にコピーしたものかを見た目で照合する。指紋は必要になった時にだけ計算する。
+async function matchFallbackCopy(files) {
+  if (!lastCopyFallback || files.length !== 1) return null;
+  if (!lastCopyFallback.fp) lastCopyFallback.fp = await clipFingerprint(lastCopyFallback.png);
+  const fp = await clipFingerprint(files[0]);
+  return clipFingerprintMatch(fp, lastCopyFallback.fp) ? lastCopyFallback.payload : null;
+}
+let pasteInFlight = false;
+async function handleImagePaste(files, clipItemsPromise) {
+  if (pasteInFlight) return; // 処理中にもう一度Ctrl+Vされても、二重に貼らない
+  pasteInFlight = true;
+  try {
+    let payload = null;
+    if (clipItemsPromise) {
+      try { payload = await readClipPayloadFromItems(await clipItemsPromise); }
+      catch (err) { console.warn('[MiruMood] could not read MiruMood data from the clipboard', err); }
+    }
+    if (!payload) payload = await matchFallbackCopy(files);
+    if (payload && await pasteClipPayload(payload, files)) return;
+    if (files.length) await addFiles(files);
+  } catch (err) {
+    console.warn('[MiruMood] paste failed:', err);
+    toast('Could not paste');
+  } finally { pasteInFlight = false; }
+}
+addEventListener('paste', e => {
+  if (readOnlyShared) return;
+  if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return; // メモ編集中などの文字の貼り付けは邪魔しない
+  // DataTransferはイベントを抜けると読めなくなるので、画像はここで同期的に取り出しておく。
+  // MiruMoodのコピーには必ず画像(合成PNG)が含まれるので、画像が無ければMiruMoodのデータも無い。
+  const files = [...(e.clipboardData?.items || [])].filter(i => i.kind === 'file' && i.type.startsWith('image/')).map(i => i.getAsFile()).filter(Boolean);
+  if (!files.length) return;
+  e.preventDefault();
+  // 独自形式はpasteイベントからは見えないので、Clipboard APIで読みに行く(初回だけ許可の確認が出ることがある)
+  const canRead = clipCustomFormatSupported() !== false && navigator.clipboard && navigator.clipboard.read;
+  handleImagePaste(files, canRead ? navigator.clipboard.read() : null);
+});
+// 右クリックメニューの「Paste」用。メニューのクリックからはブラウザ標準のpasteイベントが
+// 発生しないため、Clipboard APIで直接クリップボードを読みに行く。
 async function pasteFromMenu() {
   if (readOnlyShared) { toast('This is a read-only shared view'); return; }
   if (!navigator.clipboard || !navigator.clipboard.read) {
     toast('This browser can\'t paste from a menu — please use Ctrl+V instead');
     return;
   }
-  try {
-    const clipItems = await navigator.clipboard.read();
-    // MiruMood自身がコピーしたアイテム(メモ・画像)を優先して探す
-    for (const item of clipItems) {
-      if (!item.types.includes('text/plain')) continue;
-      const text = await (await item.getType('text/plain')).text();
-      if (text.startsWith(MIRUMOOD_ITEMS_CLIP_PREFIX)) {
-        pasteItemsFromClipboardText(text.slice(MIRUMOOD_ITEMS_CLIP_PREFIX.length));
-        return;
-      }
-    }
-    // 無ければ、画像として取り込む(他アプリ・他サイトからコピーした画像の貼り付け)
-    const files = [];
-    for (const item of clipItems) {
-      const imgType = item.types.find(t => t.startsWith('image/'));
-      if (!imgType) continue;
-      const blob = await item.getType(imgType);
-      files.push(new File([blob], `pasted.${imgType.split('/')[1] || 'png'}`, { type: imgType }));
-    }
-    if (files.length) { addFiles(files); return; }
-    toast('Nothing to paste — clipboard has no image or MiruMood data');
-  } catch (err) {
+  let clipItems;
+  try { clipItems = await navigator.clipboard.read(); }
+  catch (err) {
     console.warn('[MiruMood] paste from menu failed:', err);
     toast('Could not read the clipboard — try Ctrl+V instead');
+    return;
   }
+  const files = await imageFilesFromClipItems(clipItems).catch(() => []);
+  if (!files.length && !clipItems.some(i => i.types.includes(CLIP_MIME))) {
+    toast('Nothing to paste — clipboard has no image or MiruMood data');
+    return;
+  }
+  await handleImagePaste(files, Promise.resolve(clipItems));
 }
 
 /* ============ 操作系 ============ */
@@ -2819,19 +3069,9 @@ async function copySelectionToClipboard() {
       pngBlob = await new Promise(res => c.toBlob(res, 'image/png'));
     }
     if (!pngBlob) throw new Error('failed to encode PNG');
-    const clipItems = { 'image/png': pngBlob }; // 他アプリへ貼り付ける用(今まで通り)
-    // MiruMood自身への貼り付け時に、画像化させず編集可能なアイテムのまま復元できるよう、
-    // 選択中の全アイテム(メモ・画像どちらも)をテキストとしても書き込んでおく(他アプリでは
-    // 単なるテキストとして貼り付けられるだけで、実害は無い)。画像は実データそのものではなく
-    // imgIdの参照だけを持たせる(同じボード内でだけ復元できる。他アプリ用のPNGは別途ある)。
-    const payload = selItems.map(it => {
-      const base = { type: it.type === 'note' ? 'note' : 'image', x: it.x, y: it.y, w: it.w, h: it.h,
-        rot: it.rot || 0, flipH: !!it.flipH, flipV: !!it.flipV, gray: !!it.gray, opacity: it.opacity ?? 1 };
-      if (it.type === 'note') return { ...base, text: it.text || '', bold: !!it.bold, bg: it.bg, fg: it.fg, fontSize: it.fontSize };
-      return { ...base, imgId: it.imgId, crop: it.crop || null, vIn: it.vIn ?? null, vOut: it.vOut ?? null, vLoop: it.vLoop };
-    });
-    clipItems['text/plain'] = new Blob([MIRUMOOD_ITEMS_CLIP_PREFIX + JSON.stringify(payload)], { type: 'text/plain' });
-    await navigator.clipboard.write([new ClipboardItem(clipItems)]);
+    // 他アプリにはimage/pngだけを見せ、MiruMoodへ貼り戻すためのデータは独自形式で載せる
+    // (text/plainに入れると、Gmail等がテキストの方を貼ってしまうため。詳細はCLIPの説明を参照)。
+    await writeClipboard(pngBlob, buildClipPayload(selItems));
     progressDone();
     toast(selItems.length > 1
       ? `Copied ${selItems.length} items — Ctrl+V here to paste as editable items`
