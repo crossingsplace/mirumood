@@ -259,6 +259,7 @@
     <tr><td>Double-click</td><td>Fit image to screen (100% on empty area) / play a video or GIF</td></tr>
     <tr><td class="grp" colspan="2">Selection & editing</td></tr>
     <tr><td>Click / Shift+click</td><td>Select / Add to selection</td></tr>
+    <tr><td>Shift+drag</td><td>Move straight horizontally or vertically</td></tr>
     <tr><td>Drag empty area</td><td>Box select</td></tr>
     <tr><td>Corner handle (Shift)</td><td>Scale (Shift = free aspect ratio; notes are free by default)</td></tr>
     <tr><td>Top handle (Shift)</td><td>Rotate (Shift = snap to 15°)</td></tr>
@@ -1604,7 +1605,12 @@ cv.addEventListener('pointerdown', e => {
   if (h) { beginHandleDrag(h); return; }
   const hit = itemAt(wx, wy);
   if (hit) {
-    if (e.shiftKey) { sel.has(hit.id) ? sel.delete(hit.id) : sel.add(hit.id); }
+    if (e.shiftKey) {
+      // 選択済みのアイテムをShift付きで掴んだ時は、すぐには選択を外さない。そのままドラッグすれば
+      // 「垂直・水平に固定した移動」になり、動かさずに離した時だけ従来どおり選択から外す。
+      if (sel.has(hit.id)) drag.deferDeselect = hit.id;
+      else sel.add(hit.id);
+    }
     else if (!sel.has(hit.id)) { sel.clear(); sel.add(hit.id); }
     mode = 'move';
     drag.starts = items.filter(i => sel.has(i.id)).map(i => ({ it: i, x: i.x, y: i.y }));
@@ -1616,6 +1622,60 @@ cv.addEventListener('pointerdown', e => {
   paint();
 });
 
+// 選択中のアイテムを、ドラッグ開始位置からワールド座標(wx,wy)まで動かす。
+// shift: 垂直・水平に固定 / alt: スナップ(アイテム吸い付き・グリッド)を一時無効化
+function moveSelection(wx, wy, shift, alt) {
+    let dx = wx - drag.wx, dy = wy - drag.wy;
+    // Shift: 動いた量の大きい方の軸だけに動きを限定する(画像編集ソフトでよくある垂直・水平固定)。
+    // 途中で向きを変えれば、固定する軸も追従して切り替わる。固定した軸にはスナップも効かせない。
+    let lockX = false, lockY = false;
+    if (shift) {
+      if (Math.abs(dx) >= Math.abs(dy)) { dy = 0; lockY = true; } else { dx = 0; lockX = true; }
+    }
+    if (!alt) { // 各種スナップはAltキーで一時無効にできる(グリッドスナップと同じ操作感に揃える)
+      if (!drag.bbox0) { // 開始時点の選択グループのバウンディングボックス(アイテム吸い付き・グリッドスナップ共通)
+        let l = 1e15, t = 1e15, r = -1e15, b = -1e15;
+        for (const s of drag.starts) {
+          for (const [cx2, cy2] of corners({ ...s.it, x: s.x, y: s.y })) {
+            l = Math.min(l, cx2); r = Math.max(r, cx2); t = Math.min(t, cy2); b = Math.max(b, cy2);
+          }
+        }
+        drag.bbox0 = { l, t, r, b };
+      }
+      const bb = drag.bbox0;
+      // 他のアイテムの辺・中心への吸い付き。ドラッグ開始時に1回だけ、画面内にある(=並べようと
+      // している可能性が高い)アイテムを候補として集めておく(毎フレーム全アイテムを走査しない)。
+      if (!drag.snapCandidates) drag.snapCandidates = nearbySnapCandidates();
+      const ith = ITEM_SNAP_PX / view.s;
+      const xVals = [bb.l, bb.r, (bb.l + bb.r) / 2], yVals = [bb.t, bb.b, (bb.t + bb.b) / 2];
+      const candXs = [], candYs = [];
+      for (const cb of drag.snapCandidates) { candXs.push(cb.l, cb.r, (cb.l + cb.r) / 2); candYs.push(cb.t, cb.b, (cb.t + cb.b) / 2); }
+      const itemDx = bestAxisSnap(xVals, candXs, dx, ith);
+      const itemDy = bestAxisSnap(yVals, candYs, dy, ith);
+      if (itemDx !== null && !lockX) dx = itemDx;
+      if (itemDy !== null && !lockY) dy = itemDy;
+      if (gridMode === 2) { // グリッドスナップは、アイテム吸い付きが見つからなかった軸だけ働かせる
+        const gth = 10 / view.s;
+        const snapAxis = (vals) => {
+          let best = null;
+          for (const v of vals) {
+            const dlt = Math.round(v / GRID) * GRID - v;
+            if (Math.abs(dlt) < gth && (best === null || Math.abs(dlt) < Math.abs(best))) best = dlt;
+          }
+          return best;
+        };
+        if (itemDx === null && !lockX) { const sx2 = snapAxis([bb.l + dx, bb.r + dx, (bb.l + bb.r) / 2 + dx]); if (sx2 !== null) dx += sx2; }
+        if (itemDy === null && !lockY) { const sy2 = snapAxis([bb.t + dy, bb.b + dy, (bb.t + bb.b) / 2 + dy]); if (sy2 !== null) dy += sy2; }
+      }
+    }
+    for (const s of drag.starts) { s.it.x = s.x + dx; s.it.y = s.y + dy; }
+}
+// 移動中にShiftを押し離ししただけ(マウスは静止)でも、すぐに固定/解除が反映されるようにする
+for (const t of ['keydown', 'keyup']) addEventListener(t, e => {
+  if (e.key !== 'Shift' || mode !== 'move' || !drag.moved || !drag.lastW) return;
+  moveSelection(drag.lastW[0], drag.lastW[1], e.type === 'keydown', drag.lastAlt);
+  paint();
+});
 cv.addEventListener('pointermove', e => {
   const [cxp, cyp] = canvasXY(e);
   const pt = pointers.get(e.pointerId);
@@ -1668,44 +1728,8 @@ cv.addEventListener('pointermove', e => {
       drag.undoPushed = true;
       driveDirty = true; updateDriveState(); // 移動もpushUndo()同様に「未保存の変更」として扱う
     }
-    let dx = wx - drag.wx, dy = wy - drag.wy;
-    if (!e.altKey) { // 各種スナップはAltキーで一時無効にできる(グリッドスナップと同じ操作感に揃える)
-      if (!drag.bbox0) { // 開始時点の選択グループのバウンディングボックス(アイテム吸い付き・グリッドスナップ共通)
-        let l = 1e15, t = 1e15, r = -1e15, b = -1e15;
-        for (const s of drag.starts) {
-          for (const [cx2, cy2] of corners({ ...s.it, x: s.x, y: s.y })) {
-            l = Math.min(l, cx2); r = Math.max(r, cx2); t = Math.min(t, cy2); b = Math.max(b, cy2);
-          }
-        }
-        drag.bbox0 = { l, t, r, b };
-      }
-      const bb = drag.bbox0;
-      // 他のアイテムの辺・中心への吸い付き。ドラッグ開始時に1回だけ、画面内にある(=並べようと
-      // している可能性が高い)アイテムを候補として集めておく(毎フレーム全アイテムを走査しない)。
-      if (!drag.snapCandidates) drag.snapCandidates = nearbySnapCandidates();
-      const ith = ITEM_SNAP_PX / view.s;
-      const xVals = [bb.l, bb.r, (bb.l + bb.r) / 2], yVals = [bb.t, bb.b, (bb.t + bb.b) / 2];
-      const candXs = [], candYs = [];
-      for (const cb of drag.snapCandidates) { candXs.push(cb.l, cb.r, (cb.l + cb.r) / 2); candYs.push(cb.t, cb.b, (cb.t + cb.b) / 2); }
-      const itemDx = bestAxisSnap(xVals, candXs, dx, ith);
-      const itemDy = bestAxisSnap(yVals, candYs, dy, ith);
-      if (itemDx !== null) dx = itemDx;
-      if (itemDy !== null) dy = itemDy;
-      if (gridMode === 2) { // グリッドスナップは、アイテム吸い付きが見つからなかった軸だけ働かせる
-        const gth = 10 / view.s;
-        const snapAxis = (vals) => {
-          let best = null;
-          for (const v of vals) {
-            const dlt = Math.round(v / GRID) * GRID - v;
-            if (Math.abs(dlt) < gth && (best === null || Math.abs(dlt) < Math.abs(best))) best = dlt;
-          }
-          return best;
-        };
-        if (itemDx === null) { const sx2 = snapAxis([bb.l + dx, bb.r + dx, (bb.l + bb.r) / 2 + dx]); if (sx2 !== null) dx += sx2; }
-        if (itemDy === null) { const sy2 = snapAxis([bb.t + dy, bb.b + dy, (bb.t + bb.b) / 2 + dy]); if (sy2 !== null) dy += sy2; }
-      }
-    }
-    for (const s of drag.starts) { s.it.x = s.x + dx; s.it.y = s.y + dy; }
+    drag.lastW = [wx, wy]; drag.lastAlt = e.altKey; // Shiftの押し離しだけ(マウス静止)でも計算し直せるよう覚えておく
+    moveSelection(wx, wy, e.shiftKey, e.altKey);
     paint(); return;
   }
   if (mode === 'groupScale') {
@@ -1808,6 +1832,7 @@ cv.addEventListener('pointerup', e => {
   const [cxp, cyp] = canvasXY(e);
   if (mode === 'pinch') { if (pointers.size < 2) mode = null; paint(); return; }
   if (mode === 'pan' && !drag.moved && drag.button === 2 && !drag.touch) openMenu(cxp, cyp);
+  if (mode === 'move' && drag.deferDeselect != null && !drag.moved) sel.delete(drag.deferDeselect); // Shift+クリック(動かさず)=選択解除
   if (drag.touch && !drag.moved && mode) { // タッチのタップ処理（長押しでメニューが開いた場合は mode=null で通らない）
     const now = performance.now();
     if (now - lastTap.t < 350 && Math.hypot(cxp - lastTap.x, cyp - lastTap.y) < 40) {
