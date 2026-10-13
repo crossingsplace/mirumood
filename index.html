@@ -1845,7 +1845,7 @@ cv.addEventListener('pointerup', e => {
       // ダブルタップ：メモは編集、画像はフィット表示
       const it = itemAt(s2wX(cxp), s2wY(cyp));
       if (it && it.type === 'note') openNoteEditor(it);
-      else if (it) fitToRect(it.x - it.w / 2, it.y - it.h / 2, it.w, it.h);
+      else if (it) { cancelViewAnim(); Object.assign(view, fitItemView(it)); paint(); } // 画像は画面いっぱいまで拡大(上限はFIT_ITEM_MAX_ZOOM)
       else view.s = 1;
       lastDoubleTapT = now;
       lastTap = { t: 0, x: 0, y: 0 };
@@ -1954,9 +1954,13 @@ function findNavTarget(from, dir, excludeId) {
 }
 
 /* ---- 表示位置のアニメーション(空間的な位置関係を見失わないためのもの) ---- */
-function computeFitView(x, y, w, h) {
+// 画像1枚をフィットする時の拡大上限。以前は全体表示と同じ4倍で頭打ちになっており、ボード上で
+// 小さく配置した画像や大きいモニターでは画面いっぱいにならなかった(矢印で送った時も、小さく
+// 置いた画像だけ小さいまま表示されていた)。手動ズームの上限(32倍)に揃える。
+const FIT_ITEM_MAX_ZOOM = 32;
+function computeFitView(x, y, w, h, maxS = 4) {
   const pad = 60;
-  const s = Math.min(4, Math.min((innerWidth - pad * 2) / Math.max(w, 1e-6), (innerHeight - pad * 2) / Math.max(h, 1e-6)));
+  const s = Math.min(maxS, Math.min((innerWidth - pad * 2) / Math.max(w, 1e-6), (innerHeight - pad * 2) / Math.max(h, 1e-6)));
   return { s, ox: innerWidth / 2 - (x + w / 2) * s, oy: innerHeight / 2 - (y + h / 2) * s };
 }
 function cancelViewAnim() { if (viewAnim) { cancelAnimationFrame(viewAnim); viewAnim = 0; } }
@@ -1987,7 +1991,7 @@ function animateViewTo(target) {
 cv.addEventListener('pointerdown', cancelViewAnim, true);
 cv.addEventListener('wheel', cancelViewAnim, { capture: true, passive: true });
 
-function fitItemView(it) { const bx = navBox(it); return computeFitView(bx.l, bx.t, bx.r - bx.l, bx.b - bx.t); }
+function fitItemView(it) { const bx = navBox(it); return computeFitView(bx.l, bx.t, bx.r - bx.l, bx.b - bx.t, FIT_ITEM_MAX_ZOOM); }
 // 通常時: アイテムが画面内に収まっていなければ、ズームはそのままで中央へパンする
 function revealItem(it) {
   const bx = navBox(it), m = 40;
@@ -3258,9 +3262,9 @@ async function copySelectionToClipboard() {
     toast('Copy failed');
   }
 }
-function fitToRect(x, y, w, h) {
+function fitToRect(x, y, w, h, maxS) {
   cancelViewAnim();
-  Object.assign(view, computeFitView(x, y, w, h));
+  Object.assign(view, computeFitView(x, y, w, h, maxS));
   paint();
 }
 // メモのテキストを検索し、一致した場所へジャンプする機能。ボードが膨大になっても、
